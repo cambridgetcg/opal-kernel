@@ -102,7 +102,12 @@ the staleness bug that earned it the job. Walk through
   placed in a section called `.text.boot`; listing it first makes `_start`
   the literal first byte of the image, and `KEEP` protects it if the linker
   ever garbage-collects unreferenced sections (nothing *calls* `_start`, so
-  to the linker it looks dead).
+  to the linker it looks dead). Second comes `KEEP(*(.text.vectors))`,
+  added in M1: the exception vector table, placed right after the boot stub
+  so `_start` stays the first byte while the table still gets the 2048-byte
+  alignment `VBAR_EL1` demands — the ~2 KiB of padding between the tiny
+  stub and the table is the price of that alignment. Full story in
+  [docs/03-exceptions.md](03-exceptions.md) §2.
 
 - **`.rodata`, `.data`** — string literals and initialized statics. Nothing
   exotic.
@@ -126,7 +131,11 @@ the staleness bug that earned it the job. Walk through
 
 - **`ASSERT(SIZEOF(.got) == 0, ...)`** — a tripwire: statically linked
   kernel code should need no Global Offset Table; if one appears, fail the
-  *link* loudly rather than boot something subtly position-dependent.
+  *link* loudly rather than boot something subtly position-dependent. M1
+  added a second ASSERT below it, `(__vectors & 0x7FF) == 0`: link-time
+  proof that the vector table really landed on its 2048-byte boundary
+  (`VBAR_EL1`'s low 11 bits are RES0, so a misaligned table would be
+  silently truncated to the wrong address — every fault a wild jump).
 
 ## 4. `boot.rs` — twenty-one instructions to Rust
 
@@ -184,20 +193,28 @@ each line of the banner by *checking*, not assuming:
 
 - **`current EL`** — reads the `CurrentEL` system register (bits [3:2]
   hold the level). Expect `EL1` on QEMU, `EL2` the day this boots via m1n1.
+- **`vectors`** — added in M1: reads `VBAR_EL1` back and prints where the
+  exception vector table actually is (not where we hope `install()` put
+  it). The story of that table is [docs/03-exceptions.md](03-exceptions.md).
 - **`x0 at entry`** — the raw value, straight from the boot stub. Expect 0
   under QEMU's ELF boot; a pointer under any Linux-protocol loader.
 - **`fdt at x0` / `fdt at RAM base`** — every flattened devicetree begins
   with magic `0xd00dfeed` stored big-endian. We check both places a DTB
   could plausibly be and report what we *find*, not what docs promise. One
-  guard: we only dereference addresses inside RAM — with the MMU off and
-  no exception vectors installed (that's milestone 1), reading a hole in
-  the physical map would hang the machine with no diagnostics whatsoever.
+  guard: we only dereference addresses inside RAM — with the MMU off,
+  reading a hole in the physical map takes a synchronous external abort.
+  In M0 that meant an instant silent hang; since M1 it would die with a
+  full fault report — but a banner that says "no devicetree" still beats
+  one that dies explaining why, so the guard stays.
 
-Then the echo loop: poll the UART for a byte, write it back (`\r` from your
-Enter key becomes a real newline; unprintable bytes are shown as `<0xNN>`
-so nothing is invisible). It's three lines of code, but it closes the loop:
-input and output both work, interactively, on a kernel you can read from
-`_start` to `loop`.
+Then the console loop: poll the UART for a byte, echo it back (`\r` from
+your Enter key becomes a real newline; unprintable bytes are shown as
+`<0xNN>` so nothing is invisible). In M0 that was the whole story — pure
+echo — and it closed the loop: input and output both work, interactively,
+on a kernel you can read from `_start` to `loop`. M1 grew it into a small
+line-buffered monitor whose commands make the kernel fault on purpose
+(see docs/03-exceptions.md), but the byte-in, byte-out I/O path under it
+is unchanged.
 
 How a character actually gets out: `println!` → `format_args!` renders into
 `&str`s → our `fmt::Write` impl feeds bytes to the PL011 driver → a
@@ -207,16 +224,18 @@ hands the byte to your terminal. The driver's file
 (`src/hal/pl011.rs`) documents the MMIO rules that make those two volatile
 accesses correct — and the simulator-isms it currently leans on.
 
-## 6. What we deliberately did not do
+## 6. What milestone 0 deliberately did not do
 
-Milestone 0 is honest about its debts. No exception vectors (any CPU fault
-is a silent hang — M1). No MMU, no caches (everything physical, slow —
-M2). Interrupts never enabled; all I/O is polling (M3). One core (the
-others are parked in `wfe`, to be woken via PSCI `CPU_ON` — M6). No locking on the console, which is
-*sound* today exactly because of the previous two sentences, and becomes
-unsound the moment M1 lands — the comment in `pl011.rs` and the roadmap
-both carry that flag.
+Milestone 0 was honest about its debts, and two have since been paid. No
+exception vectors (any CPU fault was a silent hang) — paid by M1, which is
+docs/03's whole subject. No locking on the console — sound in M0 exactly
+because nothing could interrupt anything, and delivered in M1 the moment
+that stopped being true. Still outstanding: no MMU, no caches (everything
+physical, slow — M2). Interrupts never *enabled*; all I/O is polling (M1
+built the handlers, M3 turns the interrupts on). One core (the others are
+parked in `wfe`, to be woken via PSCI `CPU_ON` — M6).
 
-Next: [ROADMAP.md](../ROADMAP.md) for where this goes, and
+Next: [03-exceptions.md](03-exceptions.md) for what happened to this
+kernel in M1, [ROADMAP.md](../ROADMAP.md) for where it goes, and
 [02-hal-and-apple-silicon.md](02-hal-and-apple-silicon.md) for the real
 target this is all rehearsal for.

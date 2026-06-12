@@ -5,19 +5,20 @@ milestone is small enough to hold in your head and leaves the kernel in a
 demonstrably working state. Difficulty ratings are honest; the dragons are
 labeled.
 
-## M0 — boots and speaks ✅ (this milestone)
+## M0 — boots and speaks ✅
 
 Boot stub (park secondaries, stack, zero `.bss`), linker script, polled
 PL011 console, `println!`, banner (exception level, `x0`, devicetree
 sniffing), interactive echo loop, printing panic handler. QEMU virt only.
 
-*What it deliberately lacks:* any way to survive a CPU fault, any memory
-protection, any interrupt. Every one of those is a milestone below.
+*What it deliberately lacked:* any way to survive a CPU fault, any memory
+protection, any interrupt. The first of those debts was paid one rung
+down; the rest are milestones below.
 
-## M1 — exceptions and vectors
+## M1 — exceptions and vectors ✅ (this milestone)
 
 A full EL1 vector table (`VBAR_EL1`): the 16 entries, register-save frames,
-and a readable "what faulted, where, and why" report instead of today's
+and a readable "what faulted, where, and why" report instead of M0's
 silent hang — turning the worst debugging experience in OS development into
 a mediocre one, which is a huge upgrade. Includes `ESR/FAR` decoding and a
 deliberate test fault. **FIQ handled as a first-class citizen, not an
@@ -45,7 +46,7 @@ really leave.
 
 The architectural timer (`CNTP_*`), the GICv3 on virt: enable, route,
 acknowledge, EOI. A timer tick, interrupt-driven UART RX replacing the
-polled echo loop. Design note attached to every line of GIC code: *the GIC
+monitor's polled read loop. Design note attached to every line of GIC code: *the GIC
 is virt-only* — Apple uses AIC (and timers-as-FIQ), so the interface
 between "an interrupt arrived" and "the kernel reacts" stays
 controller-agnostic, sized for exactly two implementors.

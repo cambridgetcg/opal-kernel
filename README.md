@@ -16,11 +16,14 @@ architecture, same exception model, even the same 16 KiB page-size ambitions
 Apple's IOMMUs). See [docs/02-hal-and-apple-silicon.md](docs/02-hal-and-apple-silicon.md)
 for the full story of how the two boards relate.
 
-**Current state: Milestone 0 — "boots and speaks."** The kernel boots to
-EL1, prints a banner over the serial port (exception level, what the
-bootloader put in `x0`, whether a devicetree is present), and then echoes
-whatever you type. That's all — and getting there honestly is a surprising
-amount of the OS-development learning curve.
+**Current state: Milestone 1 — "catches its own faults."** The kernel
+boots to EL1, installs a full exception vector table, prints a banner over
+the serial port, and then runs a tiny monitor whose commands make the CPU
+fault *on purpose*: a breakpoint and a supervisor call that the kernel
+reports and survives, and two genuinely fatal faults that it reports
+before parking — "what faulted, where, and why" instead of M0's silent
+hang. The console grew the spinlock M0 promised the moment a second
+execution context (a fault handler) could print.
 
 ## Quickstart
 
@@ -38,18 +41,43 @@ cargo run                # that's it
 kernel. You should see:
 
 ```
-opal — milestone 0: boots and speaks
-------------------------------------
+opal — milestone 1: catches its own faults
+------------------------------------------
 current EL : EL1
+vectors    : VBAR_EL1 = 0x40200800 (16-entry table live)
 x0 at entry: 0x0
 fdt at x0  : no  (expected under QEMU ELF boot: x0 is just QEMU's reset zero)
 fdt at RAM base 0x40000000: yes — QEMU's bare-metal DTB placement
 
-echo console ready — type and the kernel answers. Ctrl-A X quits QEMU.
+monitor ready — 'help' lists commands. Ctrl-A X quits QEMU.
+
+>
 ```
 
-Type something; the kernel echoes it. **Ctrl-A X** quits QEMU
-(**Ctrl-A C** toggles the QEMU monitor if you're curious).
+Now make the kernel hurt itself: type `brk` and Enter. The CPU takes a
+breakpoint exception, the kernel prints a full report — cause, decoded
+syndrome, every register — then steps past the breakpoint and *returns to
+the prompt*:
+
+```
+> brk
+
+*** exception: synchronous, from current EL on SP_ELx ***
+  cause   : BRK #0xf00d — a software breakpoint (EC 0x3c)
+  ...
+  verdict : recovered — ELR pointed AT the brk (its preferred return
+            address); we advanced it one instruction so eret resumes
+            just past the breakpoint.
+
+...and we're back — the kernel caught its own fault and lived.
+>
+```
+
+`svc 7` demonstrates the same survival for a supervisor call (and why
+*its* return address needs no fixing), while `unaligned` and `abort` show
+the honest other half: faults nothing can repair yet, reported in full
+and then parked. **Ctrl-A X** quits QEMU (**Ctrl-A C** toggles the QEMU
+monitor if you're curious).
 
 ## Repository map
 
@@ -59,25 +87,33 @@ build.rs                    hands linker.ld to the linker, tracked as a build in
 rust-toolchain.toml         pinned toolchain + target, installed by rustup
 .cargo/config.toml          default target, QEMU runner
 src/
-  main.rs                   kmain, print!/println!, banner, echo loop, panic handler
+  main.rs                   kmain, print!/println! + console lock, banner,
+                            fault-demo monitor, panic handler
+  sync.rs                   hand-rolled spinlock (and the deadlock honesty notes)
   arch/
+    mod.rs                  one architecture, no cfg maze — and why
     aarch64/
       linker.ld             memory layout: where the kernel lives in RAM
       boot.rs               _start: park cores, set SP, zero .bss, call Rust
-      mod.rs                CurrentEL reader, park()
+      vectors.rs            exception vector table, trap frames, fault reports
+      mod.rs                CurrentEL reader, DAIF helpers, park()
   hal/
+    mod.rs                  what "HAL" means here: drivers, not trait soup
     pl011.rs                polled PL011 UART driver (the only driver so far)
   board/
+    mod.rs                  boards know addresses; drivers know devices
     virt.rs                 QEMU virt board: addresses + (trivial) init
 docs/
   01-boot-flow.md           power-on to banner, line by line
   02-hal-and-apple-silicon.md  the HAL design and the real target
+  03-exceptions.md          the vector table, fault reports, and the console lock
 ROADMAP.md                  the milestone ladder, with honest difficulty notes
 ```
 
 Suggested reading order: this file → `docs/01-boot-flow.md` alongside
 `linker.ld`, `build.rs`, and `boot.rs` → `hal/pl011.rs` → `main.rs` →
-`docs/02-hal-and-apple-silicon.md` → `ROADMAP.md`.
+`docs/03-exceptions.md` alongside `arch/aarch64/vectors.rs` and `sync.rs`
+→ `docs/02-hal-and-apple-silicon.md` → `ROADMAP.md`.
 
 ## Philosophy
 

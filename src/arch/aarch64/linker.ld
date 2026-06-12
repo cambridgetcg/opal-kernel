@@ -31,9 +31,18 @@ SECTIONS
 
     /* Code. KEEP(.text.boot) pins the boot stub even under section GC,
      * and listing it first guarantees _start is the first byte of the
-     * image — nice for sanity (entry point == load address). */
+     * image — nice for sanity (entry point == load address).
+     *
+     * The exception vector table (vectors.rs) comes second: VBAR_EL1
+     * ignores its low 11 bits, so the table must sit on a 2048-byte
+     * boundary. The .balign in the assembly requests that alignment; the
+     * ASSERT at the bottom of this file verifies the linker delivered it.
+     * The ~2 KiB of padding between the boot stub and the table is the
+     * price of the alignment — harmless, and cheaper than putting the
+     * table first and breaking the "_start is the first byte" invariant. */
     .text : {
         KEEP(*(.text.boot))
+        KEEP(*(.text.vectors))
         *(.text .text.*)
     }
 
@@ -87,3 +96,9 @@ SECTIONS
  * ever fires, some code is being compiled position-independent and we want
  * to know about it loudly, at link time. */
 ASSERT(SIZEOF(.got) == 0, "unexpected GOT — kernel must be statically linked")
+
+/* The vector table's alignment, double-checked at link time: VBAR_EL1's
+ * low 11 bits are RES0, so a misaligned table would be silently truncated
+ * to the wrong address and every fault would jump into the void — the
+ * exact failure mode M1 exists to abolish. */
+ASSERT((__vectors & 0x7FF) == 0, "exception vector table is not 2048-byte aligned (VBAR_EL1[10:0] are RES0)")

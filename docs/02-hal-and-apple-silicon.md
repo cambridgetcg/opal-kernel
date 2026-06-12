@@ -31,12 +31,14 @@ Two design decisions worth defending:
   in the type, so "creating" a console is free and possible anywhere —
   including inside the panic handler, where shared state may be mid-flight.
   There is nothing to initialize and therefore nothing to be uninitialized.
-- **There is no lock, on purpose, temporarily.** Milestone 0 is one core
-  with interrupts off: a second concurrent printer is impossible by
-  construction. The moment milestone 1 introduces exception handlers that
-  might print, this assumption dies; the console then gets a real spinlock
-  (and interrupt masking around it). The zero-sized type makes that a
-  type-alias change, not a hunt through call sites.
+- **The lock lives above the driver, not in it.** Milestone 0 had no lock
+  at all — one core, interrupts off, a second concurrent printer
+  impossible by construction — and said so. Milestone 1's exception
+  handlers ended that on schedule: the console print path now takes a
+  real spinlock with interrupt masking (`console_print` in main.rs), and
+  keeps an unlocked emergency path for fault reports, since the faulting
+  code may hold the lock. The driver itself stays zero-sized and
+  lock-free; docs/03-exceptions.md tells the deadlock story in full.
 
 And one honesty note, again: the PL011 driver does no initialization
 because *QEMU's model* transmits even when the UART is disabled. Real

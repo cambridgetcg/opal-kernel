@@ -8,8 +8,9 @@
 //!
 //! Everything else is *supposed* to be discovered from the devicetree blob
 //! QEMU leaves at the start of RAM. We hardcode the UART base anyway —
-//! it has not moved in many years, and milestone 0 has no FDT parser —
-//! but we say so honestly: `UART0_BASE` is a convenience, not a contract.
+//! it has not moved in many years, and the FDT parser is still milestones
+//! away (M4) — but we say so honestly: `UART0_BASE` is a convenience, not
+//! a contract.
 //! A later milestone parses the DTB and this constant becomes a fallback.
 
 use crate::hal::pl011::Pl011;
@@ -30,7 +31,9 @@ pub const RAM_SIZE: usize = 512 * 1024 * 1024;
 /// is the authoritative source, this is the well-known value.
 pub const UART0_BASE: usize = 0x0900_0000;
 
-/// The board's console UART. Zero-sized — see `hal/pl011.rs` for why.
+/// The board's console UART. Zero-sized — see `hal/pl011.rs` for why,
+/// and for where M1's console lock actually lives (main.rs, around the
+/// print path — not in the driver, and not in this alias).
 pub type Console = Pl011<UART0_BASE>;
 
 /// Conjure the console. Free to call anywhere, even mid-panic.
@@ -44,7 +47,10 @@ pub const fn console() -> Console {
 /// - the PL011 transmits without initialization under QEMU (see
 ///   `hal/pl011.rs`; real hardware would need baud/LCR/CR setup here);
 /// - the MMU and caches stay off until the MMU milestone (M2);
-/// - interrupts stay masked until the exceptions milestone (M1).
+/// - the exception vector table is installed by `kmain` (it is
+///   architecture state, not board state — arch/aarch64/vectors.rs), and
+///   interrupts stay *masked* until the timer milestone (M3): M1 catches
+///   synchronous faults; nothing asynchronous is enabled yet.
 ///
 /// The function exists so `kmain` already has the right shape: boot stub →
 /// board init → kernel main. `board/apple.rs::init()` will not be empty.

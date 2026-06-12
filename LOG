@@ -1,0 +1,82 @@
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.00s
+     Running `qemu-system-aarch64 -machine virt -cpu max -smp 1 -m 512M -nographic -kernel target/aarch64-unknown-none-softfloat/debug/opal`
+
+opal — milestone 1: catches its own faults
+------------------------------------------
+current EL : EL1
+vectors    : VBAR_EL1 = 0x40200800 (16-entry table live)
+x0 at entry: 0x0
+fdt at x0  : no  (expected under QEMU ELF boot: x0 is just QEMU's reset zero)
+fdt at RAM base 0x40000000: yes — QEMU's bare-metal DTB placement
+
+monitor ready — 'help' lists commands. Ctrl-A X quits QEMU.
+
+> brk
+
+*** exception: synchronous, from current EL on SP_ELx ***
+  cause   : BRK #0xf00d — a software breakpoint (EC 0x3c)
+  esr     : 0x00000000f200f00d  (syndrome — decoded above)
+  elr     : 0x0000000040205660  (preferred return address)
+  spsr    : 0x00000000600003c5  (interrupted PSTATE)
+  far     : 0x0000000000000000  (fault address — aborts/alignment only)
+  registers at the moment of the exception:
+    x0  0x0000000000000001    x1  0x000000004020a80f
+    x2  0x0000000000000000    x3  0x0000000000000003
+    x4  0x000000004020c498    x5  0x0000000000000008
+    x6  0x0000000000000000    x7  0x0000000000000000
+    x8  0x0000000000000001    x9  0x000000000000006b
+    x10 0x000000004021d050    x11 0x0000000000000000
+    x12 0x0000000000000000    x13 0x0000000000000020
+    x14 0x0000000000000000    x15 0x0000000000000000
+    x16 0x0000000000000000    x17 0x0000000000000000
+    x18 0x0000000000000000    x19 0x0000000000000000
+    x20 0x0000000000000000    x21 0x0000000000000000
+    x22 0x0000000000000000    x23 0x0000000000000000
+    x24 0x0000000000000000    x25 0x0000000000000000
+    x26 0x0000000000000000    x27 0x0000000000000000
+    x28 0x0000000000000000    x29 0x0000000000000000
+    x30 0x0000000040201940    sp  0x000000004021d140
+  verdict : recovered — ELR pointed AT the brk (its preferred return
+            address); we advanced it one instruction so eret resumes
+            just past the breakpoint.
+
+...and we're back — the kernel caught its own fault and lived.
+> svc 7
+
+*** exception: synchronous, from current EL on SP_ELx ***
+  cause   : SVC #0x0 with x8 = 7 — a supervisor call (EC 0x15)
+  esr     : 0x0000000056000000  (syndrome — decoded above)
+  elr     : 0x0000000040205678  (preferred return address)
+  spsr    : 0x00000000800003c5  (interrupted PSTATE)
+  far     : 0x0000000000000000  (fault address — aborts/alignment only)
+  registers at the moment of the exception:
+    x0  0x0000000000000007    x1  0x0000000000000007
+    x2  0x000000000000000a    x3  0x0000000000000003
+    x4  0x000000004020c498    x5  0x0000000000000008
+    x6  0x0000000000000000    x7  0x0000000000000000
+    x8  0x0000000000000007    x9  0x000000004021d1e8
+    x10 0x0000000000000007    x11 0x0000000000000007
+    x12 0x0000000000000001    x13 0x000000004021d3cd
+    x14 0x0000000000000000    x15 0x0000000000000000
+    x16 0x0000000000000000    x17 0x0000000000000000
+    x18 0x0000000000000000    x19 0x0000000000000000
+    x20 0x0000000000000000    x21 0x0000000000000000
+    x22 0x0000000000000000    x23 0x0000000000000000
+    x24 0x0000000000000000    x25 0x0000000000000000
+    x26 0x0000000000000000    x27 0x0000000000000000
+    x28 0x0000000000000000    x29 0x0000000000000000
+    x30 0x0000000040201a74    sp  0x000000004021d130
+  verdict : recovered — and note: nothing to fix. For svc, ELR already
+            points past the instruction (a call, not an accident), so
+            eret resumes there unadjusted. M5 turns this report into a
+            real system-call dispatcher.
+
+...back from the 'syscall' — M5 gives svc a real job.
+> help
+commands:
+  help       this text
+  brk        breakpoint: fault on purpose, report, recover, carry on
+  svc <n>    supervisor call with n in x8: report, recover, carry on
+  unaligned  FATAL: unaligned load (MMU off = Device memory rules)
+  abort      FATAL: read from a hole in the physical address map
+> qemu-system-aarch64: terminating on signal 15 from pid 58766 (<unknown process>)

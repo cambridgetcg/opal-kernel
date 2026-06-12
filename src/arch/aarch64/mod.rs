@@ -1,9 +1,14 @@
-//! AArch64-specific code: the boot stub and small CPU helpers.
+//! AArch64-specific code: the boot stub, the exception vectors, and small
+//! CPU helpers.
 //!
 //! Everything in this directory is allowed to use `core::arch::asm!` and
-//! to know AArch64 system-register names. Nothing outside it is.
+//! to know AArch64 system-register names. Nothing outside it is. That is
+//! why the DAIF helpers below exist at all: `sync.rs` wants to mask
+//! interrupts around a critical section, and this is the only place
+//! allowed to know how.
 
 pub mod boot;
+pub mod vectors;
 
 /// Which exception level are we running at? Reads the `CurrentEL` system
 /// register; the EL number lives in bits [3:2].
@@ -22,6 +27,46 @@ pub fn current_el() -> u64 {
         );
     }
     (el >> 2) & 0b11
+}
+
+/// Mask asynchronous interrupts (IRQ and FIQ) and return the previous
+/// PSTATE.DAIF, so the caller can put things back exactly as they were.
+///
+/// Save-and-restore rather than mask-and-enable matters: if interrupts
+/// were already masked (today they always are — nothing has unmasked them
+/// since reset), a nested critical section must not accidentally enable
+/// them on the way out. `DAIFSet` is a write-1-to-mask register; the
+/// immediate's four bits are D, A, I, F from high to low, so #3 = I | F.
+/// D (debug) and A (SError) stay as they are.
+pub fn daif_mask_save() -> u64 {
+    let daif: u64;
+    // SAFETY: reading DAIF is side-effect-free; masking I and F at EL1 is
+    // always legal and cannot fault. No `nomem`: the compiler must not
+    // float memory accesses across an interrupt-masking boundary.
+    unsafe {
+        core::arch::asm!(
+            "mrs {prev}, DAIF",   // remember the old mask bits
+            "msr DAIFSet, #3",    // mask IRQ (I) and FIQ (F)
+            prev = out(reg) daif,
+            options(nostack, preserves_flags)
+        );
+    }
+    daif
+}
+
+/// Restore PSTATE.DAIF from a value previously returned by
+/// [`daif_mask_save`]. The pair brackets every spinlock critical section.
+pub fn daif_restore(daif: u64) {
+    // SAFETY: writing DAIF at EL1 is always legal; the value round-trips
+    // from the matching `mrs` (bits [9:6] carry D/A/I/F in both
+    // directions). No `nomem`, same reason as above.
+    unsafe {
+        core::arch::asm!(
+            "msr DAIF, {prev}",
+            prev = in(reg) daif,
+            options(nostack, preserves_flags)
+        );
+    }
 }
 
 /// Stop this core forever, in the lowest-power way available.

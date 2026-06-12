@@ -27,16 +27,25 @@
 //! - access width matches the register: PL011 registers are 32-bit, so we
 //!   move `u32`s even when only the low byte matters.
 //!
-//! ## Why is there no lock?
+//! ## Why is there *still* no lock in this file?
 //!
-//! Honest answer: nothing to lock against, yet. Milestone 0 runs one core
-//! (the boot stub parks the rest) with interrupts never enabled, so there
-//! is exactly one thread of execution in the whole machine — concurrent
-//! access to the UART is impossible by construction. The moment M1
-//! (exceptions) lets an interrupt handler print while `kmain` is printing,
-//! this comfort evaporates: M1/M3 must wrap the console in a proper lock
-//! (spinlock + interrupt masking). The type is deliberately zero-sized so
-//! that adding that lock later changes a type alias, not every call site.
+//! In M0 the honest answer was "nothing to lock against": one core,
+//! interrupts off, concurrency impossible by construction. M1 made the
+//! threat real — an exception handler can print while `kmain` is printing
+//! — and the promised lock landed, but one level *up*: `console_print` in
+//! main.rs takes a `SpinLock` (with interrupt masking) around each whole
+//! `write_fmt`, so messages interleave but bytes within them never do.
+//! (M0's comment predicted "a type alias, not every call site" would
+//! change; the truth was even smaller — one function changed.) The driver
+//! itself stays lock-free and zero-sized, deliberately:
+//!
+//! - locking per *message* beats locking per *byte* — and a lock inside
+//!   `Pl011` would drag the monitor's blocking `read_byte` loop into a
+//!   critical section, the classic way to deadlock a console;
+//! - the fault/panic path must be able to print while the lock is held by
+//!   the very code that faulted. A bare, conjurable-anywhere `Pl011` is
+//!   exactly that escape hatch (the `OOPS` flag in main.rs, and the whole
+//!   deadlock story in docs/03-exceptions.md).
 //!
 //! ## Why is there no init code?
 //!
