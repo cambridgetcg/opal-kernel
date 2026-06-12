@@ -1,0 +1,36 @@
+# Cargo wiring for a bare-metal kernel. Two jobs:
+#
+#   1. make `cargo build` target bare-metal aarch64 by default,
+#   2. make `cargo run` boot the result in QEMU.
+#
+# (Job 3 — handing the linker our linker script — lives in build.rs, where
+# Cargo can also be told the script is a build *input*. A `rustflags`
+# link-arg here would work too, but Cargo would never relink when the
+# script changes; see the comment in build.rs.)
+
+[build]
+# softfloat = the compiler will not use FP/SIMD registers for argument
+# passing or codegen. Exactly what a kernel wants: we never have to
+# save/restore the FP state on exceptions (until we let userspace use it).
+target = "aarch64-unknown-none-softfloat"
+
+[target.aarch64-unknown-none-softfloat]
+# `cargo run` appends the path of the freshly built ELF after `-kernel`.
+# The bare command name lets your PATH find QEMU wherever your package
+# manager put it (/opt/homebrew/bin on Apple Silicon Homebrew,
+# /usr/local/bin on Intel-Mac Homebrew, /usr/bin on most Linux distros).
+#
+#   -machine virt   QEMU's idealized aarch64 board (RAM at 0x4000_0000,
+#                   PL011 UART at 0x0900_0000, DTB describing everything)
+#   -cpu max        all-features TCG CPU. Crucially it implements the 16 KiB
+#                   translation granule (cortex-a72 does not), which is the
+#                   only granule Apple Silicon's IOMMUs really support — we
+#                   want QEMU parity with the real target from day one.
+#   -smp 1          one core until we have something to say to the others
+#   -m 512M         RAM size — mirrored by board::virt::RAM_SIZE, which the
+#                   kernel uses to bound its devicetree sniffing; change
+#                   the two together (until M4's FDT parser reads the real
+#                   size from the DTB's /memory node)
+#   -nographic      no window; the UART is wired to your terminal
+#                   (Ctrl-A X quits QEMU, Ctrl-A C toggles the monitor)
+runner = "qemu-system-aarch64 -machine virt -cpu max -smp 1 -m 512M -nographic -kernel"

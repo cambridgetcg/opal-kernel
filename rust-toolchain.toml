@@ -1,0 +1,15 @@
+# Pin the toolchain so `cargo build` means the same thing on every machine.
+# rustup reads this file and auto-installs anything missing.
+#
+# Stable is enough for the entire boot path in 2026: global_asm!, naked
+# functions, and `const` arguments to asm! are all stable. No nightly needed.
+
+[toolchain]
+channel = "stable"
+components = [
+    "rust-src",    # core/alloc sources — only needed if we ever -Zbuild-std,
+                   # but also what rust-analyzer uses to index core for you
+    "llvm-tools",  # llvm-objcopy / llvm-objdump / llvm-size for inspecting the ELF
+]
+targets = ["aarch64-unknown-none-softfloat"]
+profile = "minimal"

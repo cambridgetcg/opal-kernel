@@ -1,0 +1,25 @@
+# Opal — a teaching operating system kernel.
+#
+# One binary crate. Zero dependencies, forever: every line of code that ends
+# up in the kernel image lives in this repository where you can read it.
+
+[package]
+name = "opal"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# (intentionally empty)
+
+# A kernel has no unwinder, so a panic can never unwind — it must abort.
+# The `aarch64-unknown-none-*` targets already default to abort, but we say
+# it out loud so the contract is visible, and so the build never silently
+# grows landing-pad machinery if defaults change.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+# Keep full debug info in release builds. It lives in the ELF, not in the
+# loaded image, and makes `llvm-objdump`/`gdb` output readable for free.
+debug = true
