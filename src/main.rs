@@ -164,8 +164,8 @@ fn kmain(x0: u64) -> ! {
     arch::aarch64::mmu::condemn_low_half();
 
     println!();
-    println!("opal — milestone 2: maps its own world");
-    println!("--------------------------------------");
+    println!("opal — milestone 3: has a heartbeat");
+    println!("----------------------------------");
 
     // Privilege check. QEMU virt without virtualization=on/secure=on has
     // no EL2/EL3, so we expect EL1. (On Apple Silicon via m1n1: EL2.)
@@ -214,7 +214,21 @@ fn kmain(x0: u64) -> ! {
         "vectors    : VBAR_EL1 = {:#x} (16-entry table live, upstairs)",
         arch::aarch64::vectors::vbar()
     );
-    println!("guard      : 16 KiB unmapped below the stack — overflow now faults instead of eating .bss (M0's debt, paid)");
+    println!("guard      : 16 KiB unmapped below the stack - overflow now faults instead of eating .bss (M0's debt, paid)");
+
+    // M3's heartbeat: the GIC and the architectural timer.
+    let freq = arch::aarch64::timer::frequency();
+    println!(
+        "timer      : CNTV @ {freq} Hz - the virtual timer (PPI {} via GICv2)",
+        hal::gicv2::TIMER_IRQ
+    );
+    let gic_typer = board::virt::gic().typer();
+    println!(
+        "gic        : GICv2 - GICD at {:#x}, GICC at {:#x} (TYPER={:#x})",
+        board::virt::GICD_VA,
+        board::virt::GICC_VA,
+        gic_typer
+    );
 
     // What did the bootloader hand us? Under the Linux boot protocol (and
     // m1n1) x0 is a physical FDT pointer. QEMU sets NO registers for
@@ -350,6 +364,10 @@ fn run_command(line: &[u8]) {
             println!("  noexec          execute from .data: instruction abort (PXN)");
             println!("  low             read M1's home address: the low half is condemned (level 0)");
             println!("  abort           read past RAM: the bus-error window, external abort");
+            println!("  --- M3: heartbeat ---");
+            println!("  tick            start the timer: IRQ 27 fires every second, tick counter increments");
+            println!("  ticks           read the tick counter (how many timer interrupts have fired)");
+            println!("  ticktest        arm timer, spin 3 seconds, report tick count (self-test)");
         }
         "brk" => {
             arch::aarch64::vectors::demo_brk();
@@ -418,7 +436,62 @@ fn run_command(line: &[u8]) {
             ) as u64;
             arch::aarch64::vectors::demo_abort(window);
         }
-        other => println!("unknown command {other:?} — try 'help'"),
+        "tick" => {
+            // Arm the timer and unmask IRQ. One tick per second.
+            let freq = arch::aarch64::timer::frequency();
+            let period = freq; // 1 second worth of ticks
+            arch::aarch64::timer::TICK_PERIOD.store(period, core::sync::atomic::Ordering::Relaxed);
+            arch::aarch64::timer::arm(period);
+            // Unmask IRQ at the CPU: clear DAIF.I.
+            unsafe {
+                core::arch::asm!(
+                    "msr DAIFClr, #2", // clear IRQ mask (I bit)
+                    options(nostack, preserves_flags),
+                );
+            }
+            // Read back DAIF to verify I is clear.
+            let daif: u64;
+            unsafe {
+                core::arch::asm!(
+                    "mrs {daif}, DAIF",
+                    daif = out(reg) daif,
+                    options(nomem, nostack, preserves_flags),
+                );
+            }
+            let irq_masked = (daif >> 7) & 1;
+            println!("timer armed: 1 tick/sec ({freq} Hz). DAIF.I={irq_masked} (0=unmasked)");
+            println!("the timer will fire on the next second. Type 'ticks' to check.");
+        }
+        "ticks" => {
+            let n = arch::aarch64::timer::ticks();
+            println!("tick counter: {n}");
+        }
+        "ticktest" => {
+            // Self-test: arm timer, spin for ~3 seconds of real time
+            // (spinning lets interrupts fire), then report the count.
+            let freq = arch::aarch64::timer::frequency();
+            let period = freq; // 1 second
+            arch::aarch64::timer::TICK_PERIOD.store(period, core::sync::atomic::Ordering::Relaxed);
+            arch::aarch64::timer::arm(period);
+            // Unmask IRQ
+            unsafe {
+                core::arch::asm!(
+                    "msr DAIFClr, #2",
+                    options(nostack, preserves_flags),
+                );
+            }
+            println!("ticktest: timer armed, spinning 3 seconds...");
+            // Spin for 3 seconds worth of counter ticks. Interrupts
+            // fire during the spin and bump the tick counter.
+            let start = arch::aarch64::timer::counter();
+            let target = start + 3 * freq;
+            while arch::aarch64::timer::counter() < target {
+                core::hint::spin_loop();
+            }
+            let n = arch::aarch64::timer::ticks();
+            println!("ticktest: {n} ticks in 3 seconds (expect ~3)");
+        }
+        other => println!("unknown command {other:?} - try 'help'"),
     }
 }
 

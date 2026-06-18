@@ -684,20 +684,67 @@ fn print_walk_level(fsc: u64) {
 // IRQ and FIQ: two demux points, deliberately separate
 // ---------------------------------------------------------------------------
 
-/// The IRQ entry point. Today nothing can legitimately raise one — DAIF.I
-/// has been masked since reset and no device interrupt is enabled — so an
-/// IRQ here means broken hardware or broken code, and it is fatal. M3
-/// (GIC + timer) replaces this body with acknowledge → dispatch → EOI and
-/// *returns*, making IRQs the first exceptions that are routine instead
-/// of news.
-fn handle_irq(frame: &TrapFrame, kind: Kind, source: Source) -> ! {
-    report(
-        frame,
-        kind,
-        source,
-        format_args!("IRQ — but interrupts are masked and no source is enabled; impossible today"),
-    );
-    die()
+/// The IRQ entry point. Since M3, this is the heartbeat: the GIC
+/// presents a pending interrupt, we acknowledge it (getting the ID),
+/// dispatch on the ID, signal end-of-interrupt, and *return*. This is
+/// the first exception in Opal that is routine — it runs, does its
+/// job, and resumes the interrupted code, every time.
+///
+/// The dispatch is a `match` on the interrupt ID, with the timer (30)
+/// as the one case today. An unknown ID is reported and dropped (the
+/// EOI still runs, so the GIC does not get stuck) — honest about a
+/// surprise, but not fatal. M6's scheduler will add the timer-tick
+/// preemption path here; M3 just proves the pipe works.
+fn handle_irq(frame: &TrapFrame, kind: Kind, source: Source) {
+    // The frame is unused today — the handler does not modify any
+    // register, and the interrupted code resumes exactly where it
+    // stopped. M6's context switch will read frame.sp and frame.elr;
+    // for now the argument exists so the stub's calling convention
+    // has a stable shape to grow into.
+    let _ = (frame, kind, source);
+
+    let gic = crate::board::virt::gic();
+    let id = gic.acknowledge();
+
+    // 1022-1023 are special "spurious" IDs: the GIC returns them when
+    // nothing is actually pending (e.g. two interrupts raced and the
+    // other context already ack'd). The standard response is to EOI
+    // normally for 1022, and to *not* EOI for 1023 (the GIC drops it).
+    // We treat both as "nothing to do" — a spurious IRQ on a kernel
+    // with one interrupt source is worth a line, not a panic.
+    if id >= 1020 {
+        if id == 1020 {
+            gic.end_interrupt(id);
+        }
+        return;
+    }
+
+    match id {
+        crate::hal::gicv2::TIMER_IRQ => {
+            crate::arch::aarch64::timer::on_tick();
+            // Re-arm the timer for the next period. The period is
+            // stored in a static set by kmain (see `start_ticking`).
+            let period = crate::arch::aarch64::timer::TICK_PERIOD
+                .load(core::sync::atomic::Ordering::Relaxed);
+            if period > 0 {
+                crate::arch::aarch64::timer::rearm(period);
+            }
+        }
+        other => {
+            // Unknown interrupt: report and move on. The EOI is
+            // important — without it the GIC never clears the active
+            // state and the interrupt (or the whole priority band)
+            // is stuck.
+            println!();
+            println!("*** IRQ: unknown interrupt ID {other} — acknowledging and continuing ***");
+        }
+    }
+
+    // End of interrupt: tell the GIC we are done with this ID. Must
+    // match the acknowledged ID exactly. This is the last GIC
+    // operation before returning — after it, the GIC can present the
+    // next pending interrupt (which will be taken after `eret`).
+    gic.end_interrupt(id);
 }
 
 /// The FIQ entry point — kept separate from IRQ on purpose, forever. On

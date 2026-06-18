@@ -9,6 +9,7 @@
 
 pub mod boot;
 pub mod mmu;
+pub mod timer;
 pub mod vectors;
 
 /// Which exception level are we running at? Reads the `CurrentEL` system

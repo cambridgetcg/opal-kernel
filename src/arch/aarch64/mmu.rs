@@ -551,12 +551,33 @@ pub unsafe extern "C" fn opal_build_tables() -> u64 {
     debug_assert!(stack_bottom - guard_bottom == GRANULE);
     debug_assert!(stack_top - image_base <= L2_BLOCK);
 
-    // ---- 3. The UART's L3 table: one live page ---------------------------
-    // Map what we use, not the neighborhood: one Device-nGnRnE page at
-    // the PL011. (M3's GIC at 0x0800_0000 lands in this same table —
-    // a few more entries then, zero new tables.)
+    // ---- 3. The MMIO L3 table: UART + GIC -------------------------------
+    // All three MMIO regions — UART (0x0900_0000), GIC distributor
+    // (0x0800_0000, 64 KiB), and GIC redistributor (0x080a_0000, 128 KiB
+    // for core 0) — share the same 32 MiB L2 slot (L2 index 4, the
+    // 0x0000_0000–0x0200_0000 region). One L3 table covers them all.
+    //
+    // Map what we use, not the neighborhood. The UART is one page; the
+    // GICD is 4 pages (64 KiB); the GICR is 8 pages (128 KiB — two 64 KiB
+    // frames per CPU, and we only need CPU 0's for now).
     let l3m = unsafe { &raw mut TABLES.l3_mmio.0 } as *mut u64;
-    unsafe { l3m.add(l3i(UART0_BASE)).write(page_desc(UART0_BASE as u64, Attr::Device)) };
+    unsafe {
+        // UART: one Device page at 0x0900_0000
+        l3m.add(l3i(UART0_BASE))
+            .write(page_desc(UART0_BASE as u64, Attr::Device));
+
+        // GICv2 Distributor: 4 pages at 0x0800_0000 (64 KiB)
+        for i in 0..4 {
+            let pa = crate::hal::gicv2::GICD_BASE + i * GRANULE;
+            l3m.add(l3i(pa)).write(page_desc(pa as u64, Attr::Device));
+        }
+
+        // GICv2 CPU Interface: 4 pages at 0x0801_0000 (64 KiB)
+        for i in 0..4 {
+            let pa = crate::hal::gicv2::GICC_BASE + i * GRANULE;
+            l3m.add(l3i(pa)).write(page_desc(pa as u64, Attr::Device));
+        }
+    }
 
     // ---- 4. The L2 backbone ----------------------------------------------
     let l2 = unsafe { &raw mut TABLES.l2.0 } as *mut u64;
