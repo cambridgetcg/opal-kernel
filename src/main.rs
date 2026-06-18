@@ -368,9 +368,10 @@ fn kmain(x0: u64) -> ! {
                 // Entry 3: (1, 10, ...) hypervisor -> IRQ 26
                 // GICv2 PPI IRQ = 16 + PPI_number.
                 if let Some(intr) = fdt.prop(&timer, "interrupts") {
-                    if intr.len() >= 24 {
-                        // Entry 2 (virtual timer): cells at offset 6*4..9*4
-                        let ppi_num = u32::from_be_bytes(intr[8..12].try_into().unwrap());
+                    if intr.len() >= 32 {
+                        // Entry 2 (virtual timer): cell index 7 = byte
+                        // offset 28. (type at 24, number at 28, flags at 32)
+                        let ppi_num = u32::from_be_bytes(intr[28..32].try_into().unwrap());
                         let irq = 16 + ppi_num;
                         let irq_match = irq == hal::gicv2::TIMER_IRQ;
                         println!(

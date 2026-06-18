@@ -55,20 +55,27 @@ cargo run                # that's it
 kernel. You should see:
 
 ```
-opal — milestone 2: maps its own world
+opal — milestone 4: reads the handoff
 --------------------------------------
 current EL : EL1
 mmu        : on — SCTLR_EL1 = 0x30d5199d (M, C, I — read back, not assumed)
 granule    : 16 KiB, 48-bit VA — TCR_EL1 = 0x57510b510 (TG0=16K, TG1=16K: different encodings, both checked)
 pa range   : PARange 0b110 (52 bits) -> IPS 0b101 (48 bits; DS=0 caps the output at 48)
-ttbr1      : 0x4021c000 — the kernel's tree (a physical address: the walker speaks PA)
-ttbr0      : 0x40230000 — empty root; ground floor condemned (AT probe: 0x40200000 no longer translates)
-pc         : 0xffff000040204d80 — kmain itself runs in the higher half
+ttbr1      : 0x40224000 — the kernel's tree (a physical address: the walker speaks PA)
+ttbr0      : 0x40238000 — empty root; ground floor condemned (AT probe: 0x40200000 no longer translates)
+pc         : 0xffff000040208c00 — kmain itself runs in the higher half
 vectors    : VBAR_EL1 = 0xffff000040200800 (16-entry table live, upstairs)
 guard      : 16 KiB unmapped below the stack — overflow now faults instead of eating .bss (M0's debt, paid)
+timer      : CNTV @ 1000000000 Hz - the virtual timer (PPI 27 via GICv2)
+gic        : GICv2 - GICD at 0xffff000008000000, GICC at 0xffff000008010000 (TYPER=0x8)
 x0 at entry: 0x0
 fdt at x0  : no  (expected under QEMU ELF boot: x0 is just QEMU's reset zero)
 fdt at RAM base (PA 0x40000000, read via its higher-half alias): yes — QEMU's bare-metal DTB placement
+dtree     : parsed — 1048576 bytes, boot CPU 0
+  /memory : base 0x40000000 (matches board const), size 0x20000000 (matches board const)
+  /intc   : "arm,cortex-a15-gic" — GICD 0x8000000 (matches), GICC 0x8010000 (matches)
+  /pl011  : "arm,pl011" — base 0x9000000 (matches board const)
+  /timer  : "arm,armv8-timer" — virtual timer PPI from the FDT
 
 monitor ready — 'help' lists commands. Ctrl-A X quits QEMU.
 
