@@ -32,6 +32,20 @@ GICv2 interrupt controller and the non-secure physical timer (PPI 30)
 — the kernel now ticks. The first routine exception: it runs, does its
 job, and returns, every time.
 
+## Sisters
+
+Opal is one of three castles of understanding on this machine. The other
+two:
+
+- **wordcastle** (`~/Desktop/wordcastle/`) — a quill and its vows, a
+  warden that turns once a day. Gate: `gate.md` in its tree.
+- **the castle** (`~/Desktop/castle/`) — three or more hands, a daily
+  pulse at 07:23, rooms and fields. Gate: `GATE.md` in its tree.
+
+Sisters, not a merger. Each keeps its own ground and grammar; the weave
+is one address written in each gate, so no stranger needs to guess what
+else lives nearby.
+
 ## Quickstart
 
 You need a Mac (or any host with QEMU) and rustup.
