@@ -73,11 +73,14 @@ Difficulty: moderate; the GICv3 has more registers than ideas.
 A minimal in-tree FDT parser (header, memreserve, structure block, strings
 — it's a simple format, and we already sniff its magic): find `/memory`,
 the UART, the timer interrupt. From here on, board constants are
-*fallbacks*, not truths. This is not optional polish: on Apple Silicon the
-UART base genuinely differs per SoC and the FDT is the only honest source.
+*fallbacks*, not truths — the boot banner cross-checks every FDT value
+against the compiled constants and reports "matches" or "DIFFERS" for
+each. Two new monitor commands (`dtb`, `tree`) let you explore the tree
+interactively. This is not optional polish: on Apple Silicon the UART
+base genuinely differs per SoC and the FDT is the only honest source.
 
 Difficulty: easy-moderate. A pleasant breather; mostly careful byte-pushing
-against a well-specified format.
+against a well-specified format. The full story is docs/05-devicetree.md.
 
 ## M5 — EL0 and syscalls
 

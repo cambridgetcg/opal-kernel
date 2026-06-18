@@ -7,9 +7,10 @@
 //! - RAM at `0x4000_0000`
 //!
 //! Everything else is *supposed* to be discovered from the devicetree blob
-//! QEMU leaves at the start of RAM. We hardcode the UART base anyway -
-//! it has not moved in many years, and the FDT parser is still milestones
-//! away (M4) - but we say so honestly.
+//! QEMU leaves at the start of RAM. We hardcode the UART base anyway - it
+//! has not moved in many years, and the constants serve as cross-checkable
+//! fallbacks (M4's FDT parser verifies them at boot; see
+//! `arch/aarch64/fdt.rs`).
 //!
 //! Since M3 the board also knows the GIC's address. QEMU's virt defaults
 //! to GICv2 (`arm,cortex-a15-gic`); the GICv2 distributor is at

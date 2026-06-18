@@ -1,13 +1,15 @@
-//! Opal — milestone 2: maps its own world.
+//! Opal — milestone 4: reads the handoff.
 //!
 //! This file is still most of the "operating system": print macros backed
 //! by a lock, the banner (which now reads the MMU's registers back as
-//! receipts), a monitor whose commands poke the new address space from
-//! every angle, and a panic handler. The journey from power-on to `kmain`
-//! — which since M2 includes building page tables and climbing to the
-//! higher half — is docs/01-boot-flow.md and docs/04-virtual-memory.md;
-//! the page tables and the enable ceremony are arch/aarch64/mmu.rs; the
-//! exception machinery is arch/aarch64/vectors.rs and docs/03.
+//! receipts AND cross-checks the devicetree against board constants), a
+//! monitor whose commands poke the address space from every angle, and a
+//! panic handler. The journey from power-on to `kmain` — which since M2
+//! includes building page tables and climbing to the higher half — is
+//! docs/01-boot-flow.md and docs/04-virtual-memory.md; the page tables
+//! and the enable ceremony are arch/aarch64/mmu.rs; the exception
+//! machinery is arch/aarch64/vectors.rs and docs/03; the devicetree
+//! parser is arch/aarch64/fdt.rs and docs/05-devicetree.md.
 
 // A kernel cannot use `std` — std assumes an OS underneath (files, threads,
 // an allocator, a way to exit). We *are* the OS. `core` is the dependency-

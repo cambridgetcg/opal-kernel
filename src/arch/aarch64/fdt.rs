@@ -103,8 +103,13 @@ const FDT_MAGIC: u32 = 0xd00d_feed;
 // -----------------------------------------------------------------------
 
 /// The 40-byte FDT header, laid out as the spec defines it. Every field
-/// is a big-endian u32; we byte-swap each one on read.
+/// is a big-endian u32; we byte-swap each one on read. Some fields
+/// (magic, version, ...) are read during validation but never used
+/// again — they stay in the struct because the header is a single
+/// thing, and caching it whole is cleaner than remembering which fields
+/// we dropped.
 #[derive(Clone, Copy, Default)]
+#[allow(dead_code)]
 struct Header {
     /// `0xd00d_feed` — the "is this really a DTB?" canary.
     magic: u32,
@@ -144,6 +149,7 @@ impl Header {
 /// (terminated by the all-zeros entry), but a real bootloader can use
 /// it to protect initrd images or the DTB itself.
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 pub struct ReserveEntry {
     /// Physical address of the reserved region.
     pub address: u64,
@@ -179,6 +185,7 @@ unsafe fn read_be_u32(base: usize, offset: usize, totalsize: usize) -> Option<u3
 /// # Safety
 ///
 /// Same contract as [`read_be_u32`].
+#[allow(dead_code)]
 unsafe fn read_be_u64(base: usize, offset: usize, totalsize: usize) -> Option<u64> {
     if offset + 8 > totalsize {
         return None;
@@ -355,6 +362,7 @@ impl Fdtr {
     /// all-zeros terminator (or the end of the blob, whichever comes
     /// first). Each entry is 16 bytes: a big-endian u64 address
     /// followed by a big-endian u64 size.
+    #[allow(dead_code)]
     pub fn reserves(&self) -> ReserveIter<'_> {
         ReserveIter {
             fdt: self,
@@ -449,6 +457,7 @@ impl Fdtr {
     /// this returns `"memory"`; for a bare `aliases` node it returns
     /// `"aliases"`. The unit address is the part after `@`; nodes that
     /// have no `@` return their full name.
+    #[allow(dead_code)]
     pub fn name(&self, node: &Node) -> &str {
         let raw = self.node_name_raw(node).unwrap_or("");
         // Split at '@' — the part before is the bare node name.
@@ -554,6 +563,7 @@ impl Fdtr {
     /// UTF-8 string and return the part before the null. Many DTB
     /// string properties are single-valued (e.g. `device_type`); the
     /// null terminator is the spec's way of saying "string ends here."
+    #[allow(dead_code)]
     pub fn prop_str(&self, node: &Node, name: &str) -> Option<&str> {
         let data = self.prop(node, name)?;
         // Find the null terminator; everything before it is the string.
@@ -563,6 +573,7 @@ impl Fdtr {
 
     /// A u32 property: the raw bytes are a single big-endian u32.
     /// Returns `None` if the property is missing or not exactly 4 bytes.
+    #[allow(dead_code)]
     pub fn prop_u32(&self, node: &Node, name: &str) -> Option<u32> {
         let data = self.prop(node, name)?;
         if data.len() < 4 {
@@ -575,6 +586,7 @@ impl Fdtr {
 
     /// A u64 property: the raw bytes are a single big-endian u64.
     /// Returns `None` if the property is missing or not exactly 8 bytes.
+    #[allow(dead_code)]
     pub fn prop_u64(&self, node: &Node, name: &str) -> Option<u64> {
         let data = self.prop(node, name)?;
         if data.len() < 8 {
@@ -590,6 +602,7 @@ impl Fdtr {
     /// This yields each cell in order; trailing bytes that do not fill
     /// a complete u32 are ignored (well-formed properties are always
     /// 4-byte multiples).
+    #[allow(dead_code)]
     pub fn prop_cells(&self, node: &Node, name: &str) -> CellIter<'_> {
         let data = self.prop(node, name).unwrap_or(&[]);
         CellIter { data, pos: 0 }
@@ -601,6 +614,7 @@ impl Fdtr {
     /// `FDT_BEGIN_NODE` ... `FDT_END_NODE` pair nested inside the
     /// parent. Properties of the parent are skipped; only child nodes
     /// are yielded.
+    #[allow(dead_code)]
     pub fn children(&self, node: &Node) -> NodeIter<'_> {
         NodeIter {
             fdt: self,
@@ -831,13 +845,16 @@ impl Fdtr {
 // -----------------------------------------------------------------------
 
 /// Iterator over the memory reserve map entries.
+#[allow(dead_code)]
 pub struct ReserveIter<'a> {
     fdt: &'a Fdtr,
     offset: usize,
 }
 
 /// A reserve-map entry that signals "end of map" — the all-zeros pair.
+#[allow(dead_code)]
 const RESERVE_END_ADDR: u64 = 0;
+#[allow(dead_code)]
 const RESERVE_END_SIZE: u64 = 0;
 
 impl<'a> Iterator for ReserveIter<'a> {
@@ -858,6 +875,7 @@ impl<'a> Iterator for ReserveIter<'a> {
 
 /// Iterator over the u32 cells of a property. Each `next()` yields one
 /// big-endian u32 decoded from the property's raw bytes.
+#[allow(dead_code)]
 pub struct CellIter<'a> {
     data: &'a [u8],
     pos: usize,
@@ -888,6 +906,7 @@ impl<'a> Iterator for CellIter<'a> {
 ///
 /// The iterator stops when it sees `FDT_END_NODE` at depth zero — that
 /// is the parent's own closing token, meaning no more children remain.
+#[allow(dead_code)]
 pub struct NodeIter<'a> {
     fdt: &'a Fdtr,
     /// Current byte offset in the structure block. Zero means

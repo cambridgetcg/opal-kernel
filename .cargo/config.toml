@@ -29,8 +29,8 @@ target = "aarch64-unknown-none-softfloat"
 #   -smp 1          one core until we have something to say to the others
 #   -m 512M         RAM size — mirrored by board::virt::RAM_SIZE, which the
 #                   kernel uses to bound its devicetree sniffing; change
-#                   the two together (until M4's FDT parser reads the real
-#                   size from the DTB's /memory node)
+#                   the two together (or read the real size from the DTB's
+#                   /memory node, which M4's parser now does at boot)
 #   -nographic      no window; the UART is wired to your terminal
 #                   (Ctrl-A X quits QEMU, Ctrl-A C toggles the monitor)
 runner = "qemu-system-aarch64 -machine virt -cpu max -smp 1 -m 512M -nographic -kernel"
