@@ -57,7 +57,7 @@ maintenance in the enable path is reviewed against Linux/m1n1 but
 unprovable on TCG (every cache op is a NOP there); its first real test
 is M7's silicon. `SCTLR.WXN` deferred to M5's hardening pass.
 
-## M3 — time and interrupts
+## M3 — time and interrupts ✅
 
 The architectural timer (`CNTP_*`), the GICv3 on virt: enable, route,
 acknowledge, EOI. A timer tick, interrupt-driven UART RX replacing the
