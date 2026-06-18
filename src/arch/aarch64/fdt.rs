@@ -718,14 +718,7 @@ impl Fdtr {
 
     /// Print a node and its subtree at the given indentation depth.
     fn dump_node(&self, node: &Node, depth: usize) {
-        // `str::repeat` needs `alloc`, which we don't have in `no_std`.
-        // A fixed buffer of spaces is the no-alloc equivalent for a
-        // bounded-depth tree. Devicetrees are shallow (rarely deeper
-        // than 8 levels), so 32 bytes of indent is generous.
-        const MAX_DEPTH: usize = 16;
-        let mut indent_buf = [b' '; MAX_DEPTH * 2];
-        let indent_len = (depth * 2).min(MAX_DEPTH * 2);
-        let indent = core::str::from_utf8(&indent_buf[..indent_len]).unwrap_or("");
+        let indent = indent_str(depth);
         let name = self.full_name(node);
         let label = if name.is_empty() { "/" } else { name };
         println!("{indent}{label}");
@@ -762,8 +755,7 @@ impl Fdtr {
                 None => break,
             };
             // Format the property value.
-            let prop_len = ((depth + 1) * 2).min(MAX_DEPTH * 2);
-            let prop_indent = core::str::from_utf8(&indent_buf[..prop_len]).unwrap_or("");
+            let prop_indent = indent_str(depth + 1);
             print!("{prop_indent}{pname} = ");
             self.print_prop_value(data);
             off += (len + 3) & !3;

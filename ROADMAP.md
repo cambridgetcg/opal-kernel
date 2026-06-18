@@ -68,7 +68,7 @@ controller-agnostic, sized for exactly two implementors.
 
 Difficulty: moderate; the GICv3 has more registers than ideas.
 
-## M4 — devicetree, for real
+## M4 — devicetree, for real ✅
 
 A minimal in-tree FDT parser (header, memreserve, structure block, strings
 — it's a simple format, and we already sniff its magic): find `/memory`,

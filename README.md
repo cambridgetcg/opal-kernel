@@ -17,20 +17,13 @@ granule precisely so we could rehearse for Apple's IOMMUs). See
 [docs/02-hal-and-apple-silicon.md](docs/02-hal-and-apple-silicon.md)
 for the full story of how the two boards relate.
 
-**Current state: Milestone 3 — "has a heartbeat."** Everything from M2
-still holds — the kernel builds its own page tables (16 KiB granule,
-four-level walk), turns on the MMU and caches, and moves to the higher
-half (loads at physical `0x4020_0000`, *runs* at
-`0xFFFF_0000_4020_0000`-and-up, low half condemned behind it). The image
-is W^X, the 16 KiB guard page below the stack turns silent overflow into
-a loud report (M0's oldest debt, paid), and the monitor grew oracles
-(`translate`, `walk`) plus five fatal commands that each demonstrate a
-distinct fault syndrome. M1's fatal `unaligned` demo is now a *survivor*:
-the same load that used to kill the kernel just returns its bytes,
-because RAM is finally Normal memory. On top of all that, M3 adds a
-GICv2 interrupt controller and the non-secure physical timer (PPI 30)
-— the kernel now ticks. The first routine exception: it runs, does its
-job, and returns, every time.
+**Current state: Milestone 4 — "reads the handoff."** Everything from M3
+still holds — the kernel ticks, catches faults, maps its own world. M4
+adds a minimal in-tree FDT (Flattened Devicetree) parser: the kernel now
+reads QEMU's DTB at boot and discovers /memory, /intc, /pl011, /timer
+from the machine's own description, cross-checking each against the
+hardcoded board constants. From here on, those constants are fallbacks,
+not truths. New monitor commands `dtb` and `tree` dump the parsed tree.
 
 ## Sisters
 
