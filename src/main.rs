@@ -164,7 +164,7 @@ fn kmain(x0: u64) -> ! {
     arch::aarch64::mmu::condemn_low_half();
 
     println!();
-    println!("opal — milestone 3: has a heartbeat");
+    println!("opal — milestone 4: reads the handoff");
     println!("----------------------------------");
 
     // Privilege check. QEMU virt without virtualization=on/secure=on has
@@ -214,7 +214,9 @@ fn kmain(x0: u64) -> ! {
         "vectors    : VBAR_EL1 = {:#x} (16-entry table live, upstairs)",
         arch::aarch64::vectors::vbar()
     );
-    println!("guard      : 16 KiB unmapped below the stack - overflow now faults instead of eating .bss (M0's debt, paid)");
+    println!(
+        "guard      : 16 KiB unmapped below the stack - overflow now faults instead of eating .bss (M0's debt, paid)"
+    );
 
     // M3's heartbeat: the GIC and the architectural timer.
     let freq = arch::aarch64::timer::frequency();
@@ -247,9 +249,146 @@ fn kmain(x0: u64) -> ! {
     // the higher-half alias: the PA itself stopped translating above.
     let ram_base = board::virt::RAM_BASE as u64;
     if fdt_at(ram_base) {
-        println!("fdt at RAM base (PA {ram_base:#x}, read via its higher-half alias): yes — QEMU's bare-metal DTB placement");
+        println!(
+            "fdt at RAM base (PA {ram_base:#x}, read via its higher-half alias): yes — QEMU's bare-metal DTB placement"
+        );
     } else {
-        println!("fdt at RAM base (PA {ram_base:#x}, read via its higher-half alias): no — unexpected, check linker.ld load address");
+        println!(
+            "fdt at RAM base (PA {ram_base:#x}, read via its higher-half alias): no — unexpected, check linker.ld load address"
+        );
+    }
+
+    // M4: parse the devicetree for real. The FDT at RAM base is the one
+    // QEMU actually placed; if it's there, walk it and cross-check what
+    // the machine says about itself against the constants we compiled
+    // with. From here on, those constants are *fallbacks*, not truths —
+    // the FDT is the honest source. On Apple Silicon (M7) the UART base
+    // genuinely differs per SoC, and the FDT is the only way to know.
+    if fdt_at(ram_base) {
+        if let Some(fdt) = arch::aarch64::fdt::Fdtr::new(ram_base as usize) {
+            println!(
+                "dtree     : parsed — {} bytes, boot CPU {}",
+                fdt.totalsize(),
+                fdt.boot_cpuid()
+            );
+
+            // /memory — the machine's RAM, as QEMU declares it. Cross-
+            // check against board::virt's hardcoded RAM_BASE/RAM_SIZE.
+            if let Some(mem) = fdt.find("/memory") {
+                if let Some(reg) = fdt.prop(&mem, "reg") {
+                    if reg.len() >= 16 {
+                        let base = u64::from_be_bytes(reg[0..8].try_into().unwrap());
+                        let size = u64::from_be_bytes(reg[8..16].try_into().unwrap());
+                        let base_match = base as usize == board::virt::RAM_BASE;
+                        let size_match = size as usize == board::virt::RAM_SIZE;
+                        println!(
+                            "  /memory : base {base:#x} ({}), size {size:#x} ({})",
+                            if base_match {
+                                "matches board const"
+                            } else {
+                                "DIFFERS from board const!"
+                            },
+                            if size_match {
+                                "matches board const"
+                            } else {
+                                "DIFFERS from board const!"
+                            },
+                        );
+                    }
+                }
+            } else {
+                println!("  /memory : not found");
+            }
+
+            // The interrupt controller. The `compatible` string tells
+            // us which GIC driver to use; the `reg` property gives its
+            // MMIO addresses. Cross-check against our GICv2 constants.
+            if let Some(gic) = fdt.find("/intc") {
+                let compat = fdt.compatible(&gic);
+                if !compat.is_empty() {
+                    // Read the GIC's reg property: two (addr, size) pairs
+                    // for GICD and GICC. With #address-cells=2 and
+                    // #size-cells=2, each pair is 16 bytes.
+                    if let Some(reg) = fdt.prop(&gic, "reg") {
+                        if reg.len() >= 32 {
+                            let gicd_base = u64::from_be_bytes(reg[0..8].try_into().unwrap());
+                            let gicc_base = u64::from_be_bytes(reg[16..24].try_into().unwrap());
+                            let gicd_match = gicd_base as usize == hal::gicv2::GICD_BASE;
+                            let gicc_match = gicc_base as usize == hal::gicv2::GICC_BASE;
+                            println!(
+                                "  /intc   : \"{compat}\" — GICD {gicd_base:#x} ({}), GICC {gicc_base:#x} ({})",
+                                if gicd_match { "matches" } else { "DIFFERS!" },
+                                if gicc_match { "matches" } else { "DIFFERS!" },
+                            );
+                        }
+                    } else {
+                        println!("  /intc   : \"{compat}\" (reg not found)");
+                    }
+                }
+            } else {
+                println!("  /intc   : not found");
+            }
+
+            // The UART — our PL011. Cross-check the address.
+            if let Some(uart) = fdt.find("/pl011") {
+                let compat = fdt.compatible(&uart);
+                if let Some(reg) = fdt.prop(&uart, "reg") {
+                    if reg.len() >= 16 {
+                        let uart_base = u64::from_be_bytes(reg[0..8].try_into().unwrap());
+                        let uart_match = uart_base as usize == board::virt::UART0_BASE;
+                        println!(
+                            "  /pl011  : \"{compat}\" — base {uart_base:#x} ({})",
+                            if uart_match {
+                                "matches board const"
+                            } else {
+                                "DIFFERS!"
+                            },
+                        );
+                    }
+                } else if !compat.is_empty() {
+                    println!("  /pl011  : \"{compat}\" (reg not found)");
+                }
+            } else {
+                println!("  /pl011  : not found");
+            }
+
+            // The architectural timer. Its `interrupts` property lists
+            // four PPIs; we use the virtual timer (PPI 27, the third
+            // entry: type=1 PPI, number=11, flags=0x104).
+            if let Some(timer) = fdt.find("/timer") {
+                let compat = fdt.compatible(&timer);
+                if !compat.is_empty() {
+                    println!("  /timer  : \"{compat}\"");
+                }
+                // The interrupts property has 4 entries × 3 cells = 12 u32s.
+                // Each entry: (type, number, flags). PPI type=1.
+                // Entry 0: (1, 13, ...) secure physical  -> IRQ 29
+                // Entry 1: (1, 14, ...) non-secure physical -> IRQ 30
+                // Entry 2: (1, 11, ...) virtual -> IRQ 27  <- ours
+                // Entry 3: (1, 10, ...) hypervisor -> IRQ 26
+                // GICv2 PPI IRQ = 16 + PPI_number.
+                if let Some(intr) = fdt.prop(&timer, "interrupts") {
+                    if intr.len() >= 24 {
+                        // Entry 2 (virtual timer): cells at offset 6*4..9*4
+                        let ppi_num = u32::from_be_bytes(intr[8..12].try_into().unwrap());
+                        let irq = 16 + ppi_num;
+                        let irq_match = irq == hal::gicv2::TIMER_IRQ;
+                        println!(
+                            "           virtual timer PPI {ppi_num} -> IRQ {irq} ({})",
+                            if irq_match {
+                                "matches TIMER_IRQ"
+                            } else {
+                                "DIFFERS!"
+                            },
+                        );
+                    }
+                }
+            } else {
+                println!("  /timer  : not found");
+            }
+        } else {
+            println!("dtree     : magic found but header invalid — using board constants");
+        }
     }
 
     println!();
@@ -319,7 +458,10 @@ fn parange_bits(enc: u64) -> u64 {
 
 /// Parse a monitor hex argument: `0x` prefix optional, case-insensitive.
 fn parse_hex(s: &str) -> Option<u64> {
-    let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    let s = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
     u64::from_str_radix(s, 16).ok()
 }
 
@@ -357,17 +499,30 @@ fn run_command(line: &[u8]) {
             println!("  unaligned       M1's killer, defanged: Normal memory tolerates it now");
             println!("  --- oracles ---");
             println!("  translate <va>  ask AT S1E1R where a virtual address really goes");
-            println!("  walk <va>       narrate the page-table walk, then cross-check the hardware");
+            println!(
+                "  walk <va>       narrate the page-table walk, then cross-check the hardware"
+            );
             println!("  --- FATAL (one fault syndrome each) ---");
             println!("  guard           write below the stack: translation fault, level 3");
             println!("  wx              write to .rodata: permission fault");
             println!("  noexec          execute from .data: instruction abort (PXN)");
-            println!("  low             read M1's home address: the low half is condemned (level 0)");
+            println!(
+                "  low             read M1's home address: the low half is condemned (level 0)"
+            );
             println!("  abort           read past RAM: the bus-error window, external abort");
             println!("  --- M3: heartbeat ---");
-            println!("  tick            start the timer: IRQ 27 fires every second, tick counter increments");
-            println!("  ticks           read the tick counter (how many timer interrupts have fired)");
+            println!(
+                "  tick            start the timer: IRQ 27 fires every second, tick counter increments"
+            );
+            println!(
+                "  ticks           read the tick counter (how many timer interrupts have fired)"
+            );
             println!("  ticktest        arm timer, spin 3 seconds, report tick count (self-test)");
+            println!("  --- M4: devicetree ---");
+            println!(
+                "  dtb             show parsed devicetree: header, /memory, /intc, /pl011, /timer"
+            );
+            println!("  tree            dump the full devicetree tree (nodes, properties, values)");
         }
         "brk" => {
             arch::aarch64::vectors::demo_brk();
@@ -431,9 +586,9 @@ fn run_command(line: &[u8]) {
             // mmu.rs maps this 32 MiB Device precisely so the walk
             // succeeds and the BUS gets to say no (DFSC 0x10), the way
             // every bad address failed before M2.
-            let window = arch::aarch64::mmu::phys_to_virt(
-                board::virt::RAM_BASE + board::virt::RAM_SIZE,
-            ) as u64;
+            let window =
+                arch::aarch64::mmu::phys_to_virt(board::virt::RAM_BASE + board::virt::RAM_SIZE)
+                    as u64;
             arch::aarch64::vectors::demo_abort(window);
         }
         "tick" => {
@@ -475,10 +630,7 @@ fn run_command(line: &[u8]) {
             arch::aarch64::timer::arm(period);
             // Unmask IRQ
             unsafe {
-                core::arch::asm!(
-                    "msr DAIFClr, #2",
-                    options(nostack, preserves_flags),
-                );
+                core::arch::asm!("msr DAIFClr, #2", options(nostack, preserves_flags),);
             }
             println!("ticktest: timer armed, spinning 3 seconds...");
             // Spin for 3 seconds worth of counter ticks. Interrupts
@@ -490,6 +642,106 @@ fn run_command(line: &[u8]) {
             }
             let n = arch::aarch64::timer::ticks();
             println!("ticktest: {n} ticks in 3 seconds (expect ~3)");
+        }
+        "dtb" => {
+            // Re-parse the FDT and print a summary: the bootloader's
+            // honest description of the machine, cross-checked against
+            // the board constants we compiled with.
+            let ram_base = board::virt::RAM_BASE as u64;
+            if !fdt_at(ram_base) {
+                println!("no FDT at RAM base ({ram_base:#x})");
+            } else if let Some(fdt) = arch::aarch64::fdt::Fdtr::new(ram_base as usize) {
+                println!(
+                    "FDT at {ram_base:#x} — {} bytes, boot CPU {}",
+                    fdt.totalsize(),
+                    fdt.boot_cpuid()
+                );
+                println!("reservations:");
+                let mut rsv_count = 0;
+                for r in fdt.reserves() {
+                    println!(
+                        "  [{rsv_count}] addr={:#018x} size={:#018x}",
+                        r.address, r.size
+                    );
+                    rsv_count += 1;
+                }
+                if rsv_count == 0 {
+                    println!("  (none)");
+                }
+                // /memory
+                if let Some(mem) = fdt.find("/memory") {
+                    let name = fdt.full_name(&mem);
+                    if let Some(reg) = fdt.prop(&mem, "reg") {
+                        if reg.len() >= 16 {
+                            let base = u64::from_be_bytes(reg[0..8].try_into().unwrap());
+                            let size = u64::from_be_bytes(reg[8..16].try_into().unwrap());
+                            println!(
+                                "{name}: base {base:#x}, size {size:#x} ({} MiB)",
+                                size / (1024 * 1024)
+                            );
+                        }
+                    }
+                }
+                // /intc
+                if let Some(gic) = fdt.find("/intc") {
+                    let compat = fdt.compatible(&gic);
+                    println!("intc: compatible \"{compat}\"");
+                    if let Some(reg) = fdt.prop(&gic, "reg") {
+                        if reg.len() >= 32 {
+                            let gicd = u64::from_be_bytes(reg[0..8].try_into().unwrap());
+                            let gicc = u64::from_be_bytes(reg[16..24].try_into().unwrap());
+                            println!("      GICD {gicd:#x}, GICC {gicc:#x}");
+                        }
+                    }
+                }
+                // /pl011
+                if let Some(uart) = fdt.find("/pl011") {
+                    let compat = fdt.compatible(&uart);
+                    println!("pl011: compatible \"{compat}\"");
+                    if let Some(reg) = fdt.prop(&uart, "reg") {
+                        if reg.len() >= 16 {
+                            let base = u64::from_be_bytes(reg[0..8].try_into().unwrap());
+                            println!("      base {base:#x}");
+                        }
+                    }
+                }
+                // /timer
+                if let Some(timer) = fdt.find("/timer") {
+                    let compat = fdt.compatible(&timer);
+                    println!("timer: compatible \"{compat}\"");
+                    if let Some(intr) = fdt.prop(&timer, "interrupts") {
+                        let cells = intr.len() / 4;
+                        print!("      interrupts: {cells} cells <",);
+                        for i in 0..cells {
+                            if i > 0 {
+                                print!(" ");
+                            }
+                            let v = u32::from_be_bytes(intr[i * 4..i * 4 + 4].try_into().unwrap());
+                            print!("{v:#x}");
+                        }
+                        println!(">");
+                    }
+                }
+            } else {
+                println!("FDT magic found but header invalid");
+            }
+        }
+        "tree" => {
+            // Dump the full devicetree tree. This is the raw view of
+            // what QEMU declared — every node, every property, every
+            // value. A teaching tool: compare this with `dtc -I dtb -O
+            // dts /tmp/virt.dtb` to see the same data in a different
+            // rendering.
+            let ram_base = board::virt::RAM_BASE as u64;
+            if !fdt_at(ram_base) {
+                println!("no FDT at RAM base ({ram_base:#x})");
+            } else if let Some(fdt) = arch::aarch64::fdt::Fdtr::new(ram_base as usize) {
+                println!("=== devicetree dump ({} bytes) ===", fdt.totalsize());
+                fdt.dump();
+                println!("=== end ===");
+            } else {
+                println!("FDT magic found but header invalid");
+            }
         }
         other => println!("unknown command {other:?} - try 'help'"),
     }

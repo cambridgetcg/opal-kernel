@@ -421,7 +421,10 @@ extern "C" fn exception_dispatch(frame: &mut TrapFrame, kind: u64, source: u64) 
         println!();
         println!("*** nested exception while reporting an exception ***");
         println!("  the first report's ESR/ELR were just overwritten; trusting nothing.");
-        println!("  new esr: {:#018x}  new elr: {:#018x}", frame.esr, frame.elr);
+        println!(
+            "  new esr: {:#018x}  new elr: {:#018x}",
+            frame.esr, frame.elr
+        );
         super::park();
     }
 
@@ -543,7 +546,11 @@ fn handle_sync(frame: &mut TrapFrame, kind: Kind, source: Source) {
             // read), DFSC = bits [5:0], FnV = bit 10 (FAR not valid —
             // possible only for external aborts).
             let dfsc = iss & 0x3f;
-            let wnr = if iss & (1 << 6) != 0 { "write to" } else { "read from" };
+            let wnr = if iss & (1 << 6) != 0 {
+                "write to"
+            } else {
+                "read from"
+            };
             if iss & (1 << 10) == 0 {
                 report(
                     frame,
@@ -656,17 +663,27 @@ pub(crate) fn fault_status(fsc: u64) -> &'static str {
     match fsc {
         // 0b0001LL, 0b0010LL, 0b0011LL: LL = the table walk level 0-3
         // (printed separately by print_walk_level).
-        0x04..=0x07 => "translation fault — the walk hit an INVALID descriptor: \
-                 nothing is mapped at this address",
-        0x08..=0x0b => "access-flag fault — a mapping with AF=0. mmu.rs's constructors \
-                 bake AF in, so suspect a hand-written descriptor",
-        0x0c..=0x0f => "permission fault — mapped, but the descriptor forbids this \
-                 access; W^X doing its job",
-        0x10 => "synchronous external abort — the translation SUCCEEDED and the bus \
-                 said no: mapped, but nothing lives there",
+        0x04..=0x07 => {
+            "translation fault — the walk hit an INVALID descriptor: \
+                 nothing is mapped at this address"
+        }
+        0x08..=0x0b => {
+            "access-flag fault — a mapping with AF=0. mmu.rs's constructors \
+                 bake AF in, so suspect a hand-written descriptor"
+        }
+        0x0c..=0x0f => {
+            "permission fault — mapped, but the descriptor forbids this \
+                 access; W^X doing its job"
+        }
+        0x10 => {
+            "synchronous external abort — the translation SUCCEEDED and the bus \
+                 said no: mapped, but nothing lives there"
+        }
         0x14..=0x17 => "synchronous external abort during a page-table walk",
-        0x21 => "alignment fault — Device memory (MMIO) forbids unaligned access \
-                 (Normal memory has tolerated it since M2)",
+        0x21 => {
+            "alignment fault — Device memory (MMIO) forbids unaligned access \
+                 (Normal memory has tolerated it since M2)"
+        }
         _ => "a fault status this kernel does not decode (DDI 0601, ESR_EL1 has the full list)",
     }
 }
@@ -758,7 +775,9 @@ fn handle_fiq(frame: &TrapFrame, kind: Kind, source: Source) -> ! {
         frame,
         kind,
         source,
-        format_args!("FIQ — nothing routes to FIQ on QEMU; on Apple Silicon this is the timer (M7)"),
+        format_args!(
+            "FIQ — nothing routes to FIQ on QEMU; on Apple Silicon this is the timer (M7)"
+        ),
     );
     die()
 }
@@ -774,8 +793,14 @@ fn report(frame: &TrapFrame, kind: Kind, source: Source, cause: fmt::Arguments<'
     println!();
     println!("*** exception: {}, from {} ***", kind.name(), source.name());
     println!("  cause   : {cause}");
-    println!("  esr     : {:#018x}  (syndrome — decoded above)", frame.esr);
-    println!("  elr     : {:#018x}  (preferred return address)", frame.elr);
+    println!(
+        "  esr     : {:#018x}  (syndrome — decoded above)",
+        frame.esr
+    );
+    println!(
+        "  elr     : {:#018x}  (preferred return address)",
+        frame.elr
+    );
     println!("  spsr    : {:#018x}  (interrupted PSTATE)", frame.spsr);
     println!(
         "  far     : {:#018x}  (fault address — aborts/alignment only)",
@@ -804,8 +829,7 @@ fn report(frame: &TrapFrame, kind: Kind, source: Source, cause: fmt::Arguments<'
     };
     println!(
         "    x30 {:#018x}    sp  {:#018x}{sp_note}",
-        frame.x[30],
-        frame.sp
+        frame.x[30], frame.sp
     );
 }
 

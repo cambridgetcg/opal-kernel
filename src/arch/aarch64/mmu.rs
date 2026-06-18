@@ -885,7 +885,9 @@ pub fn walk(va: u64) {
     ];
     for (level, (i, lname)) in idx.iter().enumerate() {
         if table_pa < tables_pa || table_pa >= tables_pa + tables_len {
-            println!("  {lname}: table PA {table_pa:#x} is outside the kernel's six tables — corrupt descriptor?");
+            println!(
+                "  {lname}: table PA {table_pa:#x} is outside the kernel's six tables — corrupt descriptor?"
+            );
             return;
         }
         // SAFETY: in range of TABLES (checked above), whose provenance
@@ -900,27 +902,39 @@ pub fn walk(va: u64) {
         let pa_field = desc & 0x0000_FFFF_FFFF_C000;
         match (desc & 0b11, level) {
             (0b00, _) | (0b10, _) => {
-                println!("  {lname}[{i}] = {desc:#018x} — INVALID: the walk ends here in a translation fault (level {level})");
+                println!(
+                    "  {lname}[{i}] = {desc:#018x} — INVALID: the walk ends here in a translation fault (level {level})"
+                );
                 return;
             }
             (0b01, 3) => {
-                println!("  {lname}[{i}] = {desc:#018x} — bits[1:0]=0b01 at L3 is RESERVED-invalid (a block pattern in a page slot): translation fault");
+                println!(
+                    "  {lname}[{i}] = {desc:#018x} — bits[1:0]=0b01 at L3 is RESERVED-invalid (a block pattern in a page slot): translation fault"
+                );
                 return;
             }
             (0b01, 2) => {
                 // A block's output address starts at bit 25, not 14 —
                 // print the block mask, not the page mask.
                 let block_pa = desc & 0x0000_FFFF_FE00_0000;
-                println!("  {lname}[{i}] = {desc:#018x} — 32 MiB block at PA {block_pa:#x} {}", decode_leaf(desc));
+                println!(
+                    "  {lname}[{i}] = {desc:#018x} — 32 MiB block at PA {block_pa:#x} {}",
+                    decode_leaf(desc)
+                );
                 finish_walk(va, block_pa | (va & 0x1FF_FFFF));
                 return;
             }
             (0b01, _) => {
-                println!("  {lname}[{i}] = {desc:#018x} — a block descriptor at {lname}?! 16K/DS=0 has no blocks above L2: reserved, translation fault");
+                println!(
+                    "  {lname}[{i}] = {desc:#018x} — a block descriptor at {lname}?! 16K/DS=0 has no blocks above L2: reserved, translation fault"
+                );
                 return;
             }
             (0b11, 3) => {
-                println!("  {lname}[{i}] = {desc:#018x} — 16 KiB page at PA {pa_field:#x} {}", decode_leaf(desc));
+                println!(
+                    "  {lname}[{i}] = {desc:#018x} — 16 KiB page at PA {pa_field:#x} {}",
+                    decode_leaf(desc)
+                );
                 finish_walk(va, pa_field | (va & 0x3FFF));
                 return;
             }
@@ -937,13 +951,19 @@ pub fn walk(va: u64) {
 fn finish_walk(va: u64, soft_pa: u64) {
     match translate(va) {
         Ok(hw_pa) if hw_pa == soft_pa => {
-            println!("  software walk says PA {soft_pa:#x}; AT S1E1R agrees — the narration above is the real mechanism");
+            println!(
+                "  software walk says PA {soft_pa:#x}; AT S1E1R agrees — the narration above is the real mechanism"
+            );
         }
         Ok(hw_pa) => {
-            println!("  software walk says PA {soft_pa:#x}, but AT S1E1R says {hw_pa:#x} — ONE OF THEM IS WRONG; trust the hardware, debug the narrator");
+            println!(
+                "  software walk says PA {soft_pa:#x}, but AT S1E1R says {hw_pa:#x} — ONE OF THEM IS WRONG; trust the hardware, debug the narrator"
+            );
         }
         Err(par) => {
-            println!("  software walk says PA {soft_pa:#x}, but AT S1E1R FAULTS (PAR {par:#018x}) — the walker sees something the narrator missed");
+            println!(
+                "  software walk says PA {soft_pa:#x}, but AT S1E1R FAULTS (PAR {par:#018x}) — the walker sees something the narrator missed"
+            );
         }
     }
 }

@@ -16,7 +16,7 @@
 //! 0x0800_0000 and the CPU interface at 0x0801_0000, both from the DTB.
 
 use crate::arch::aarch64::mmu;
-use crate::hal::gicv2::{GicV2, GICC_BASE, GICD_BASE, TIMER_IRQ};
+use crate::hal::gicv2::{GICC_BASE, GICD_BASE, GicV2, TIMER_IRQ};
 use crate::hal::pl011::Pl011;
 
 /// Start of RAM, physical.

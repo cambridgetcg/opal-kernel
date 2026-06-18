@@ -253,7 +253,7 @@ _start:
 /// Must only be reached from `_start` above — it assumes the environment
 /// that stub created.
 #[unsafe(no_mangle)] // edition 2024: no_mangle is an unsafe attribute,
-                     // because colliding symbol names break linkage soundness
+// because colliding symbol names break linkage soundness
 pub unsafe extern "C" fn _start_rust(x0: u64) -> ! {
     crate::kmain(x0)
 }

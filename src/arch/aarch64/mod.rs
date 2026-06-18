@@ -8,6 +8,7 @@
 //! allowed to know how.
 
 pub mod boot;
+pub mod fdt;
 pub mod mmu;
 pub mod timer;
 pub mod vectors;
