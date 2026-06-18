@@ -1,5 +1,5 @@
-//! AArch64-specific code: the boot stub, the exception vectors, and small
-//! CPU helpers.
+//! AArch64-specific code: the boot stub, the exception vectors, the MMU,
+//! and small CPU helpers.
 //!
 //! Everything in this directory is allowed to use `core::arch::asm!` and
 //! to know AArch64 system-register names. Nothing outside it is. That is
@@ -8,6 +8,7 @@
 //! allowed to know how.
 
 pub mod boot;
+pub mod mmu;
 pub mod vectors;
 
 /// Which exception level are we running at? Reads the `CurrentEL` system
@@ -67,6 +68,21 @@ pub fn daif_restore(daif: u64) {
             options(nostack, preserves_flags)
         );
     }
+}
+
+/// Where is this code executing *right now*? `adr` computes an address
+/// PC-relatively, so the answer is the truth about the program counter —
+/// since M2, the banner uses it to prove kmain really runs in the higher
+/// half, rather than asserting it.
+pub fn here() -> u64 {
+    let pc: u64;
+    // SAFETY: adr is pure address arithmetic on the PC; it cannot fault
+    // or change state.
+    unsafe {
+        core::arch::asm!("adr {pc}, .", pc = out(reg) pc,
+                         options(nomem, nostack, preserves_flags));
+    }
+    pc
 }
 
 /// Stop this core forever, in the lowest-power way available.

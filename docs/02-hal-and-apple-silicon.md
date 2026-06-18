@@ -77,7 +77,7 @@ Linux-protocol contract. The differences that matter:
 | image format | ELF | flat arm64 "Image"-format binary (Linux-style header) |
 | console | PL011 at a known address | Samsung-style **s5l UART**, base discovered from the FDT (differs per SoC) |
 | interrupt controller | GIC | **AIC/AICv2**, and timers arrive as **FIQs**, not IRQs |
-| page granule | our choice; `-cpu max` offers 16K | **16K effectively mandatory** (DART IOMMUs are 16K-only) |
+| page granule | **16K (since M2)**; `-cpu max` provides it | **16K effectively mandatory** (DART IOMMUs are 16K-only) |
 | display | (none, serial only) | iBoot-provided framebuffer, republished by m1n1 in the FDT |
 
 The development loop is also worth knowing now, because it shapes the
@@ -125,15 +125,21 @@ milestone in ROADMAP.md):
    Apple it is the difference between a timer tick and silence). Device
    interrupts then come via AIC (M1-generation) or AICv2 (M1 Pro/Max and
    later, which adds a die index for multi-die parts).
-7. **16 KiB pages.** The DART IOMMUs are effectively 16K-only, so Opal's
-   MMU milestone (M2) uses the 16K granule *on QEMU* from day one — that
-   is the entire reason `.cargo/config.toml` says `-cpu max` (which
-   implements TGRAN16) instead of a named CPU like `cortex-a72` (which
-   does not).
+7. **16 KiB pages — delivered.** The DART IOMMUs are effectively
+   16K-only, so Opal's MMU milestone (M2) used the 16K granule *on QEMU*
+   from day one — that is the entire reason `.cargo/config.toml` says
+   `-cpu max` (which implements TGRAN16) instead of a named CPU like
+   `cortex-a72` (which does not). M2 even cashes the promise at runtime:
+   the table builder reads `ID_AA64MMFR0_EL1.TGran16` and refuses to
+   boot a CPU without the granule (docs/04 §3) — and its `DS=0` choice
+   deliberately rejects an LPA2 convenience QEMU offers and M1-class
+   silicon lacks (docs/04 §3's block-level story).
 
 Items 6 and 7 are the quiet payoff of the VM-first strategy: they are
-*Apple* requirements that we get to implement and debug *on QEMU*, months
-before touching the machine that enforces them.
+*Apple* requirements that we got to implement and debug *on QEMU*, months
+before touching the machine that enforces them — item 6 as M1's
+FIQ-first vector table, item 7 as M2's running, fault-demonstrating
+16K address space.
 
 ## Sources
 

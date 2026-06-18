@@ -1,82 +1,111 @@
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.00s
      Running `qemu-system-aarch64 -machine virt -cpu max -smp 1 -m 512M -nographic -kernel target/aarch64-unknown-none-softfloat/debug/opal`
 
-opal — milestone 1: catches its own faults
-------------------------------------------
+opal — milestone 2: maps its own world
+--------------------------------------
 current EL : EL1
-vectors    : VBAR_EL1 = 0x40200800 (16-entry table live)
+mmu        : on — SCTLR_EL1 = 0x30d5199d (M, C, I — read back, not assumed)
+granule    : 16 KiB, 48-bit VA — TCR_EL1 = 0x57510b510 (TG0=16K, TG1=16K: different encodings, both checked)
+pa range   : PARange 0b110 (52 bits) -> IPS 0b101 (48 bits; DS=0 caps the output at 48)
+ttbr1      : 0x4021c000 — the kernel's tree (a physical address: the walker speaks PA)
+ttbr0      : 0x40230000 — empty root; ground floor condemned (AT probe: 0x40200000 no longer translates)
+pc         : 0xffff000040204d80 — kmain itself runs in the higher half
+vectors    : VBAR_EL1 = 0xffff000040200800 (16-entry table live, upstairs)
+guard      : 16 KiB unmapped below the stack — overflow now faults instead of eating .bss (M0's debt, paid)
 x0 at entry: 0x0
 fdt at x0  : no  (expected under QEMU ELF boot: x0 is just QEMU's reset zero)
-fdt at RAM base 0x40000000: yes — QEMU's bare-metal DTB placement
+fdt at RAM base (PA 0x40000000, read via its higher-half alias): yes — QEMU's bare-metal DTB placement
 
 monitor ready — 'help' lists commands. Ctrl-A X quits QEMU.
 
+> help
+commands:
+  help            this text
+  --- recoverable ---
+  brk             breakpoint: fault on purpose, report, recover, carry on
+  svc <n>         supervisor call with n in x8: report, recover, carry on
+  unaligned       M1's killer, defanged: Normal memory tolerates it now
+  --- oracles ---
+  translate <va>  ask AT S1E1R where a virtual address really goes
+  walk <va>       narrate the page-table walk, then cross-check the hardware
+  --- FATAL (one fault syndrome each) ---
+  guard           write below the stack: translation fault, level 3
+  wx              write to .rodata: permission fault
+  noexec          execute from .data: instruction abort (PXN)
+  low             read M1's home address: the low half is condemned (level 0)
+  abort           read past RAM: the bus-error window, external abort
+> unaligned
+read 0x0011223344556677 from an odd address — no fault: Normal memory
+tolerates this (and SCTLR_EL1.A stays clear so it may). This exact
+load was M1's "goodbye".
+> translate 0xffff000040200000
+  0xffff000040200000 -> PA 0x40200000
+> walk 0xffff000009000000
+  TTBR1 -> root table at PA 0x4021c000
+  L0[0] = 0x0000000040220003 — table: descend to PA 0x40220000
+  L1[0] = 0x0000000040224003 — table: descend to PA 0x40224000
+  L2[4] = 0x000000004022c003 — table: descend to PA 0x4022c000
+  L3[1024] = 0x0060000009000407 — 16 KiB page at PA 0x9000000 [Device-nGnRnE RW XN AF]
+  software walk says PA 0x9000000; AT S1E1R agrees — the narration above is the real mechanism
 > brk
 
 *** exception: synchronous, from current EL on SP_ELx ***
   cause   : BRK #0xf00d — a software breakpoint (EC 0x3c)
   esr     : 0x00000000f200f00d  (syndrome — decoded above)
-  elr     : 0x0000000040205660  (preferred return address)
+  elr     : 0xffff000040207c68  (preferred return address)
   spsr    : 0x00000000600003c5  (interrupted PSTATE)
   far     : 0x0000000000000000  (fault address — aborts/alignment only)
   registers at the moment of the exception:
-    x0  0x0000000000000001    x1  0x000000004020a80f
+    x0  0x0000000000000001    x1  0xffff0000402114ab
     x2  0x0000000000000000    x3  0x0000000000000003
-    x4  0x000000004020c498    x5  0x0000000000000008
+    x4  0xffff000040213a88    x5  0x0000000000000007
     x6  0x0000000000000000    x7  0x0000000000000000
     x8  0x0000000000000001    x9  0x000000000000006b
-    x10 0x000000004021d050    x11 0x0000000000000000
+    x10 0xffff00004024b840    x11 0x0000000000000000
     x12 0x0000000000000000    x13 0x0000000000000020
-    x14 0x0000000000000000    x15 0x0000000000000000
-    x16 0x0000000000000000    x17 0x0000000000000000
-    x18 0x0000000000000000    x19 0x0000000000000000
-    x20 0x0000000000000000    x21 0x0000000000000000
+    x14 0x0000000000000000    x15 0xffff00004024b08b
+    x16 0x0000000000000064    x17 0x000000000098967f
+    x18 0x0000000000000400    x19 0x0000000000000000
+    x20 0x000000004021c000    x21 0xffff000000000000
     x22 0x0000000000000000    x23 0x0000000000000000
     x24 0x0000000000000000    x25 0x0000000000000000
     x26 0x0000000000000000    x27 0x0000000000000000
     x28 0x0000000000000000    x29 0x0000000000000000
-    x30 0x0000000040201940    sp  0x000000004021d140
+    x30 0xffff000040203198    sp  0xffff00004024b930
   verdict : recovered — ELR pointed AT the brk (its preferred return
             address); we advanced it one instruction so eret resumes
             just past the breakpoint.
 
 ...and we're back — the kernel caught its own fault and lived.
-> svc 7
+> guard
+goodbye — writing 8 bytes below the stack; the guard page has no mapping:
 
 *** exception: synchronous, from current EL on SP_ELx ***
-  cause   : SVC #0x0 with x8 = 7 — a supervisor call (EC 0x15)
-  esr     : 0x0000000056000000  (syndrome — decoded above)
-  elr     : 0x0000000040205678  (preferred return address)
-  spsr    : 0x00000000800003c5  (interrupted PSTATE)
-  far     : 0x0000000000000000  (fault address — aborts/alignment only)
+  cause   : data abort — a write to 0xffff00004023bff8 failed (EC 0x25, DFSC 0x07)
+  esr     : 0x0000000096000047  (syndrome — decoded above)
+  elr     : 0xffff0000402069c0  (preferred return address)
+  spsr    : 0x00000000a00003c5  (interrupted PSTATE)
+  far     : 0xffff00004023bff8  (fault address — aborts/alignment only)
   registers at the moment of the exception:
-    x0  0x0000000000000007    x1  0x0000000000000007
-    x2  0x000000000000000a    x3  0x0000000000000003
-    x4  0x000000004020c498    x5  0x0000000000000008
+    x0  0x00000000000003c0    x1  0x0000000000000000
+    x2  0x0000000000000001    x3  0xffff0000402012e8
+    x4  0xffff0000402123a0    x5  0x0000000000000007
     x6  0x0000000000000000    x7  0x0000000000000000
-    x8  0x0000000000000007    x9  0x000000004021d1e8
-    x10 0x0000000000000007    x11 0x0000000000000007
-    x12 0x0000000000000001    x13 0x000000004021d3cd
-    x14 0x0000000000000000    x15 0x0000000000000000
-    x16 0x0000000000000000    x17 0x0000000000000000
-    x18 0x0000000000000000    x19 0x0000000000000000
-    x20 0x0000000000000000    x21 0x0000000000000000
+    x8  0xffff00004023bff8    x9  0xffff000040234000
+    x10 0xffff00004021163a    x11 0xffff000040234000
+    x12 0x0000000000000001    x13 0x0000000000000020
+    x14 0x0000000000000000    x15 0xffff00004024b08b
+    x16 0x0000000000000064    x17 0x000000000098967f
+    x18 0x0000000000000400    x19 0x0000000000000000
+    x20 0x000000004021c000    x21 0xffff000000000000
     x22 0x0000000000000000    x23 0x0000000000000000
     x24 0x0000000000000000    x25 0x0000000000000000
     x26 0x0000000000000000    x27 0x0000000000000000
     x28 0x0000000000000000    x29 0x0000000000000000
-    x30 0x0000000040201a74    sp  0x000000004021d130
-  verdict : recovered — and note: nothing to fix. For svc, ELR already
-            points past the instruction (a call, not an accident), so
-            eret resumes there unadjusted. M5 turns this report into a
-            real system-call dispatcher.
+    x30 0xffff000040203350    sp  0xffff00004024b900
+  status  : translation fault — the walk hit an INVALID descriptor: nothing is mapped at this address
+  level   : the walk failed at level 3
+  verdict : FATAL — the kernel cannot repair this yet; parking core 0.
+            (QEMU is still alive, just idle: Ctrl-A X to leave.)
 
-...back from the 'syscall' — M5 gives svc a real job.
-> help
-commands:
-  help       this text
-  brk        breakpoint: fault on purpose, report, recover, carry on
-  svc <n>    supervisor call with n in x8: report, recover, carry on
-  unaligned  FATAL: unaligned load (MMU off = Device memory rules)
-  abort      FATAL: read from a hole in the physical address map
-> qemu-system-aarch64: terminating on signal 15 from pid 58766 (<unknown process>)
+qemu-system-aarch64: terminating on signal 15 from pid 53333 (<unknown process>)

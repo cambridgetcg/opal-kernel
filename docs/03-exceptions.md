@@ -149,17 +149,28 @@ would be noise.
 
 For aborts, ISS bits [5:0] hold the fault status code (DFSC for data,
 IFSC for instruction fetches), which is where the report's `status` line
-comes from. The two the monitor can demonstrate today:
+comes from. When M1 shipped, the monitor could demonstrate exactly two:
 
 - **0x10, synchronous external abort** — the bus itself rejected the
   access; nothing lives at that address. (QEMU's virt board has faulted
-  bad addresses like real hardware since machine type virt-2.11.)
-- **0x21, alignment fault** — with the MMU off, every address is
+  bad addresses like real hardware since machine type virt-2.11.) Still
+  demonstrable — but since M2 it takes deliberate staging: the walk
+  rejects unmapped addresses before they ever reach the bus, so the
+  `abort` command now goes through a mapped-but-unbacked Device window
+  built for the purpose (docs/04 §2).
+- **0x21, alignment fault** — with the MMU off, every address was
   Device-nGnRnE memory, and Device memory forbids unaligned access. This
-  surprises everyone once: the same load will be perfectly legal on
-  Normal memory after M2 turns the MMU on. (And a QEMU honesty note:
-  TCG only enforces this rule since QEMU 9.0 — on 8.x the `unaligned`
-  demo would silently succeed. Real hardware faults.)
+  surprises everyone once — and M2 delivered the predicted second
+  surprise: the same load is perfectly legal on Normal memory now that
+  the MMU is on, and the `unaligned` command demonstrates the *survival*
+  where it used to demonstrate the death. A 0x21 today means a genuinely
+  misaligned MMIO access.
+
+M2 grew the demonstrable set by a family: translation faults at level 3
+(`guard`) and level 0 (`low`), and permission faults for data (`wx`) and
+fetches (`noexec`) — and for the page-table families the decoder now
+prints the failing walk level on its own `level` line, under `status`.
+docs/04 §10 scripts all five.
 
 `FAR_EL1` holds the faulting *address* for aborts and alignment faults.
 It is not valid for every class — for external aborts the CPU may decline
@@ -189,12 +200,16 @@ That frame edit is the entire recovery mechanism, and it is why the
 dispatcher takes `&mut TrapFrame`: handlers repair the world by mutating
 the saved copy of it, and the epilogue makes the mutation real.
 
-The fatal commands (`unaligned`, `abort`) complete the lesson from the
-other side: a failed bus access has nothing to retry and no state to
-repair, so the honest maximum is a full report and `wfe`. No fake
-recovery that would resume Rust code mid-broken-expression — M2 (page
-faults we can service) and M5 (kill the offending task, not the kernel)
-raise this ceiling for real.
+The fatal commands complete the lesson from the other side: a failed
+access has nothing to retry and no state to repair, so the honest
+maximum is a full report and `wfe`. No fake recovery that would resume
+Rust code mid-broken-expression. (M1 wrote here that "M2 — page faults
+we can service — raises this ceiling"; M2 arrived and the honest
+accounting is narrower: it made faults *preventable* — the guard, W^X —
+and the reports richer, but services none. Its own `unaligned` command
+even defected from the fatal list to the survivors. The first fault
+with a real fix is M5's, where the answer becomes "kill the offending
+task, not the kernel".)
 
 ## 7. The console lock, and the deadlock we refused to ship
 
@@ -228,12 +243,14 @@ output beats guaranteed silence — the same trade Linux's serial drivers
 make during an oops. Recoverable faults flip the flag back on exit;
 panics never return, so they don't bother.
 
-One honest footnote lives in `sync.rs`: with the MMU and caches off, real
-AArch64 hardware does not guarantee the exclusive-access instructions
-inside `compare_exchange` make progress. QEMU's TCG doesn't model that
-restriction, so the lock is sound today *on the simulator* — a labeled
-simulator-ism, like the PL011's missing init, retired automatically when
-M2 turns the MMU on (long before M7 meets real silicon).
+One honest footnote lived in `sync.rs`, and has since been retired on
+schedule: with the MMU and caches off, real AArch64 hardware does not
+guarantee the exclusive-access instructions inside `compare_exchange`
+make progress, so from M1 to M2 the lock was sound only because QEMU's
+TCG doesn't model the restriction — a labeled simulator-ism, like the
+PL011's missing init. M2 mapped this lock's memory Normal Inner-Shareable
+write-back, exactly as promised, and the guarantee is the architecture's
+now, not the simulator's (sync.rs keeps the retired note as history).
 
 ## 8. Why FIQ gets a real seat at the table
 
@@ -260,7 +277,7 @@ least convenient time imaginable.
 *** exception: synchronous, from current EL on SP_ELx ***
   cause   : BRK #0xf00d — a software breakpoint (EC 0x3c)
   esr     : 0x00000000f200f00d  (syndrome — decoded above)
-  elr     : 0x0000000040205660  (preferred return address)
+  elr     : 0xffff000040207c68  (preferred return address)
   ...
   verdict : recovered — ELR pointed AT the brk (its preferred return
             address); we advanced it one instruction so eret resumes
@@ -270,11 +287,15 @@ least convenient time imaginable.
 >
 ```
 
+(That `elr` starting `0xffff…` is M2's fingerprint — fault addresses
+have been higher-half virtual since the kernel moved upstairs.)
+
 Then `svc 7` (recovers with *no* ELR adjustment — section 6), and when
-you're ready to say goodbye, `unaligned` or `abort` for a fatal report
-with the full register table and an honest verdict. `help` reminds you of
-the menu; the prompt surviving a `brk` is milestone 1 in one line of
-transcript.
+you're ready to say goodbye, any of the M2 fatal five (`guard`, `wx`,
+`noexec`, `low`, `abort` — docs/04 §10 predicts each syndrome) for a
+fatal report with the full register table and an honest verdict. `help`
+reminds you of the menu; the prompt surviving a `brk` is milestone 1 in
+one line of transcript.
 
 ## Sources
 
@@ -287,5 +308,7 @@ target/arm (BRK return-address semantics; MMU-off alignment checking
 since 9.0). Linux: `oops_in_progress`/`bust_spinlocks()` and the serial
 drivers' trylock-during-oops pattern, the model for our `OOPS` flag.
 
-Next: [ROADMAP.md](../ROADMAP.md) — M2 turns on the MMU, the milestone
-this one's fault reports were built to survive.
+Next: [04-virtual-memory.md](04-virtual-memory.md) — M2 turns on the
+MMU, the milestone these fault reports were built to survive (and they
+did: they covered its enable cliff and now narrate its page-table
+faults).

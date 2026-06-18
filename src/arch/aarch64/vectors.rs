@@ -296,18 +296,26 @@ const _: () = assert!(core::mem::offset_of!(TrapFrame, far) == 280);
 // Installation
 // ---------------------------------------------------------------------------
 
-/// Point VBAR_EL1 at the table. Called once, first thing in `kmain` —
-/// before the banner, so even banner-era bugs get reports.
+/// Point VBAR_EL1 at the table. Called first thing in `kmain` — before
+/// the banner, so even banner-era bugs get reports. Not the first writer
+/// anymore, though: the M2 boot stub pre-arms VBAR twice (low before the
+/// MMU enable, high after the canary), so by the time this runs it is a
+/// re-affirmation — and a useful one, because it derives the address a
+/// *third* way and the banner reads the register back to show all three
+/// agreed.
 pub fn install() {
     // SAFETY: __vectors is the 2048-aligned table from this file's
     // global_asm! (VBAR_EL1 bits [10:0] are RES0; linker.ld ASSERTs the
-    // alignment). Writing VBAR_EL1 at EL1 is always permitted. The `isb`
-    // flushes the pipeline so the very next instruction already faults
-    // through the new table, not the old UNKNOWN one.
+    // alignment). Writing VBAR_EL1 at EL1 is always permitted. The adrp
+    // is PC-relative: executed at kmain's higher-half PC it yields the
+    // table's higher-half address — the same value the boot stub loaded
+    // from its literal pool at step 10, arrived at by a different route.
+    // The `isb` flushes the pipeline so the very next instruction already
+    // faults through the new table.
     unsafe {
         core::arch::asm!(
-            "adrp {t}, __vectors",            // page of the table (PC-relative —
-            "add  {t}, {t}, :lo12:__vectors", //  same habit as boot.rs)
+            "adrp {t}, __vectors",            // page of the table (PC-relative)
+            "add  {t}, {t}, :lo12:__vectors",
             "msr  VBAR_EL1, {t}",             // the table is now the law
             "isb",                            // ...starting with the next fetch
             t = out(reg) _,
@@ -477,8 +485,12 @@ const EC_SP_ALIGN: u64 = 0x26; // SP alignment fault
 const EC_BRK64: u64 = 0x3c; // brk from AArch64
 
 /// Synchronous exceptions from the kernel itself — the interesting ones.
-/// Two recover (brk, svc); the rest are fatal until the MMU milestone
-/// gives us something to repair them *with*.
+/// Two recover (brk, svc); the rest are fatal. M2 changed their *texture*
+/// — the page-table fault families are reachable now (and demonstrable:
+/// the monitor's `guard`/`wx`/`noexec`/`low` commands produce one each),
+/// and the worst overflows became preventable — but it services none of
+/// them: the first fault with a fix is M5's, where the answer can be
+/// "kill the offending task" instead of "park the kernel".
 fn handle_sync(frame: &mut TrapFrame, kind: Kind, source: Source) {
     let ec = (frame.esr >> 26) & 0x3f; // exception class: bits [31:26]
     let iss = frame.esr & 0x01ff_ffff; // instruction-specific syndrome: bits [24:0]
@@ -555,6 +567,7 @@ fn handle_sync(frame: &mut TrapFrame, kind: Kind, source: Source) {
                 );
             }
             println!("  status  : {}", fault_status(dfsc));
+            print_walk_level(dfsc);
             die()
         }
         EC_IABT_SAME_EL => {
@@ -570,6 +583,7 @@ fn handle_sync(frame: &mut TrapFrame, kind: Kind, source: Source) {
                 ),
             );
             println!("  status  : {}", fault_status(ifsc));
+            print_walk_level(ifsc);
             die()
         }
         EC_PC_ALIGN => {
@@ -633,20 +647,36 @@ fn handle_sync(frame: &mut TrapFrame, kind: Kind, source: Source) {
 }
 
 /// Translate a DFSC/IFSC fault-status code (the low six bits of an abort
-/// ISS) into words. We name the codes the machine can produce today plus
-/// the page-table family we will meet in M2; the rest print raw upstream.
-fn fault_status(fsc: u64) -> &'static str {
+/// ISS) into words. M1 wrote this table for faults it could not yet
+/// cause ("M2 territory", it said); M2 made every family below reachable
+/// on purpose — each has a monitor command that demonstrates it.
+/// `pub(crate)` since M2: the monitor's `translate` command reuses it to
+/// decode PAR_EL1.FST, which speaks the same encoding.
+pub(crate) fn fault_status(fsc: u64) -> &'static str {
     match fsc {
-        // 0b0001LL, 0b0010LL, 0b0011LL: LL = the table walk level 0-3.
-        0x04..=0x07 => "translation fault — no page-table mapping (impossible today: MMU off)",
-        0x08..=0x0b => "access-flag fault — page tables again; M2 territory",
-        0x0c..=0x0f => "permission fault — page tables again; M2 territory",
-        0x10 => "synchronous external abort — the bus rejected the access: \
-                 nothing lives at this address",
+        // 0b0001LL, 0b0010LL, 0b0011LL: LL = the table walk level 0-3
+        // (printed separately by print_walk_level).
+        0x04..=0x07 => "translation fault — the walk hit an INVALID descriptor: \
+                 nothing is mapped at this address",
+        0x08..=0x0b => "access-flag fault — a mapping with AF=0. mmu.rs's constructors \
+                 bake AF in, so suspect a hand-written descriptor",
+        0x0c..=0x0f => "permission fault — mapped, but the descriptor forbids this \
+                 access; W^X doing its job",
+        0x10 => "synchronous external abort — the translation SUCCEEDED and the bus \
+                 said no: mapped, but nothing lives there",
         0x14..=0x17 => "synchronous external abort during a page-table walk",
-        0x21 => "alignment fault — with the MMU off every access is Device memory, \
-                 and Device memory forbids unaligned access",
+        0x21 => "alignment fault — Device memory (MMIO) forbids unaligned access \
+                 (Normal memory has tolerated it since M2)",
         _ => "a fault status this kernel does not decode (DDI 0601, ESR_EL1 has the full list)",
+    }
+}
+
+/// The page-table fault families encode where the walk failed in their
+/// low two bits; saying "level 3" out loud turns a hex code into a
+/// pointer at the guilty table.
+fn print_walk_level(fsc: u64) {
+    if (0x04..=0x0f).contains(&fsc) {
+        println!("  level   : the walk failed at level {}", fsc & 0b11);
     }
 }
 
@@ -732,10 +762,12 @@ fn report(frame: &TrapFrame, kind: Kind, source: Source, cause: fmt::Arguments<'
     );
 }
 
-/// The standard fatal ending. With no MMU, no tasks, and no way to undo a
-/// failed bus access, "report and park" is the honest maximum — M2 (page
-/// faults we can service) and M5 (kill the offending task instead of the
-/// kernel) raise the ceiling.
+/// The standard fatal ending. With no tasks and no demand paging,
+/// "report and park" is still the honest maximum. M2 raised the *quality*
+/// of the reports (fault families that name the failing walk level) and
+/// made the worst faults preventable (the guard, W^X) — but the first
+/// fault we can actually *service* arrives with M5, where killing the
+/// offending task beats parking the kernel.
 fn die() -> ! {
     println!("  verdict : FATAL — the kernel cannot repair this yet; parking core 0.");
     println!("            (QEMU is still alive, just idle: Ctrl-A X to leave.)");
@@ -765,53 +797,169 @@ pub fn demo_svc(arg: u64) {
     unsafe { core::arch::asm!("svc #0", in("x8") arg, options(nostack)) };
 }
 
-/// Load eight bytes from an odd address — fatal by design. With the MMU
-/// off every access is Device-nGnRnE memory, and Device memory *requires*
-/// natural alignment: the CPU raises a data abort (DFSC 0x21) instead of
-/// performing the load. (QEMU note: TCG only enforces this rule since
-/// QEMU 9.0 — on 8.x this load silently succeeds. Real hardware faults,
-/// which is the behavior worth rehearsing.)
-pub fn demo_unaligned() -> ! {
-    // An address that is certainly readable RAM, made certainly
-    // misaligned: one past the (16-aligned) start of our own stack frame.
+/// Load eight bytes from an odd address — and, since M2, **return them**.
+///
+/// This exact load was M1's "goodbye": with the MMU off every access was
+/// Device-nGnRnE, and Device memory *requires* natural alignment — the
+/// CPU raised a data abort (DFSC 0x21) instead of performing it. Since M2
+/// the stack is Normal write-back memory and SCTLR_EL1.A is deliberately
+/// clear, so the same instruction simply... loads. The signature changed
+/// from `-> !` to `-> u64` the day the fault stopped: the old
+/// "unreachable" park-backstop became *reachable*, and a survivable demo
+/// that silently parks is exactly the species of silence this kernel
+/// exists to abolish.
+pub fn demo_unaligned() -> u64 {
+    // Recognizable bytes, so the loaded value proves which ones moved:
+    // an unaligned read at +1 sees bytes 1..8 of the first word and
+    // byte 0 of the second — little-endian, that is 0x0011223344556677.
     // `expose_provenance`, not `addr`: the asm below genuinely accesses
     // memory through this integer, so the pointer's provenance must be
     // exposed first — the same strict-provenance discipline as every MMIO
     // access in hal/pl011.rs. (`addr()` deliberately severs provenance,
     // which would disavow exactly the access we are about to make.)
-    let buf = [0u64; 2];
+    let buf = [0x1122_3344_5566_7788u64, 0x99AA_BBCC_DDEE_FF00];
     let misaligned = (&raw const buf).expose_provenance() + 1;
-    // SAFETY: the load never completes — the alignment fault is taken
-    // first, and its handler parks. Done in assembly because Rust's read
-    // methods are allowed to assume aligned pointers: we want the CPU's
-    // opinion of the misalignment, not language-level UB — and thanks to
-    // the exposed provenance above, an access through this address is one
-    // the language permits us to attempt.
+    let loaded: u64;
+    // SAFETY: the load completes now and reads bytes 1..9 of `buf` —
+    // inside a live, exposed allocation. Done in assembly because Rust's
+    // typed reads are allowed to *assume* alignment: we want the CPU's
+    // opinion of a misaligned access, not language-level UB. (M1's
+    // version of this comment said "the load never completes"; M2
+    // falsified it, which is the whole demonstration.)
     unsafe {
         core::arch::asm!(
-            "ldr {scratch}, [{addr}]",
+            "ldr {v}, [{addr}]",
             addr = in(reg) misaligned,
-            scratch = out(reg) _,
-            options(nostack),
+            v = out(reg) loaded,
+            options(nostack, preserves_flags),
         );
     }
-    // Unreachable in practice; the signature wants a `!` and honesty
-    // prefers a backstop to a lie.
-    super::park()
+    loaded
 }
 
-/// Read from `addr`, which the caller promises is a hole in the physical
-/// memory map — fatal by design. Since machine type virt-2.11, QEMU
-/// faults accesses to unbacked addresses like real hardware does: the bus
-/// transaction fails and comes back as a synchronous external abort
-/// (DFSC 0x10). There is nothing to retry and nobody to retry it for.
+/// Read from `addr`, which the caller promises is inside the bus-error
+/// window — fatal by design, but for a *different* reason than M1's
+/// version of this demo.
+///
+/// M1 read past the end of RAM unmapped and raw; since M2 every unmapped
+/// address dies politely in the walk (DFSC 0x04..0x07) and could never
+/// reach the bus. To keep the bus's own "no" demonstrable, mmu.rs maps
+/// the 32 MiB past RAM as Device memory on purpose: the walk *succeeds*,
+/// the access goes out on the bus, nothing answers, and the failure comes
+/// back as a synchronous external abort (DFSC 0x10 — since machine type
+/// virt-2.11, QEMU models this like real hardware). Page-table "no"
+/// versus bus "no", one command each — that contrast is the lesson.
 pub fn demo_abort(addr: u64) -> ! {
-    // SAFETY: same shape as demo_unaligned — the load never completes;
-    // the external-abort handler reports and parks.
+    // SAFETY: the load never completes — the external-abort handler
+    // reports and parks.
     unsafe {
         core::arch::asm!(
             "ldr {scratch}, [{addr}]",
             addr = in(reg) addr,
+            scratch = out(reg) _,
+            options(nostack),
+        );
+    }
+    super::park()
+}
+
+/// Write just below the stack — fatal by design: the 16 KiB under
+/// `__stack_bottom` is the guard, the page mmu.rs deliberately never
+/// maps. A real overflow's first touch is a *spill*, so the demo writes
+/// rather than reads; expect a data abort, WnR=1, DFSC 0x07 (translation
+/// fault, level 3), FAR pointing into the guard. This is M0's oldest
+/// debt being seen to pay: overflow used to eat the top of .bss in
+/// silence; now it has somewhere to fault *into*.
+pub fn demo_guard() -> ! {
+    unsafe extern "C" {
+        static __stack_bottom: u8;
+    }
+    // Eight bytes below the stack's lowest legal address — inside the
+    // guard. (Taking a linker symbol's address is safe; it is the store
+    // that the MMU will, by design, refuse.)
+    let target = (&raw const __stack_bottom).expose_provenance() - 8;
+    // SAFETY: the store never completes — the guard page is unmapped and
+    // the translation-fault handler parks.
+    unsafe {
+        core::arch::asm!(
+            "str xzr, [{addr}]",
+            addr = in(reg) target,
+            options(nostack),
+        );
+    }
+    super::park()
+}
+
+/// What `wx` writes at: a value pinned in read-only memory. A plain
+/// `static` of plain data lands in .rodata, which mmu.rs maps AP=read-
+/// only — the descriptor, not the Rust type system, is what objects here.
+static RODATA_SENTINEL: u64 = 0x524F_4F4E_4C59; // "ROONLY", as bytes
+
+/// Write to .rodata — fatal by design: the mapping exists (the walk
+/// succeeds) but its descriptor says read-only, so expect a data abort,
+/// WnR=1, DFSC 0x0F (permission fault, level 3). Compare with `guard`:
+/// same EC, different family — "no mapping" versus "mapping says no".
+pub fn demo_wx() -> ! {
+    let target = (&raw const RODATA_SENTINEL).expose_provenance();
+    // SAFETY: the store never completes — the permission-fault handler
+    // parks. (If it ever DID complete, the const-eval'd sentinel would
+    // make the corruption visible, but the report should come first.)
+    unsafe {
+        core::arch::asm!(
+            "str xzr, [{addr}]",
+            addr = in(reg) target,
+            options(nostack),
+        );
+    }
+    super::park()
+}
+
+/// What `noexec` jumps at: one valid AArch64 `ret` (0xD65F03C0), parked
+/// in .data. `static mut` so it cannot be promoted to .rodata — the
+/// demonstration needs it in writable-therefore-PXN memory.
+static mut DATA_CODE: [u32; 1] = [0xD65F_03C0];
+
+/// Branch into .data — fatal by design, and *falsifiably* so: the target
+/// holds a genuine `ret`, so if PXN were broken this function would
+/// quietly RETURN, and the caller prints the betrayal. With PXN doing its
+/// job, the fetch itself faults: an instruction abort, IFSC 0x0F
+/// (permission fault, level 3), with ELR and FAR both naming the .data
+/// address. A `-> !` signature here would be a lie that hides exactly
+/// the bug the demo exists to catch.
+pub fn demo_noexec() {
+    let target = (&raw const DATA_CODE).expose_provenance();
+    // SAFETY: with correct page tables the branch faults before executing
+    // anything; with broken ones it executes a single `ret`. Either way
+    // no memory is touched — x30 is the only state the call clobbers.
+    unsafe {
+        core::arch::asm!(
+            "blr {addr}",
+            addr = in(reg) target,
+            out("x30") _,
+            options(nostack),
+        );
+    }
+    println!("  executed data as code and RETURNED — W^X is broken; the report");
+    println!("  above this line should have been an instruction abort and was not.");
+}
+
+/// Read M1's home address — fatal by design: 0x4020_0000 is where this
+/// kernel *loads*, and until `condemn_low_half` it was mapped through
+/// TTBR0's identity trunk. Now TTBR0 holds the empty root, so the walk
+/// dies at the first step: DFSC 0x04, translation fault, **level 0** —
+/// the only demo that can produce a level-0 report, because every other
+/// command lives in the half whose tree is populated.
+pub fn demo_low() -> ! {
+    // The integer is the point: no Rust object lives at this address
+    // anymore — same shape as M1's demo_abort, an address conjured to
+    // prove nothing answers there.
+    let target = 0x4020_0000u64;
+    // SAFETY: the load never completes — TTBR0 is the empty root and the
+    // translation-fault handler parks.
+    unsafe {
+        core::arch::asm!(
+            "ldr {scratch}, [{addr}]",
+            addr = in(reg) target,
             scratch = out(reg) _,
             options(nostack),
         );

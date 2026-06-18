@@ -81,7 +81,11 @@ impl<const BASE: usize> Pl011<BASE> {
     #[inline]
     fn flags(self) -> u32 {
         // SAFETY: FR is a readable 32-bit device register on this board,
-        // mapped (MMU off: physical == virtual) for the program's lifetime.
+        // reachable at BASE for the program's lifetime. (M0/M1 said "MMU
+        // off: physical == virtual" here; since M2, BASE is whichever
+        // alias the instantiator may legally touch — the higher-half VA
+        // that mmu.rs maps Device-nGnRnE for the kernel proper, or the
+        // raw physical base for the boot stub's pre-condemnation world.)
         unsafe { ptr::with_exposed_provenance::<u32>(Self::FR).read_volatile() }
     }
 

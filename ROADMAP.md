@@ -12,10 +12,11 @@ PL011 console, `println!`, banner (exception level, `x0`, devicetree
 sniffing), interactive echo loop, printing panic handler. QEMU virt only.
 
 *What it deliberately lacked:* any way to survive a CPU fault, any memory
-protection, any interrupt. The first of those debts was paid one rung
-down; the rest are milestones below.
+protection, any interrupt. The first two of those debts have since been
+paid — faults one rung down (M1), memory protection two (M2); interrupts
+remain M3's.
 
-## M1 — exceptions and vectors ✅ (this milestone)
+## M1 — exceptions and vectors ✅
 
 A full EL1 vector table (`VBAR_EL1`): the 16 entries, register-save frames,
 and a readable "what faulted, where, and why" report instead of M0's
@@ -29,18 +30,32 @@ moment a second execution context (a handler) can print.
 Difficulty: moderate. Mostly bookkeeping, but the bookkeeping must be
 exactly right, and bugs in it corrupt the evidence of themselves.
 
-## M2 — MMU with the 16 KiB granule
+## M2 — MMU with the 16 KiB granule ✅ (this milestone)
 
-Page tables, identity-map the kernel, map MMIO as Device memory, turn on
-`SCTLR_EL1.M` + caches without the machine vanishing. **16 KiB granule
-from day one** — Apple's DART IOMMUs are 16K-only, and `-cpu max` was
-chosen in M0 exactly so QEMU can rehearse this. Higher-half kernel mapping;
-a guard page under the boot stack (paying off M0's known debt).
+Page tables (built by the kernel, in readable Rust), the kernel
+identity-mapped for the climb and then moved to a **higher-half** home at
+`0xFFFF_0000_0000_0000 + PA`, MMIO mapped as Device-nGnRnE,
+`SCTLR_EL1.{M,C,I}` on — without the machine vanishing, thanks to a
+staged bring-up, a boot-stub canary, and W^X per-section permissions
+proven by five new fatal monitor commands. **16 KiB granule from day
+one** — Apple's DART IOMMUs are 16K-only, and `-cpu max` was chosen in M0
+exactly so QEMU could rehearse this (the builder now verifies TGran16 in
+`ID_AA64MMFR0_EL1` at boot). The guard page under the boot stack pays off
+M0's known debt; M1's `unaligned` killer becomes a survivor the moment
+RAM turns into Normal memory. The full story is docs/04-virtual-memory.md.
 
-Difficulty: **spike.** The first MMU enable is the classic "works or hangs
-with zero feedback" cliff; attempt only with M1's fault reporting in hand.
-Cache/TLB maintenance subtleties (break-before-make) start here and never
-really leave.
+Difficulty: was indeed a **spike** — the "works or hangs with zero
+feedback" cliff is real, and M1's fault reporting plus the rehearse-
+under-identity staging are what made it climbable.
+
+*What it deliberately lacked:* no fault is *serviced* — reports got
+richer, several faults became preventable, but recovery still means
+"brk/svc only" until M5. No demand paging; no ASIDs (TLB flushes are the
+broad kind until M5 wants finer). Break-before-make is documented, never
+exercised — M5 edits live tables and inherits it. The D-cache/I-cache
+maintenance in the enable path is reviewed against Linux/m1n1 but
+unprovable on TCG (every cache op is a NOP there); its first real test
+is M7's silicon. `SCTLR.WXN` deferred to M5's hardening pass.
 
 ## M3 — time and interrupts
 

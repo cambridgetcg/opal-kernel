@@ -43,15 +43,17 @@
 //! `oops_in_progress` and `bust_spinlocks()`). Possibly-garbled output
 //! beats guaranteed silence.
 //!
-//! ## An honesty note: atomics with the MMU off
+//! ## An honesty note, retired: atomics with the MMU off
 //!
 //! `compare_exchange` compiles to load/store-exclusive (LDXR/STXR) on
 //! this target, and on *real* AArch64 hardware exclusives are only
-//! guaranteed to make progress on cacheable memory — with the MMU and
-//! caches off they may fail forever. QEMU's TCG does not model that
-//! restriction, so this lock works fine today, on the simulator. That is
-//! a labeled simulator-ism, exactly like the PL011's missing init: M2
-//! turns the MMU on long before this code meets real silicon in M7.
+//! guaranteed to make progress on cacheable memory. From M1's birth until
+//! M2 this file therefore carried a labeled simulator-ism: with the MMU
+//! and caches off the lock worked only because QEMU's TCG does not model
+//! the restriction. Paid as promised ("M2 turns the MMU on long before
+//! this code meets real silicon"): this lock's memory has been Normal
+//! Inner-Shareable write-back since M2, and exclusives' forward progress
+//! on it is architecturally guaranteed, not simulated.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 

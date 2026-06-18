@@ -45,10 +45,13 @@ leaves room at the base of RAM, QEMU drops the DTB at `0x4000_0000`.
 > **A trap we hit so you don't have to:** "leaves room" is checked against
 > the DTB's *pre-allocated buffer size* — 1 MiB (`FDT_MAX_SIZE`) — not its
 > real packed size (~100 KiB). And if the check fails, `arm_load_dtb()`
-> returns success *without loading anything*. Our first draft linked the
+> returns success *without loading anything*. Our first draft loaded the
 > kernel at `0x4008_0000` (512 KiB of room): it booted perfectly and
-> silently had no devicetree. That is why `linker.ld` links at
+> silently had no devicetree. That is why `linker.ld` loads at
 > `0x4020_0000` — 2 MiB of headroom, comfortably more than QEMU wants.
+> (M0/M1 could say "links at"; since M2 the kernel *links* in the higher
+> half and *loads* at this physical address — the distinction is
+> docs/04 §5's whole subject.)
 
 ## 2. Machine state at the first instruction
 
@@ -93,54 +96,88 @@ the staleness bug that earned it the job. Walk through
 `src/arch/aarch64/linker.ld`:
 
 - **`ENTRY(_start)`** — records in the ELF header where execution begins.
-  QEMU reads exactly this field.
+  QEMU reads exactly this field. (Since M2 an ASSERT pins `_start` to the
+  load address `0x40200000`. Current QEMU would actually *rescue* a
+  higher-half entry — it quietly translates an entry VMA back to its
+  load address — but that kindness is undocumented and m1n1 will not
+  repeat it; the ASSERT makes the question moot on both loaders.)
 
 - **`. = 0x40200000;`** — the location counter: "lay out everything from
-  here." RAM base plus 2 MiB (see the trap above).
+  here." RAM base plus 2 MiB (see the trap above). In M0/M1 this one
+  number was the whole layout; since M2 it sets only the *load* side, and
+  a second assignment — `. = KERNEL_BASE + ...` — moves the *link* side
+  upstairs. The file's header tells that story; docs/04 §5 explains why
+  it has to be told.
 
-- **`.text`** with `KEEP(*(.text.boot))` first — our boot stub asks to be
-  placed in a section called `.text.boot`; listing it first makes `_start`
-  the literal first byte of the image, and `KEEP` protects it if the linker
-  ever garbage-collects unreferenced sections (nothing *calls* `_start`, so
-  to the linker it looks dead). Second comes `KEEP(*(.text.vectors))`,
-  added in M1: the exception vector table, placed right after the boot stub
-  so `_start` stays the first byte while the table still gets the 2048-byte
-  alignment `VBAR_EL1` demands — the ~2 KiB of padding between the tiny
-  stub and the table is the price of that alignment. Full story in
-  [docs/03-exceptions.md](03-exceptions.md) §2.
+- **`.text.boot`**, its own output section since M2 — our boot stub asks
+  to be placed here; putting it first makes `_start` the literal first
+  byte of the image, and `KEEP` protects it if the linker ever
+  garbage-collects unreferenced sections (nothing *calls* `_start`, so to
+  the linker it looks dead). It is the one section whose link address
+  still equals its load address: everything below this line in the
+  script lives at `KERNEL_BASE + PA` and is loaded at its PA via `AT()`.
 
-- **`.rodata`, `.data`** — string literals and initialized statics. Nothing
-  exotic.
+- **`.text`** — `KEEP(*(.text.vectors))` leads, added in M1: the
+  exception vector table gets the 2048-byte alignment `VBAR_EL1` demands
+  (the ~2 KiB of padding after the tiny boot stub is the price; full
+  story in [docs/03-exceptions.md](03-exceptions.md) §2). Since M2 the
+  section *ends* with `ALIGN(16K)`: the next section has different MMU
+  permissions, and permission lines can only be drawn between 16 KiB
+  pages — every W^X boundary in the script is granule-aligned and
+  ASSERT-checked.
+
+- **`.rodata`, `.data`** — string literals and initialized statics.
+  `.rodata` also ends on a granule edge (read-only → read-write is a
+  permission line too).
 
 - **`.bss (NOLOAD)`** — zero-initialized statics. `NOLOAD` means the ELF
   records the region's address and size but contains no bytes for it. The
   script exports `__bss_start` and `__bss_end`, both 16-byte aligned, as
   symbols — the boot stub will loop over exactly that range. This is the
   classic linker-script trick: *the script computes addresses, code
-  consumes them as if they were extern variables.*
+  consumes them as if they were extern variables.* Since M2 the page
+  tables themselves live here (96 KiB, granule-aligned), which is why
+  zeroing `.bss` doubles as initializing every descriptor to INVALID.
 
 - **`.stack (NOLOAD)`** — 64 KiB of reserved space, with `__stack_top`
   exported. AArch64 stacks grow downward and the AAPCS64 calling convention
-  requires SP ≡ 0 (mod 16) at every call, hence the alignment. Why 64 KiB?
-  Generous for a kernel that doesn't recurse; small enough not to care.
-  There is no guard page yet — a stack overflow walks silently into `.bss`.
-  The MMU milestone (M2) fixes that properly.
+  requires SP ≡ 0 (mod 16) at every call. Why 64 KiB? Generous for a
+  kernel that doesn't recurse; small enough not to care. M0 shipped this
+  with a confessed defect — "there is no guard page yet; a stack overflow
+  walks silently into `.bss`; M2 fixes that properly" — and M2 did: a
+  16 KiB `__stack_guard_bottom` hole now sits below `__stack_bottom`,
+  reserved in the script and deliberately never mapped by the page
+  tables, so overflow's first touch faults with a report (the monitor's
+  `guard` command demonstrates it; docs/04 §2).
 
 - **`/DISCARD/`** — sections we refuse to carry: unwind tables (`.eh_frame`,
   dead weight under `panic=abort`), toolchain version notes.
 
-- **`ASSERT(SIZEOF(.got) == 0, ...)`** — a tripwire: statically linked
-  kernel code should need no Global Offset Table; if one appears, fail the
-  *link* loudly rather than boot something subtly position-dependent. M1
-  added a second ASSERT below it, `(__vectors & 0x7FF) == 0`: link-time
-  proof that the vector table really landed on its 2048-byte boundary
-  (`VBAR_EL1`'s low 11 bits are RES0, so a misaligned table would be
-  silently truncated to the wrong address — every fault a wild jump).
+- **The ASSERT battery.** M0 had one tripwire — `SIZEOF(.got) == 0`:
+  statically linked kernel code should need no Global Offset Table; if
+  one appears, fail the *link* loudly rather than boot something subtly
+  position-dependent. M1 added the vector-table alignment proof
+  (`(__vectors & 0x7FF) == 0`). M2 added five more: entry == load PA,
+  a size cap on `.text.boot` (which doubles as a detector for lld's
+  silent cross-half thunks — docs/04 §5), `KERNEL_BASE` alignment,
+  granule alignment of every W^X/guard boundary, and a bound keeping
+  image+stack inside the one 32 MiB region mmu.rs maps page by page.
+  The pattern is the point: every layout invariant the kernel's
+  correctness leans on gets a link-time check with a message that names
+  the consequence.
 
-## 4. `boot.rs` — twenty-one instructions to Rust
+## 4. `boot.rs` — the climb to Rust
 
 `boot.rs` contains one `global_asm!` block (assembly compiled into the
-binary as-is, in section `.text.boot`) and one Rust shim. The assembly, in
+binary as-is, in section `.text.boot`) and one Rust shim. In M0 the
+assembly was twenty-one instructions — park, stack, zero `.bss`, call
+Rust; since M2 the same file is a thirteen-step *climb* (numbered in its
+comments) that additionally builds the page tables, turns on the MMU,
+proves the higher half translates, and only then branches upstairs.
+This section walks the steps that have existed since M0; the M2 steps —
+literal pools instead of `adrp`, the canary, the move — are
+[docs/04-virtual-memory.md](04-virtual-memory.md) §§5–7's subject, told
+alongside the step comments in the file itself. The M0 foundation, in
 order:
 
 **Park the secondaries.** We boot `-smp 1` today, but the stub is written
@@ -155,11 +192,15 @@ affinity is zero proceeds; every other core drops into a `wfe`
 (wait-for-event) loop — a polite, low-power "sleep until someone pokes
 you." Waking them properly (via PSCI on QEMU) is a later milestone.
 
-**Set the stack pointer.** `adrp`/`add` build `__stack_top`'s address
-PC-relatively (`adrp` finds the 4 KiB page, `:lo12:` adds the page offset).
-PC-relative matters: it works no matter where the image was loaded — a
-habit we'll be grateful for on Apple Silicon, where m1n1 loads the kernel
-at a randomized address. After `mov sp, x1`, function calls are legal.
+**Set the stack pointer.** In M0/M1 this was `adrp`/`add` building
+`__stack_top`'s address PC-relatively — a habit that works at any load
+address. M2 had to retire it *in this file only*: the stub runs a full
+`KERNEL_BASE` below the addresses its symbols carry, far beyond `adrp`'s
+±4 GiB reach, so the stub loads full 64-bit addresses from a literal
+pool and subtracts `KERNEL_BASE` (boot.rs's header explains the idiom;
+the rest of the kernel keeps the `adrp` habit, which is precisely what
+makes it run correctly upstairs). After `mov sp, x1`, function calls are
+legal.
 
 **Zero `.bss`.** A four-instruction loop storing 16 zero bytes per
 iteration (`stp xzr, xzr, [x1], #16` — store a pair of zero registers,
@@ -168,16 +209,21 @@ script's 16-byte alignment of both symbols is what lets the loop be this
 naive. After this, Rust's assumption that statics start initialized is
 true.
 
-**`bl _start_rust`.** One detail carries the whole bootloader interface:
-**`x0` has not been touched** since QEMU handed over control. AAPCS64 puts
-a function's first argument in `x0` — so simply *not clobbering it* means
-`_start_rust(x0)` receives whatever the loader left there. Under QEMU
-that's 0; under m1n1 it will be the devicetree pointer. Same stub, both
-worlds.
+**Into `_start_rust`.** One detail carries the whole bootloader
+interface: **`x0` survives untouched** from QEMU's handover to
+`_start_rust(x0)`. AAPCS64 puts a function's first argument in `x0` — in
+M0 "survives" meant simply not clobbering it; since M2 the stub calls
+two functions on the way (the table builder and the MMU enable), so it
+parks the value in callee-saved `x19` and restores it for the final
+branch. Under QEMU that's 0; under m1n1 it will be the devicetree
+pointer. Same stub, both worlds.
 
-**The net.** `_start_rust` is declared `-> !` (never returns). If a bug
-ever violates that, the next instructions are a `wfe` parking loop, not a
-march into uninitialized memory.
+**The net.** A `wfe` parking loop still ends the stub, but M2 changed
+its job. `_start_rust` is now reached by `br` — a tail jump with nothing
+to return to — so the loop no longer catches an impossible return;
+instead it is where the stub's own self-checks land when they fail (the
+`KERNEL_BASE` cross-check at step 3, a dead canary at step 9), rather
+than marching on into a world they just proved broken.
 
 The Rust side is three lines: `_start_rust` is `#[unsafe(no_mangle)]`
 (assembly must be able to name it — and edition 2024 marks the attribute
@@ -198,14 +244,23 @@ each line of the banner by *checking*, not assuming:
   it). The story of that table is [docs/03-exceptions.md](03-exceptions.md).
 - **`x0 at entry`** — the raw value, straight from the boot stub. Expect 0
   under QEMU's ELF boot; a pointer under any Linux-protocol loader.
+- Since M2 seven more lines sit above these — `mmu`, `granule`,
+  `pa range`, `ttbr1`, `ttbr0`, `pc`, `guard` — every one a register
+  read-back or hardware probe, never an assumption. They are the MMU's
+  receipts, and [docs/04-virtual-memory.md](04-virtual-memory.md) §§6–10
+  is where each is explained and put to work.
 - **`fdt at x0` / `fdt at RAM base`** — every flattened devicetree begins
   with magic `0xd00dfeed` stored big-endian. We check both places a DTB
   could plausibly be and report what we *find*, not what docs promise. One
-  guard: we only dereference addresses inside RAM — with the MMU off,
-  reading a hole in the physical map takes a synchronous external abort.
-  In M0 that meant an instant silent hang; since M1 it would die with a
-  full fault report — but a banner that says "no devicetree" still beats
-  one that dies explaining why, so the guard stays.
+  guard: we only dereference addresses inside RAM — and each milestone
+  has changed why. In M0, reading a hole in the physical map took a
+  synchronous external abort and an instant silent hang; since M1 it
+  would at least die with a full fault report; since M2 the page tables
+  decide everything, the candidate is read through its higher-half alias
+  (the DTB window is mapped read-only Normal memory), and an out-of-RAM
+  address would be a translation fault. A banner that says "no
+  devicetree" still beats one that dies explaining why, so the guard
+  stays — three regimes, one unchanged conclusion.
 
 Then the console loop: poll the UART for a byte, echo it back (`\r` from
 your Enter key becomes a real newline; unprintable bytes are shown as
@@ -226,16 +281,19 @@ accesses correct — and the simulator-isms it currently leans on.
 
 ## 6. What milestone 0 deliberately did not do
 
-Milestone 0 was honest about its debts, and two have since been paid. No
+Milestone 0 was honest about its debts, and most have since been paid. No
 exception vectors (any CPU fault was a silent hang) — paid by M1, which is
 docs/03's whole subject. No locking on the console — sound in M0 exactly
 because nothing could interrupt anything, and delivered in M1 the moment
-that stopped being true. Still outstanding: no MMU, no caches (everything
-physical, slow — M2). Interrupts never *enabled*; all I/O is polling (M1
-built the handlers, M3 turns the interrupts on). One core (the others are
-parked in `wfe`, to be woken via PSCI `CPU_ON` — M6).
+that stopped being true. No MMU, no caches, no stack guard (everything
+physical, slow, and one recursion away from eating `.bss`) — paid by M2,
+which is docs/04's whole subject. Still outstanding: interrupts never
+*enabled*; all I/O is polling (M1 built the handlers, M3 turns the
+interrupts on). One core (the others are parked in `wfe`, to be woken via
+PSCI `CPU_ON` — M6).
 
 Next: [03-exceptions.md](03-exceptions.md) for what happened to this
-kernel in M1, [ROADMAP.md](../ROADMAP.md) for where it goes, and
-[02-hal-and-apple-silicon.md](02-hal-and-apple-silicon.md) for the real
-target this is all rehearsal for.
+kernel in M1, [04-virtual-memory.md](04-virtual-memory.md) for M2's
+move to the higher half, [ROADMAP.md](../ROADMAP.md) for where it goes,
+and [02-hal-and-apple-silicon.md](02-hal-and-apple-silicon.md) for the
+real target this is all rehearsal for.
