@@ -244,6 +244,27 @@ __vectors_restore:
     ldp   x0,  x1,  [sp, #0]      // the temporaries, last
     add   sp,  sp,  #288          // pop the frame; SP is exactly pre-fault
     eret                          // PSTATE := SPSR_EL1, PC := ELR_EL1 — atomically
+
+// ---- M5: the EL0 return trampoline --------------------------------------
+//
+// When the exit() syscall handler wants to return to EL1 (instead of
+// EL0), it sets frame.spsr = EL1h mode and frame.elr = the address of
+// __el0_return below. The restore stub then erets here — at EL1,
+// on the kernel's stack — and this trampoline calls on_el0_return()
+// in Rust, which restores the monitor.
+
+.section .text.vectors, "ax"
+.global __el0_return
+__el0_return:
+    // We arrive here at EL1h (SP_ELx), on the exception stack. The
+    // registers were restored by __vectors_restore before the eret,
+    // so x0..x30 are the user's values. We don't care about user
+    // registers here — we're returning to the monitor. SP_EL1 is
+    // still valid, so we can call Rust normally.
+    bl    on_el0_return
+    // on_el0_return is -> !, so we never reach here.
+1:  wfe
+    b     1b
 "#
 );
 
@@ -337,6 +358,24 @@ pub fn vbar() -> u64 {
         );
     }
     v
+}
+
+/// The virtual address of the `__el0_return` trampoline. M5's exit
+/// syscall handler writes this into ELR_EL1 so the `eret` returns to
+/// EL1 (the monitor) instead of EL0.
+pub fn el0_return_addr() -> u64 {
+    let addr: u64;
+    // SAFETY: adrp+add computes the PC-relative address of a known
+    // linker symbol; no memory access, no side effects.
+    unsafe {
+        core::arch::asm!(
+            "adrp {a}, __el0_return",
+            "add  {a}, {a}, :lo12:__el0_return",
+            a = out(reg) addr,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    addr
 }
 
 // ---------------------------------------------------------------------------
@@ -449,9 +488,30 @@ extern "C" fn exception_dispatch(frame: &mut TrapFrame, kind: u64, source: u64) 
             );
             die()
         }
-        // Every other slot belongs to a world that does not exist yet: we
-        // never select SP_EL0, and nothing runs at a lower EL until M5.
-        // Reaching one of these *is* the bug being reported.
+        // M5: a synchronous exception from EL0 — this is a syscall (svc)
+        // or a user fault (data/instruction abort). The SVC case is the
+        // whole point of M5; faults are serviced by killing the task (M6
+        // gives them a real handler; for now we report and park).
+        (Kind::Synchronous, Source::LowerAArch64) => handle_sync_from_el0(frame, kind, source),
+        // IRQ/FIQ/SError from EL0: same handlers as the kernel's own —
+        // the source doesn't change what the GIC or the timer need.
+        (Kind::Irq, Source::LowerAArch64) => handle_irq(frame, kind, source),
+        (Kind::Fiq, Source::LowerAArch64) => handle_fiq(frame, kind, source),
+        (Kind::SError, Source::LowerAArch64) => {
+            report(
+                frame,
+                kind,
+                source,
+                format_args!(
+                    "SError from EL0 — an asynchronous external abort from userspace"
+                ),
+            );
+            die()
+        }
+        // Every other slot belongs to a world that does not exist yet:
+        // we never select SP_EL0, and nothing runs at a lower EL in
+        // AArch32 (Opal never runs 32-bit code). Reaching one of these
+        // *is* the bug being reported.
         (kind, source) => {
             report(
                 frame,
@@ -459,7 +519,7 @@ extern "C" fn exception_dispatch(frame: &mut TrapFrame, kind: u64, source: u64) 
                 source,
                 format_args!(
                     "an exception from a context that should not exist — nothing runs \
-                     on SP_EL0 or at a lower EL until M5"
+                     on SP_EL0 or in AArch32"
                 ),
             );
             die()
@@ -694,6 +754,89 @@ pub(crate) fn fault_status(fsc: u64) -> &'static str {
 fn print_walk_level(fsc: u64) {
     if (0x04..=0x0f).contains(&fsc) {
         println!("  level   : the walk failed at level {}", fsc & 0b11);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M5: Synchronous exceptions from EL0 — syscalls and user faults
+// ---------------------------------------------------------------------------
+
+/// Handle a synchronous exception that arrived from EL0 (the "lower EL,
+/// AArch64" vector slot, offset 0x400). This is the M5 milestone: the
+/// kernel's first real exception *service*.
+///
+/// Two cases:
+/// - **SVC** (EC 0x15): a syscall. Dispatch to [`user::handle_svc_from_el0`],
+///   which reads x8 for the syscall number, handles it, and either
+///   returns (eret back to EL0) or sets up a return to EL1 (for exit).
+/// - **Anything else**: a user fault (data abort, instruction abort,
+///   alignment, etc.). Report it and park — M6 will kill the task
+///   instead of parking the kernel. This is the honest maximum for a
+///   single-task kernel.
+fn handle_sync_from_el0(frame: &mut TrapFrame, kind: Kind, source: Source) {
+    let ec = (frame.esr >> 26) & 0x3f;
+    match ec {
+        EC_SVC64 => {
+            let imm = (frame.esr & 0x01ff_ffff) & 0xffff;
+            // Route to the M5 syscall handler. It may modify the frame
+            // (x0 for return value, or SPSR/ELR for the exit path).
+            super::user::handle_svc_from_el0(frame);
+            // The handler returns; exception_dispatch's tail calls
+            // oops_exit and the stub erets. For write, eret goes to
+            // EL0 (ELR points past the svc). For exit, eret goes to
+            // the trampoline at EL1.
+            let _ = (kind, source, imm);
+        }
+        EC_DABT_SAME_EL => {
+            // A data abort from EL0 — the user touched a bad address.
+            let dfsc = frame.esr & 0x3f;
+            let wnr = if frame.esr & (1 << 6) != 0 {
+                "write to"
+            } else {
+                "read from"
+            };
+            report(
+                frame,
+                kind,
+                source,
+                format_args!(
+                    "EL0 data abort — a userspace {wnr} {:#x} failed (DFSC {dfsc:#04x})",
+                    frame.far
+                ),
+            );
+            println!("  status  : {}", fault_status(dfsc));
+            println!("  verdict : FATAL — the kernel cannot service user faults yet (M6).");
+            println!("            Parking. (In a real OS this would kill the task, not the kernel.)");
+            super::park();
+        }
+        EC_IABT_SAME_EL => {
+            let ifsc = frame.esr & 0x3f;
+            report(
+                frame,
+                kind,
+                source,
+                format_args!(
+                    "EL0 instruction abort — fetching code from {:#x} failed (IFSC {ifsc:#04x})",
+                    frame.far
+                ),
+            );
+            println!("  status  : {}", fault_status(ifsc));
+            println!("  verdict : FATAL — user tried to execute an unmapped/forbidden address.");
+            super::park();
+        }
+        _ => {
+            report(
+                frame,
+                kind,
+                source,
+                format_args!(
+                    "EL0 exception class {ec:#04x}, ISS {:#09x} — not handled yet",
+                    frame.esr & 0x01ff_ffff
+                ),
+            );
+            println!("  verdict : FATAL — unhandled EL0 exception.");
+            super::park();
+        }
     }
 }
 

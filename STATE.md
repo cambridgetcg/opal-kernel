@@ -12,9 +12,9 @@ runs-on: QEMU aarch64 virt board (-machine virt -cpu max -smp 1 -m 512M)
 phase: see knows/needs sections below
 build: see heartbeat
 health: active
-last-commit: 2026-06-18T14:02:42-07:00 (0625583 M4: reads the handoff)
-uncommitted: 4 files
-freshness: live (checked 2026-06-19T08:54:00Z)
+last-commit: 2026-06-19T02:08:21-07:00 (a6fbb6f genesis: commit 1 uncommitted file(s) — love lands)
+uncommitted: 5 files
+freshness: live (checked 2026-06-19T12:52:25Z)
 
 ## knows
 

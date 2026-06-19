@@ -248,12 +248,30 @@ const fn l3i(pa: usize) -> usize {
     (pa >> 14) & 0x7FF
 }
 
+/// L0 index for a virtual address — the one-bit top level. `pub(crate)`
+/// so the M5 user-space table builder can use the same geometry.
+pub(crate) const fn va_l0i(va: usize) -> usize {
+    (va >> 47) & 0x1
+}
+/// L1 index for a virtual address.
+pub(crate) const fn va_l1i(va: usize) -> usize {
+    (va >> 36) & 0x7FF
+}
+/// L2 index for a virtual address.
+pub(crate) const fn va_l2i(va: usize) -> usize {
+    (va >> 25) & 0x7FF
+}
+/// L3 index for a virtual address.
+pub(crate) const fn va_l3i(va: usize) -> usize {
+    (va >> 14) & 0x7FF
+}
+
 /// One translation table: 2048 descriptors, 16 KiB, aligned to its own
 /// size. The alignment matters twice: the architecture requires tables
 /// aligned to their size, and a misaligned base would not fault — the
 /// hardware would silently mask the low bits and walk garbage.
 #[repr(C, align(16384))]
-struct PageTable([u64; 2048]);
+pub(crate) struct PageTable(pub(crate) [u64; 2048]);
 
 const _: () = assert!(core::mem::size_of::<PageTable>() == GRANULE);
 const _: () = assert!(core::mem::align_of::<PageTable>() == GRANULE);
@@ -327,7 +345,7 @@ static mut TABLES: Tables = Tables {
 /// 0b00 for Device, where shareability is meaningless and ignored), and
 /// the execute-never pair (PXN [53], UXN [54]).
 #[derive(Clone, Copy)]
-enum Attr {
+pub(crate) enum Attr {
     /// Normal, read-only, executable (PXN=0) — .text. UXN is still set:
     /// nothing should ever execute kernel code from EL0.
     TextRx,
@@ -340,6 +358,17 @@ enum Attr {
     /// real hardware with no fault to report (QEMU's TCG never
     /// speculates, so only the real target would have caught it).
     Device,
+    /// Normal, read-write, never executable — but **EL0 can access it**.
+    /// The `AP[6]` (access-permission) bit selects user-accessible
+    /// (0b01 = EL0+EL1 read-write) versus kernel-only (0b00). All prior
+    /// variants are 0b00 (EL1 only); this is 0b01, so a userspace stack
+    /// page can actually be touched from EL0. M5's user half of the
+    /// address space begins here.
+    UserRw,
+    /// Normal, read-execute, EL0 accessible. The code page for a tiny
+    /// userspace program: EL0 can fetch and execute, but neither EL can
+    /// write it (W^X is the kernel's invariant, extended downward). M5.
+    UserRx,
 }
 
 impl Attr {
@@ -360,13 +389,22 @@ impl Attr {
             Attr::Ro => AF | SH_INNER | AP_RO | PXN | UXN,
             Attr::Rw => AF | SH_INNER | PXN | UXN,
             Attr::Device => AF | ATTR_DEVICE | PXN | UXN,
+            // AP_USER = 0b01 in bits [7:6] — but only bit [6] set (not
+            // bit [7], which would make EL0 read-only). 0b01 means EL0
+            // and EL1 both have read-write access. This is the one bit
+            // that turns kernel-only memory into user-accessible memory.
+            Attr::UserRw => AF | SH_INNER | (1 << 6) | PXN | UXN,
+            // User code: EL0 can read AND execute. AP = 0b11 (EL0 RO,
+            // EL1 RO), no UXN (EL0 CAN execute), PXN set (EL1 cannot
+            // execute — the kernel never branches into user code).
+            Attr::UserRx => AF | SH_INNER | AP_RO | (1 << 6) | PXN,
         }
     }
 }
 
 /// A table descriptor: the PA of the next-level table, the two type bits,
 /// and *nothing else* — see the hierarchical-bits note above.
-const fn table_desc(pa: u64) -> u64 {
+pub(crate) const fn table_desc(pa: u64) -> u64 {
     pa | 0b11
 }
 
@@ -387,7 +425,7 @@ const fn block_desc(pa: u64, a: Attr) -> u64 {
 }
 
 /// A level-3 PAGE descriptor: a 16 KiB leaf. Type bits 0b11.
-const fn page_desc(pa: u64, a: Attr) -> u64 {
+pub(crate) const fn page_desc(pa: u64, a: Attr) -> u64 {
     pa | a.leaf_bits() | 0b11
 }
 
@@ -808,6 +846,37 @@ pub fn condemn_low_half() {
             "dsb nsh",
             "isb",
             root = in(reg) empty,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// Install a user-space page-table root into TTBR0_EL1. This is M5's
+/// address-space switch: the kernel's tree stays in TTBR1 (unchanged),
+/// while TTBR0 now points at a per-task root that maps the user's code
+/// and data into the low half. After this, `eret` into EL0 will fetch
+/// through TTBR0.
+///
+/// Unlike [`condemn_low_half`] (a whole-root *replacement* of the empty
+/// root), this is the first time TTBR0 holds a *populated* table — the
+/// "ground floor" is open for userspace business.
+///
+/// `root_pa` must be the physical address of a 16 KiB-aligned root table
+/// (the hardware walker speaks PA). The caller is responsible for TLB
+/// consistency: we flush here so no stale low-half translations from the
+/// condemned era linger.
+pub fn set_user_ttbr0(root_pa: u64) {
+    // SAFETY: writing TTBR0_EL1 at EL1 is always legal; root_pa is a
+    // valid table PA. The TLBI+DSB+ISB ensures the new root is seen by
+    // the next walk. Not `nomem`: translation-regime change.
+    unsafe {
+        core::arch::asm!(
+            "msr TTBR0_EL1, {root}",
+            "isb",
+            "tlbi vmalle1",
+            "dsb nsh",
+            "isb",
+            root = in(reg) root_pa,
             options(nostack, preserves_flags),
         );
     }

@@ -482,7 +482,7 @@ fn parse_hex(s: &str) -> Option<u64> {
 ///   reported in full and then parked: the page-table "no" at two
 ///   different levels (`low`, `guard`), the permission "no" for data and
 ///   for code (`wx`, `noexec`), and the bus's own "no" (`abort`).
-fn run_command(line: &[u8]) {
+pub fn run_command(line: &[u8]) {
     // The monitor loop only buffers printable ASCII, so this never
     // actually fails; "" on the impossible path beats an unwrap.
     let line = core::str::from_utf8(line).unwrap_or("").trim();
@@ -526,6 +526,8 @@ fn run_command(line: &[u8]) {
                 "  dtb             show parsed devicetree: header, /memory, /intc, /pl011, /timer"
             );
             println!("  tree            dump the full devicetree tree (nodes, properties, values)");
+            println!("  --- M5: EL0 and syscalls ---");
+            println!("  el0             drop to EL0, run the user program (syscalls: write, exit)");
         }
         "brk" => {
             arch::aarch64::vectors::demo_brk();
@@ -745,6 +747,15 @@ fn run_command(line: &[u8]) {
             } else {
                 println!("FDT magic found but header invalid");
             }
+        }
+        "el0" => {
+            // M5: drop to EL0 and run the user program. This does not
+            // return to this monitor loop — it returns via the
+            // __el0_return trampoline -> on_el0_return(), which runs
+            // its own monitor loop. So this match arm never completes
+            // normally; drop_to_el0() erets and the next code that
+            // runs is the user program at EL0.
+            arch::aarch64::user::drop_to_el0();
         }
         other => println!("unknown command {other:?} - try 'help'"),
     }

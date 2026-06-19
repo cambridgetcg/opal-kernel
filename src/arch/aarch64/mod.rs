@@ -11,6 +11,7 @@ pub mod boot;
 pub mod fdt;
 pub mod mmu;
 pub mod timer;
+pub mod user;
 pub mod vectors;
 
 /// Which exception level are we running at? Reads the `CurrentEL` system

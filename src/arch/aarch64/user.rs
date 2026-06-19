@@ -1,0 +1,417 @@
+//! M5 — EL0 and syscalls: the kernel becomes an operating system.
+//!
+//! Everything before this milestone ran at EL1: the kernel WAS the only
+//! program. This file builds the other side of that boundary — a tiny
+//! userspace that runs at EL0, with its own address space (TTBR0), and
+//! talks to the kernel through `svc` traps.
+//!
+//! ## The smallest possible userspace
+//!
+//! One code page, one stack page. The "program" is a handful of AArch64
+//! instructions embedded in a static byte array: write a byte to the UART
+//! (via a syscall), then exit (via a syscall). It is not loaded from
+//! disk — it lives in the kernel image, copied to a user page at boot.
+//! The point is not the program; the point is the boundary.
+//!
+//! ## The drop
+//!
+//! `eret` is the only way to EL0. We set up SPSR_EL1 (the PSTATE EL0
+//! will see), ELR_EL1 (where it starts executing), SP_EL0 (its stack),
+//! install the user TTBR0, and `eret`. The CPU atomically drops
+//! privilege, switches SP, and jumps — all at once.
+//!
+//! ## The return
+//!
+//! Every `svc` from EL0 traps to the vector table's "lower EL,
+//! AArch64" synchronous slot (offset 0x400). M1 filled that slot with
+//! a reporter that says "this shouldn't exist yet" — M5 replaces that
+//! with a real syscall dispatcher that reads x8 (the syscall number),
+//! handles it, and `eret`s back to EL0 (or, for `exit`, back to EL1).
+//!
+//! ## What this first beat does
+//!
+//! - Defines the syscall ABI: `write(fd, buf, len)` via x8=1, `exit()`
+//!   via x8=2. The kernel handler reads the trap frame's registers,
+//!   performs the action, and returns a value in x0.
+//! - Drops to EL0, runs one program that calls `write` then `exit`.
+//! - On `exit`, returns to the monitor via a trampoline that erets
+//!   back to EL1.
+//!
+//! The next beat adds per-task kernel stacks, a real scheduler, and
+//! the `yield` syscall. This beat proves the boundary works.
+
+use crate::arch::aarch64::mmu;
+use crate::board::virt;
+
+use core::arch::asm;
+
+// ---------------------------------------------------------------------------
+// User address space layout
+// ---------------------------------------------------------------------------
+
+/// Where the user code page lives, virtually. The low half (TTBR0
+/// region) starts at VA 0; we pick a simple, page-aligned address.
+/// One page of code at 1 MiB into the user address space.
+pub const USER_CODE_VA: usize = 0x0000_0000_0010_0000;
+/// One page of stack, one page above the code. Stacks grow down, so
+/// the stack page is placed above the code page and SP starts at its
+/// top.
+pub const USER_STACK_VA: usize = 0x0000_0000_0020_0000;
+/// The initial SP for EL0: top of the stack page (one granule above
+/// USER_STACK_VA).
+pub const USER_STACK_TOP: usize = USER_STACK_VA + mmu::GRANULE;
+
+// ---------------------------------------------------------------------------
+// Syscall numbers — the M5 ABI
+// ---------------------------------------------------------------------------
+
+/// `write(fd, buf, len)` — write `len` bytes from `buf` to `fd`.
+/// Args: x0=fd, x1=buf (user VA), x2=len. Returns: x0=bytes written.
+/// Only fd=1 (stdout, i.e. the UART) is supported.
+pub const SYS_WRITE: u64 = 1;
+/// `exit()` — terminate the user program. Does not return to EL0;
+/// the kernel returns to the monitor via the EL1 trampoline.
+pub const SYS_EXIT: u64 = 2;
+
+// ---------------------------------------------------------------------------
+// The user page tables
+// ---------------------------------------------------------------------------
+
+/// The user's page tables: a four-level tree for TTBR0, mapping two
+/// pages (code + stack) into the low half. This is a separate tree
+/// from the kernel's TTBR1 tree — the first time the two TTBRs point
+/// at different roots.
+///
+/// 64 KiB of .bss (4 tables × 16 KiB), zeroed by the boot stub, so every
+/// unwritten descriptor is INVALID — the same property the kernel tree
+/// relies on.
+#[repr(C)]
+struct UserTables {
+    l0: mmu::PageTable,
+    l1: mmu::PageTable,
+    l2: mmu::PageTable,
+    l3: mmu::PageTable,
+}
+
+static mut USER_TABLES: UserTables = UserTables {
+    l0: mmu::PageTable([0; 2048]),
+    l1: mmu::PageTable([0; 2048]),
+    l2: mmu::PageTable([0; 2048]),
+    l3: mmu::PageTable([0; 2048]),
+};
+
+/// The user code page: 16 KiB of RAM holding the embedded userspace
+/// program. This is the physical backing for the USER_CODE_VA mapping.
+/// The boot stub zeroes .bss (which includes this); `build_user_space`
+/// copies the program into it.
+#[repr(C, align(16384))]
+struct UserCodePage([u8; mmu::GRANULE]);
+static mut USER_CODE_PAGE: UserCodePage = UserCodePage([0; mmu::GRANULE]);
+
+/// The user stack page: 16 KiB, zeroed by boot. Mapped user-read-write
+/// at USER_STACK_VA.
+#[repr(C, align(16384))]
+struct UserStackPage([u8; mmu::GRANULE]);
+static mut USER_STACK_PAGE: UserStackPage = UserStackPage([0; mmu::GRANULE]);
+
+// ---------------------------------------------------------------------------
+// The userspace program
+// ---------------------------------------------------------------------------
+
+/// The complete userspace program as raw bytes. 7 instructions (28
+/// bytes), 4 NOPs for alignment (16 bytes), and the string
+/// "hello, EL0!\n\r\0" (14 bytes). Total: 62 bytes, padded to 64.
+///
+/// ```asm
+/// [0x00] mov  x8, #1          ; SYS_WRITE
+/// [0x04] mov  x0, #1          ; fd = stdout
+/// [0x08] adr  x1, +40          ; buf -> string at offset 0x30
+/// [0x0c] mov  x2, #13          ; len = 13 ("hello, EL0!\n\r")
+/// [0x10] svc  #0               ; syscall
+/// [0x14] mov  x8, #2          ; SYS_EXIT
+/// [0x18] svc  #0               ; exit
+/// [0x1c] b    .                ; infinite loop (shouldn't reach)
+/// [0x20..0x30] nop × 4         ; alignment padding
+/// [0x30] "hello, EL0!\n\r\0"   ; the message
+/// ```
+const USER_PROGRAM_BYTES: [u8; 64] = {
+    let mut buf = [0u8; 64];
+    // mov x8, #1 = MOVZ x8, #1 = 0xD2800028 (immediate at bits[20:5], Rd at [4:0])
+    buf[0] = 0x28; buf[1] = 0x00; buf[2] = 0x80; buf[3] = 0xD2;
+    // mov x0, #1 = MOVZ x0, #1 = 0xD2800020
+    buf[4] = 0x20; buf[5] = 0x00; buf[6] = 0x80; buf[7] = 0xD2;
+    // adr x1, +40 = ADR x1, #(0x30 - 0x08) = 0x10000141 (verified via objdump)
+    buf[8] = 0x41; buf[9] = 0x01; buf[10] = 0x00; buf[11] = 0x10;
+    // mov x2, #13 = MOVZ x2, #13 = 0xD28001A2
+    buf[12] = 0xA2; buf[13] = 0x01; buf[14] = 0x80; buf[15] = 0xD2;
+    // svc #0 = 0xD4000001
+    buf[16] = 0x01; buf[17] = 0x00; buf[18] = 0x00; buf[19] = 0xD4;
+    // mov x8, #2 = MOVZ x8, #2 = 0xD2800048
+    buf[20] = 0x48; buf[21] = 0x00; buf[22] = 0x80; buf[23] = 0xD2;
+    // svc #0 = 0xD4000001
+    buf[24] = 0x01; buf[25] = 0x00; buf[26] = 0x00; buf[27] = 0xD4;
+    // b . (infinite loop) = 0x14000000
+    buf[28] = 0x00; buf[29] = 0x00; buf[30] = 0x00; buf[31] = 0x14;
+    // NOP × 4 = 0xD503201F
+    buf[32] = 0x1F; buf[33] = 0x20; buf[34] = 0x03; buf[35] = 0xD5;
+    buf[36] = 0x1F; buf[37] = 0x20; buf[38] = 0x03; buf[39] = 0xD5;
+    buf[40] = 0x1F; buf[41] = 0x20; buf[42] = 0x03; buf[43] = 0xD5;
+    buf[44] = 0x1F; buf[45] = 0x20; buf[46] = 0x03; buf[47] = 0xD5;
+    // "hello, EL0!\n\r\0" at offset 0x30
+    buf[48] = b'h'; buf[49] = b'e'; buf[50] = b'l'; buf[51] = b'l';
+    buf[52] = b'o'; buf[53] = b','; buf[54] = b' '; buf[55] = b'E';
+    buf[56] = b'L'; buf[57] = b'0'; buf[58] = b'!'; buf[59] = b'\n';
+    buf[60] = b'\r'; buf[61] = 0x00;
+    buf
+};
+
+// ---------------------------------------------------------------------------
+// Build the user address space
+// ---------------------------------------------------------------------------
+
+/// Build the user page tables and populate the user code page. Called
+/// from the monitor's `el0` command (high world, MMU on) before dropping
+/// to EL0.
+///
+/// Returns the physical address of the user L0 root — the value to
+/// load into TTBR0_EL1.
+pub fn build_user_space() -> u64 {
+    // ---- 1. Copy the program into the user code page ----
+    // SAFETY: single core, no concurrent access. USER_CODE_PAGE is
+    // .bss (zeroed by boot); we write the program bytes into it.
+    unsafe {
+        let page = &raw mut USER_CODE_PAGE.0 as *mut u8;
+        let prog = &USER_PROGRAM_BYTES;
+        let mut i = 0;
+        while i < prog.len() {
+            page.add(i).write_volatile(prog[i]);
+            i += 1;
+        }
+        // The rest of the page stays zeroed (already done by boot).
+    }
+
+    // ---- 2. Physical addresses of the user pages and tables ----
+    // SAFETY: address-taking only (no reads/writes) on static muts.
+    let code_pa = mmu::virt_to_phys(unsafe { &raw const USER_CODE_PAGE }.expose_provenance()) as u64;
+    let stack_pa = mmu::virt_to_phys(unsafe { &raw const USER_STACK_PAGE }.expose_provenance()) as u64;
+    let l0_pa = mmu::virt_to_phys(unsafe { &raw const USER_TABLES.l0 }.expose_provenance()) as u64;
+    let l1_pa = mmu::virt_to_phys(unsafe { &raw const USER_TABLES.l1 }.expose_provenance()) as u64;
+    let l2_pa = mmu::virt_to_phys(unsafe { &raw const USER_TABLES.l2 }.expose_provenance()) as u64;
+    let l3_pa = mmu::virt_to_phys(unsafe { &raw const USER_TABLES.l3 }.expose_provenance()) as u64;
+
+    // ---- 3. Wire the tree: L0 -> L1 -> L2 -> L3 ----
+    // SAFETY: single core, MMU on but TTBR0 is still the empty root
+    // (condemned in kmain). We are writing to USER_TABLES via their
+    // high aliases; the hardware walker is not looking at these tables
+    // yet (TTBR0 points at the kernel's empty_root). No concurrent
+    // reader exists.
+    unsafe {
+        let l0 = &raw mut USER_TABLES.l0.0 as *mut u64;
+        let l1 = &raw mut USER_TABLES.l1.0 as *mut u64;
+        let l2 = &raw mut USER_TABLES.l2.0 as *mut u64;
+        let l3 = &raw mut USER_TABLES.l3.0 as *mut u64;
+
+        // L0[0] -> L1 (all user VAs are in the low half, bit 47 = 0)
+        l0.add(mmu::va_l0i(USER_CODE_VA)).write(mmu::table_desc(l1_pa));
+        // L1[0] -> L2 (all our VAs are < 2^36)
+        l1.add(mmu::va_l1i(USER_CODE_VA)).write(mmu::table_desc(l2_pa));
+        // L2 -> L3 (one 32 MiB region, refined to 16 KiB pages)
+        l2.add(mmu::va_l2i(USER_CODE_VA)).write(mmu::table_desc(l3_pa));
+
+        // L3: two pages — code (user RX) and stack (user RW).
+        l3.add(mmu::va_l3i(USER_CODE_VA))
+            .write(mmu::page_desc(code_pa, mmu::Attr::UserRx));
+        l3.add(mmu::va_l3i(USER_STACK_VA))
+            .write(mmu::page_desc(stack_pa, mmu::Attr::UserRw));
+    }
+
+    l0_pa
+}
+
+// ---------------------------------------------------------------------------
+// The EL0 drop
+// ---------------------------------------------------------------------------
+
+/// Drop to EL0 and run the user program. When the program calls
+/// `exit` (syscall 2), the syscall handler modifies the trap frame so
+/// the `eret` returns to EL1 instead of EL0 — landing in the
+/// `__el0_return` trampoline, which calls [`on_el0_return`].
+pub fn drop_to_el0() {
+    let root_pa = build_user_space();
+    mmu::set_user_ttbr0(root_pa);
+
+    // SPSR_EL1: the PSTATE for EL0.
+    //   M[3:0] = 0b0000 = EL0
+    //   bit [4] = 0 = AArch64 (NOT AArch32: bit 4 set means AArch32!)
+    //   DAIF = 0b1111 at bits [9:6] (all masked — EL0 cannot take async
+    //   exceptions directly; they trap to EL1 first)
+    //   All other bits 0.
+    //
+    // The DAIF field lives at bits [9:6], NOT [7:4]: D=bit9, A=bit8,
+    // I=bit7, F=bit6. So 0b1111<<6 = 0x3C0. A common mistake is to put
+    // the mask at [7:4] (0xF0) — that sets bit 4, which flips the target
+    // into AArch32 mode and the exception comes back as "from AArch32".
+    let spsr: u64 = 0x3C0; // DAIF=1111 at [9:6], M=0000 at [3:0], bit[4]=0
+
+    println!("[kernel] dropping to EL0 — user code at VA {USER_CODE_VA:#x}, SP {USER_STACK_TOP:#x}");
+
+    // SAFETY: the eret is the privilege-drop. Before it, we set up
+    // SPSR_EL1, ELR_EL1, and SP_EL0 — the three things eret reads.
+    // After eret, we are at EL0; the next instruction is fetched from
+    // USER_CODE_VA through TTBR0. The user program will svc, which
+    // traps back to EL1 vector slot 0x400 (lower EL, synchronous).
+    // We use explicit registers (x0, x1, x2) to avoid any ambiguity
+    // about which register holds which value — the compiler's register
+    // allocator could otherwise put the SPSR value in a register that
+    // shadows a user register, corrupting the user's initial state.
+    unsafe {
+        let spsr_v = spsr;
+        let entry_v = USER_CODE_VA as u64;
+        let sp_v = USER_STACK_TOP as u64;
+        asm!(
+            "msr  SPSR_EL1, {0}",
+            "msr  ELR_EL1, {1}",
+            "msr  SP_EL0, {2}",
+            // Zero the user's GP registers so no kernel state leaks
+            // into userspace and no leftover values confuse the first
+            // instructions. The eret reads SPSR/ELR/SP, not GP regs.
+            "mov  x0,  xzr",
+            "mov  x1,  xzr",
+            "mov  x2,  xzr",
+            "mov  x3,  xzr",
+            "mov  x4,  xzr",
+            "mov  x5,  xzr",
+            "mov  x6,  xzr",
+            "mov  x7,  xzr",
+            "mov  x8,  xzr",
+            "mov  x9,  xzr",
+            "mov  x10, xzr",
+            "mov  x11, xzr",
+            "mov  x12, xzr",
+            "mov  x13, xzr",
+            "mov  x14, xzr",
+            "mov  x15, xzr",
+            "mov  x16, xzr",
+            "mov  x17, xzr",
+            "mov  x18, xzr",
+            "eret",
+            in(reg) spsr_v,
+            in(reg) entry_v,
+            in(reg) sp_v,
+            options(nostack),
+        );
+    }
+}
+
+/// Called when the user program exits and we return to EL1/monitor.
+/// The `__el0_return` trampoline in vectors.rs jumps here.
+#[unsafe(no_mangle)]
+extern "C" fn on_el0_return() -> ! {
+    // Restore TTBR0 to the empty root (condemn the user space).
+    mmu::condemn_low_half();
+    println!("[kernel] returned from EL0 — user program exited cleanly.");
+    println!("[kernel] monitor resumed.");
+    print!("> ");
+    // Re-enter the monitor loop. We cannot return to kmain's loop
+    // (it never returns), so we run our own copy of the same loop.
+    let uart = virt::console();
+    let mut buf = [0u8; 64];
+    let mut len = 0usize;
+    loop {
+        let b = uart.read_byte();
+        match b {
+            b'\r' | b'\n' => {
+                println!();
+                crate::run_command(&buf[..len]);
+                len = 0;
+                print!("> ");
+            }
+            0x08 | 0x7f => {
+                if len > 0 {
+                    len -= 1;
+                    print!("\x08 \x08");
+                }
+            }
+            0x20..=0x7e => {
+                if len < buf.len() {
+                    buf[len] = b;
+                    len += 1;
+                    uart.write_byte(b);
+                }
+            }
+            other => print!("<{other:#04x}>"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The syscall handler — called from the vector table's lower-EL slot
+// ---------------------------------------------------------------------------
+
+/// Handle an SVC from EL0. Called from `exception_dispatch` when a
+/// synchronous exception arrives from the "lower EL, AArch64" slot
+/// (vector offset 0x400) with EC = SVC64.
+///
+/// `frame` is the trap frame the stub built; its registers are the
+/// user's register state at the moment of the `svc`. The handler:
+/// - Reads x8 for the syscall number.
+/// - Dispatches: write, exit.
+/// - For write: reads the user's buffer (from the user VA in x1),
+///   writes to the UART, sets x0 = bytes written.
+/// - For exit: modifies SPSR/ELR so the eret returns to EL1 (the
+///   trampoline), not EL0.
+/// - Returns: the stub restores (possibly modified) registers and
+///   erets. For write, eret goes back to EL0. For exit, eret goes
+///   to the trampoline at EL1.
+pub fn handle_svc_from_el0(frame: &mut super::vectors::TrapFrame) {
+    let nr = frame.x[8];
+    match nr {
+        SYS_WRITE => {
+            let fd = frame.x[0];
+            let buf_va = frame.x[1] as usize;
+            let len = frame.x[2] as usize;
+            if fd != 1 {
+                frame.x[0] = (-1i64) as u64; // -EBADF
+                return;
+            }
+            if len > 256 {
+                frame.x[0] = (-7i64) as u64; // -E2BIG
+                return;
+            }
+            let mut bytes_written = 0u64;
+            let uart = virt::console();
+            for i in 0..len {
+                // SAFETY: buf_va is a user VA mapped in the user tables.
+                // We are at EL1, so we can read through TTBR0. If the VA
+                // is unmapped, this faults — a data abort from the
+                // handler. For M5's first beat we trust the user program
+                // (it's our own code). M6 will add fault-around-syscall
+                // handling.
+                let byte = unsafe {
+                    core::ptr::with_exposed_provenance::<u8>(buf_va + i).read_volatile()
+                };
+                if byte == b'\n' {
+                    uart.write_byte(b'\r');
+                }
+                uart.write_byte(byte);
+                bytes_written += 1;
+            }
+            frame.x[0] = bytes_written;
+        }
+        SYS_EXIT => {
+            // The user wants to exit. Instead of modifying the frame and
+            // using a trampoline, we call on_el0_return() directly —
+            // we're already at EL1 with a valid kernel stack.
+            println!("[kernel] syscall: exit()");
+            // Restore TTBR0 to the empty root before returning to the
+            // monitor, so the user address space is gone.
+            mmu::condemn_low_half();
+            // on_el0_return never returns — it runs the monitor loop.
+            on_el0_return();
+        }
+        _ => {
+            println!("[kernel] unknown syscall {nr}");
+            frame.x[0] = (-38i64) as u64; // -ENOSYS
+        }
+    }
+}
