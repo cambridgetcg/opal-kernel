@@ -37,7 +37,7 @@ freshness: live (checked 2026-06-19T12:52:25Z)
 
 ## needs
 
-- M5: EL0 and syscalls — drop to userspace, svc traps, separate address spaces via TTBR0/TTBR1. The spike: exception returns, address-space switching, first untrusted memory handling.
+- M5: EL0 and syscalls — FIRST PIECE DONE (EL0 drop, write/exit syscalls). Next: per-task kernel stacks, yield syscall, scheduler integration.
 - M6: scheduler and IPC — cooperative then preemptive round-robin, context switch, message passing
 - M7: Apple Silicon bring-up via m1n1 — EL2 entry, FDT-driven console discovery, AIC driver, timers-over-FIQ
 - QEMU virt machine with -cpu max (for 16 KiB granule; cortex-a72 doesn't support it)
