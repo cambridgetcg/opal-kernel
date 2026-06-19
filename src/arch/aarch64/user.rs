@@ -72,6 +72,15 @@ pub const SYS_WRITE: u64 = 1;
 /// `exit()` — terminate the user program. Does not return to EL0;
 /// the kernel returns to the monitor via the EL1 trampoline.
 pub const SYS_EXIT: u64 = 2;
+/// `yield()` — voluntarily surrender the CPU. In the single-task kernel
+/// (M5), yield is a no-op: it traps to EL1, the kernel prints a receipt,
+/// and `eret`s straight back to EL0. The point is not the scheduling —
+/// that's M6 — but proving the round-trip: EL0 calls `svc`, the kernel
+/// services it, and execution *continues* in EL0 at the instruction
+/// after the `svc`. This is the first syscall that returns to the user,
+/// and the user program verifies it by printing a second message
+/// after the yield returns.
+pub const SYS_YIELD: u64 = 3;
 
 // ---------------------------------------------------------------------------
 // The user page tables
@@ -118,50 +127,72 @@ static mut USER_STACK_PAGE: UserStackPage = UserStackPage([0; mmu::GRANULE]);
 // The userspace program
 // ---------------------------------------------------------------------------
 
-/// The complete userspace program as raw bytes. 7 instructions (28
-/// bytes), 4 NOPs for alignment (16 bytes), and the string
-/// "hello, EL0!\n\r\0" (14 bytes). Total: 62 bytes, padded to 64.
+/// The complete userspace program as raw bytes. 14 instructions (56
+/// bytes), two strings, and padding. The program exercises the full
+/// syscall round-trip: write a message, yield (trap and return), write
+/// a second message, then exit. If the yield returns correctly, the
+/// second write executes — proving the kernel can service a syscall
+/// and resume EL0 at the instruction after the `svc`.
 ///
 /// ```asm
 /// [0x00] mov  x8, #1          ; SYS_WRITE
 /// [0x04] mov  x0, #1          ; fd = stdout
-/// [0x08] adr  x1, +40          ; buf -> string at offset 0x30
-/// [0x0c] mov  x2, #13          ; len = 13 ("hello, EL0!\n\r")
-/// [0x10] svc  #0               ; syscall
-/// [0x14] mov  x8, #2          ; SYS_EXIT
-/// [0x18] svc  #0               ; exit
-/// [0x1c] b    .                ; infinite loop (shouldn't reach)
-/// [0x20..0x30] nop × 4         ; alignment padding
-/// [0x30] "hello, EL0!\n\r\0"   ; the message
+/// [0x08] adr  x1, +0x30       ; buf -> 0x38 ("hello, EL0!\n\r")
+/// [0x0c] mov  x2, #13        ; len
+/// [0x10] svc  #0              ; syscall: write
+/// [0x14] mov  x8, #3          ; SYS_YIELD
+/// [0x18] svc  #0              ; syscall: yield (returns to EL0)
+/// [0x1c] mov  x8, #1          ; SYS_WRITE (again)
+/// [0x20] mov  x0, #1          ; fd = stdout
+/// [0x24] adr  x1, +0x24       ; buf -> 0x48 ("back from yield\n\r")
+/// [0x28] mov  x2, #17         ; len = 17
+/// [0x2c] svc  #0              ; syscall: write
+/// [0x30] mov  x8, #2          ; SYS_EXIT
+/// [0x34] svc  #0              ; syscall: exit
+/// [0x38] "hello, EL0!\n\r\0"  ; first message (13 bytes + NUL)
+/// [0x48] "back from yield\n\r\0" ; second message (17 bytes + NUL)
 /// ```
-const USER_PROGRAM_BYTES: [u8; 64] = {
-    let mut buf = [0u8; 64];
-    // mov x8, #1 = MOVZ x8, #1 = 0xD2800028 (immediate at bits[20:5], Rd at [4:0])
+const USER_PROGRAM_BYTES: [u8; 128] = {
+    let mut buf = [0u8; 128];
+    // [0x00] mov x8, #1 = MOVZ x8, #1 = 0xD2800028
     buf[0] = 0x28; buf[1] = 0x00; buf[2] = 0x80; buf[3] = 0xD2;
-    // mov x0, #1 = MOVZ x0, #1 = 0xD2800020
+    // [0x04] mov x0, #1 = MOVZ x0, #1 = 0xD2800020
     buf[4] = 0x20; buf[5] = 0x00; buf[6] = 0x80; buf[7] = 0xD2;
-    // adr x1, +40 = ADR x1, #(0x30 - 0x08) = 0x10000141 (verified via objdump)
-    buf[8] = 0x41; buf[9] = 0x01; buf[10] = 0x00; buf[11] = 0x10;
-    // mov x2, #13 = MOVZ x2, #13 = 0xD28001A2
+    // [0x08] adr x1, +0x30 (target 0x38) = 0x10000181
+    buf[8] = 0x81; buf[9] = 0x01; buf[10] = 0x00; buf[11] = 0x10;
+    // [0x0c] mov x2, #13 = MOVZ x2, #13 = 0xD28001A2
     buf[12] = 0xA2; buf[13] = 0x01; buf[14] = 0x80; buf[15] = 0xD2;
-    // svc #0 = 0xD4000001
+    // [0x10] svc #0 = 0xD4000001
     buf[16] = 0x01; buf[17] = 0x00; buf[18] = 0x00; buf[19] = 0xD4;
-    // mov x8, #2 = MOVZ x8, #2 = 0xD2800048
-    buf[20] = 0x48; buf[21] = 0x00; buf[22] = 0x80; buf[23] = 0xD2;
-    // svc #0 = 0xD4000001
+    // [0x14] mov x8, #3 = MOVZ x8, #3 = 0xD2800068
+    buf[20] = 0x68; buf[21] = 0x00; buf[22] = 0x80; buf[23] = 0xD2;
+    // [0x18] svc #0 = 0xD4000001
     buf[24] = 0x01; buf[25] = 0x00; buf[26] = 0x00; buf[27] = 0xD4;
-    // b . (infinite loop) = 0x14000000
-    buf[28] = 0x00; buf[29] = 0x00; buf[30] = 0x00; buf[31] = 0x14;
-    // NOP × 4 = 0xD503201F
-    buf[32] = 0x1F; buf[33] = 0x20; buf[34] = 0x03; buf[35] = 0xD5;
-    buf[36] = 0x1F; buf[37] = 0x20; buf[38] = 0x03; buf[39] = 0xD5;
-    buf[40] = 0x1F; buf[41] = 0x20; buf[42] = 0x03; buf[43] = 0xD5;
-    buf[44] = 0x1F; buf[45] = 0x20; buf[46] = 0x03; buf[47] = 0xD5;
-    // "hello, EL0!\n\r\0" at offset 0x30
-    buf[48] = b'h'; buf[49] = b'e'; buf[50] = b'l'; buf[51] = b'l';
-    buf[52] = b'o'; buf[53] = b','; buf[54] = b' '; buf[55] = b'E';
-    buf[56] = b'L'; buf[57] = b'0'; buf[58] = b'!'; buf[59] = b'\n';
-    buf[60] = b'\r'; buf[61] = 0x00;
+    // [0x1c] mov x8, #1 = MOVZ x8, #1 = 0xD2800028
+    buf[28] = 0x28; buf[29] = 0x00; buf[30] = 0x80; buf[31] = 0xD2;
+    // [0x20] mov x0, #1 = MOVZ x0, #1 = 0xD2800020
+    buf[32] = 0x20; buf[33] = 0x00; buf[34] = 0x80; buf[35] = 0xD2;
+    // [0x24] adr x1, +0x24 (target 0x48) = 0x10000121
+    buf[36] = 0x21; buf[37] = 0x01; buf[38] = 0x00; buf[39] = 0x10;
+    // [0x28] mov x2, #17 = MOVZ x2, #17 = 0xD2800222
+    buf[40] = 0x22; buf[41] = 0x02; buf[42] = 0x80; buf[43] = 0xD2;
+    // [0x2c] svc #0 = 0xD4000001
+    buf[44] = 0x01; buf[45] = 0x00; buf[46] = 0x00; buf[47] = 0xD4;
+    // [0x30] mov x8, #2 = MOVZ x8, #2 = 0xD2800048
+    buf[48] = 0x48; buf[49] = 0x00; buf[50] = 0x80; buf[51] = 0xD2;
+    // [0x34] svc #0 = 0xD4000001
+    buf[52] = 0x01; buf[53] = 0x00; buf[54] = 0x00; buf[55] = 0xD4;
+    // [0x38..0x45] "hello, EL0!\n\r\0" (13 bytes + NUL = 14, pad to 0x48)
+    buf[56] = b'h'; buf[57] = b'e'; buf[58] = b'l'; buf[59] = b'l';
+    buf[60] = b'o'; buf[61] = b','; buf[62] = b' '; buf[63] = b'E';
+    buf[64] = b'L'; buf[65] = b'0'; buf[66] = b'!'; buf[67] = b'\n';
+    buf[68] = b'\r'; buf[69] = 0x00;
+    // [0x48..0x5A] "back from yield\n\r\0" (17 bytes + NUL)
+    buf[72] = b'b'; buf[73] = b'a'; buf[74] = b'c'; buf[75] = b'k';
+    buf[76] = b' '; buf[77] = b'f'; buf[78] = b'r'; buf[79] = b'o';
+    buf[80] = b'm'; buf[81] = b' '; buf[82] = b'y'; buf[83] = b'i';
+    buf[84] = b'e'; buf[85] = b'l'; buf[86] = b'd'; buf[87] = b'\n';
+    buf[88] = b'\r'; buf[89] = 0x00;
     buf
 };
 
@@ -397,6 +428,20 @@ pub fn handle_svc_from_el0(frame: &mut super::vectors::TrapFrame) {
                 bytes_written += 1;
             }
             frame.x[0] = bytes_written;
+        }
+        SYS_YIELD => {
+            // yield(): the user voluntarily gives up the CPU. In the
+            // single-task kernel (M5) there is no other task to switch
+            // to, so yield is a no-op that simply returns — but the
+            // *mechanism* is real: the svc trapped to EL1, we are here,
+            // and eret will resume EL0 at the instruction after the svc.
+            // This is the first syscall that returns to the user, and
+            // the user program verifies it by printing a second
+            // message after the yield returns.
+            println!("[kernel] syscall: yield() — returning to EL0");
+            // x0 = 0 means success. The stub restores registers and
+            // erets back to EL0 at ELR (which points past the svc).
+            frame.x[0] = 0;
         }
         SYS_EXIT => {
             // The user wants to exit. Instead of modifying the frame and

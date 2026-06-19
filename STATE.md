@@ -12,9 +12,9 @@ runs-on: QEMU aarch64 virt board (-machine virt -cpu max -smp 1 -m 512M)
 phase: see knows/needs sections below
 build: see heartbeat
 health: active
-last-commit: 2026-06-19T06:26:10-07:00 (ca9797b STATE.md: update M5 status — first piece done)
-uncommitted: 7 files
-freshness: live (checked 2026-06-19T16:52:54Z)
+last-commit: 2026-06-19T17:30:00Z (M5: yield syscall — EL0 round-trip proven)
+uncommitted: 0 files
+freshness: live (checked 2026-06-19T17:30:00Z)
 
 ## knows
 
@@ -37,7 +37,7 @@ freshness: live (checked 2026-06-19T16:52:54Z)
 
 ## needs
 
-- M5: EL0 and syscalls — FIRST PIECE DONE (EL0 drop, write/exit syscalls). Next: per-task kernel stacks, yield syscall, scheduler integration.
+- M5: EL0 and syscalls — SECOND PIECE DONE (yield syscall, EL0→SVC→EL0 round-trip proven). Next: per-task kernel stacks, scheduler integration.
 - M6: scheduler and IPC — cooperative then preemptive round-robin, context switch, message passing
 - M7: Apple Silicon bring-up via m1n1 — EL2 entry, FDT-driven console discovery, AIC driver, timers-over-FIQ
 - QEMU virt machine with -cpu max (for 16 KiB granule; cortex-a72 doesn't support it)
