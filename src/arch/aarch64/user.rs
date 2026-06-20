@@ -93,6 +93,18 @@ pub const SYS_SEND: u64 = 4;
 /// returned in x1. Non-blocking: if the mailbox is empty, the
 /// receiver gets -EAGAIN and can yield and retry.
 pub const SYS_RECV: u64 = 5;
+/// `recvblk(buf, len)` — blocking receive: like `recv` but if the
+/// mailbox is empty, the task is put to sleep (Blocked) instead of
+/// returning -EAGAIN. When a `send` arrives at the mailbox, the kernel
+/// wakes the task (Ready) and the scheduler resumes it; it re-enters
+/// the syscall and finds the message waiting. Args: x0=buf (user VA),
+/// x1=buf_len. Returns: x0=bytes received (>=0), x1=sender TID.
+///
+/// This is the M6 blocking-IPC primitive — the `Blocked` state's first
+/// real use. It demonstrates that the scheduler can put a task to sleep
+/// on a condition and wake it when the condition is met, the same
+/// pattern a real OS uses for blocking reads, waits, and futexes.
+pub const SYS_RECVBLK: u64 = 6;
 
 // ---------------------------------------------------------------------------
 // The user page tables
@@ -611,6 +623,189 @@ const TASK_IPC_RECEIVER_BYTES: [u8; 128] = {
     buf
 };
 
+/// The M6 blocking-IPC demo: a sender and a receiver where the receiver
+/// *blocks* on recvblk instead of yielding and retrying.
+///
+/// Task A (the sender) writes "A: send", yields (so B can run and block
+/// on its recvblk), then sends "wake!" to task B (TID 2) via SYS_SEND,
+/// writes "A: done", and exits. The yield is the key ordering step: it
+/// ensures B has called recvblk and gone Blocked *before* A sends. When
+/// A sends, ipc_send sees B is Blocked, wakes it (Ready, enqueued), and
+/// the scheduler resumes B — which re-enters the recvblk svc, finds the
+/// message waiting, and returns it.
+///
+/// Task B (the receiver) writes "B: block", then calls SYS_RECVBLK
+/// (syscall 6) with a buffer on its stack page. The mailbox is empty
+/// (A hasn't sent yet), so the kernel blocks B (Blocked state, not
+/// enqueued) and switches to A. When A sends and wakes B, B resumes,
+/// re-enters the svc, finds "wake!" in its mailbox, and continues to
+/// write "B: woke!" and exit.
+///
+/// This proves the Blocked state end-to-end: a task sleeps on a
+/// condition (empty mailbox), another task satisfies the condition
+/// (sends a message), and the kernel wakes the sleeper — the same
+/// pattern a real OS uses for blocking read(), wait(), and futex.
+///
+/// Layout (code 0x00..0x4c, data 0x4c onward — no overlap):
+/// ```asm
+/// [0x00] mov  x8, #1          ; SYS_WRITE
+/// [0x04] mov  x0, #1          ; fd = stdout
+/// [0x08] adr  x1, +0x44       ; buf -> 0x4c ("A: send\n\r")
+/// [0x0c] mov  x2, #9          ; len
+/// [0x10] svc  #0              ; write "A: send"
+/// [0x14] mov  x8, #3          ; SYS_YIELD
+/// [0x18] svc  #0              ; yield (let B block on recvblk first)
+/// [0x1c] mov  x8, #4          ; SYS_SEND
+/// [0x20] mov  x0, #2          ; dst_tid = 2 (task B)
+/// [0x24] adr  x1, +0x38       ; buf -> 0x5c ("wake!")
+/// [0x28] mov  x2, #5          ; len = 5
+/// [0x2c] svc  #0              ; send "wake!" — wakes B if Blocked
+/// [0x30] mov  x8, #1          ; SYS_WRITE
+/// [0x34] mov  x0, #1          ; fd = stdout
+/// [0x38] adr  x1, +0x34       ; buf -> 0x6c ("A: done\n\r")
+/// [0x3c] mov  x2, #9          ; len = 9
+/// [0x40] svc  #0              ; write "A: done"
+/// [0x44] mov  x8, #2          ; SYS_EXIT
+/// [0x48] svc  #0              ; exit
+/// [0x4c] "A: send\n\r\0"      ; 9 bytes
+/// [0x5c] "wake!\0"            ; 6 bytes
+/// [0x6c] "A: done\n\r\0"      ; 9 bytes
+/// ```
+const TASK_BLKIPC_SENDER_BYTES: [u8; 128] = {
+    let mut buf = [0u8; 128];
+    // [0x00] mov x8, #1 = MOVZ x8, #1 = 0xD2800028
+    buf[0] = 0x28; buf[1] = 0x00; buf[2] = 0x80; buf[3] = 0xD2;
+    // [0x04] mov x0, #1 = MOVZ x0, #1 = 0xD2800020
+    buf[4] = 0x20; buf[5] = 0x00; buf[6] = 0x80; buf[7] = 0xD2;
+    // [0x08] adr x1, +0x44 (target 0x4c, offset 68)
+    //   immlo = 0, immhi = 17 = 0x10000221
+    buf[8] = 0x21; buf[9] = 0x02; buf[10] = 0x00; buf[11] = 0x10;
+    // [0x0c] mov x2, #9 = MOVZ x2, #9 = 0xD2800122
+    buf[12] = 0x22; buf[13] = 0x01; buf[14] = 0x80; buf[15] = 0xD2;
+    // [0x10] svc #0 = 0xD4000001
+    buf[16] = 0x01; buf[17] = 0x00; buf[18] = 0x00; buf[19] = 0xD4;
+    // [0x14] mov x8, #3 = MOVZ x8, #3 = 0xD2800068
+    buf[20] = 0x68; buf[21] = 0x00; buf[22] = 0x80; buf[23] = 0xD2;
+    // [0x18] svc #0 = 0xD4000001
+    buf[24] = 0x01; buf[25] = 0x00; buf[26] = 0x00; buf[27] = 0xD4;
+    // [0x1c] mov x8, #4 = MOVZ x8, #4 = 0xD2800088
+    buf[28] = 0x88; buf[29] = 0x00; buf[30] = 0x80; buf[31] = 0xD2;
+    // [0x20] mov x0, #2 = MOVZ x0, #2 = 0xD2800040
+    buf[32] = 0x40; buf[33] = 0x00; buf[34] = 0x80; buf[35] = 0xD2;
+    // [0x24] adr x1, +0x38 (target 0x5c, offset 56)
+    //   immlo = 0, immhi = 14 = 0x100001C1
+    buf[36] = 0xC1; buf[37] = 0x01; buf[38] = 0x00; buf[39] = 0x10;
+    // [0x28] mov x2, #5 = MOVZ x2, #5 = 0xD28000A2
+    buf[40] = 0xA2; buf[41] = 0x00; buf[42] = 0x80; buf[43] = 0xD2;
+    // [0x2c] svc #0 = 0xD4000001
+    buf[44] = 0x01; buf[45] = 0x00; buf[46] = 0x00; buf[47] = 0xD4;
+    // [0x30] mov x8, #1 = MOVZ x8, #1 = 0xD2800028
+    buf[48] = 0x28; buf[49] = 0x00; buf[50] = 0x80; buf[51] = 0xD2;
+    // [0x34] mov x0, #1 = MOVZ x0, #1 = 0xD2800020
+    buf[52] = 0x20; buf[53] = 0x00; buf[54] = 0x80; buf[55] = 0xD2;
+    // [0x38] adr x1, +0x34 (target 0x6c, offset 52)
+    //   immlo = 0, immhi = 13 = 0x100001A1
+    buf[56] = 0xA1; buf[57] = 0x01; buf[58] = 0x00; buf[59] = 0x10;
+    // [0x3c] mov x2, #9 = MOVZ x2, #9 = 0xD2800122
+    buf[60] = 0x22; buf[61] = 0x01; buf[62] = 0x80; buf[63] = 0xD2;
+    // [0x40] svc #0 = 0xD4000001
+    buf[64] = 0x01; buf[65] = 0x00; buf[66] = 0x00; buf[67] = 0xD4;
+    // [0x44] mov x8, #2 = MOVZ x8, #2 = 0xD2800048
+    buf[68] = 0x48; buf[69] = 0x00; buf[70] = 0x80; buf[71] = 0xD2;
+    // [0x48] svc #0 = 0xD4000001
+    buf[72] = 0x01; buf[73] = 0x00; buf[74] = 0x00; buf[75] = 0xD4;
+    // [0x4c] "A: send\n\r\0" (9 bytes) at offset 76
+    buf[76] = b'A'; buf[77] = b':'; buf[78] = b' '; buf[79] = b's';
+    buf[80] = b'e'; buf[81] = b'n'; buf[82] = b'd'; buf[83] = b'\n';
+    buf[84] = b'\r'; buf[85] = 0x00;
+    // [0x5c] "wake!\0" (6 bytes) at offset 92
+    buf[92] = b'w'; buf[93] = b'a'; buf[94] = b'k'; buf[95] = b'e';
+    buf[96] = b'!'; buf[97] = 0x00;
+    // [0x6c] "A: done\n\r\0" (9 bytes) at offset 108
+    buf[108] = b'A'; buf[109] = b':'; buf[110] = b' '; buf[111] = b'd';
+    buf[112] = b'o'; buf[113] = b'n'; buf[114] = b'e'; buf[115] = b'\n';
+    buf[116] = b'\r'; buf[117] = 0x00;
+    buf
+};
+
+/// Task B (receiver) for the blocking-IPC demo.
+///
+/// Writes "B: block", then calls SYS_RECVBLK (6) with a buffer on its
+/// stack page. If the mailbox is empty, the kernel blocks B and switches
+/// to A. When A sends and wakes B, B re-enters the recvblk svc, finds
+/// the message, and continues to write "B: woke!" and exit.
+///
+/// Layout (code 0x00..0x44, data 0x44 onward):
+/// ```asm
+/// [0x00] mov  x8, #1          ; SYS_WRITE
+/// [0x04] mov  x0, #1          ; fd = stdout
+/// [0x08] adr  x1, +0x3c       ; buf -> 0x44 ("B: block\n\r")
+/// [0x0c] mov  x2, #10         ; len = 10
+/// [0x10] svc  #0              ; write "B: block"
+/// [0x14] mov  x8, #6          ; SYS_RECVBLK
+/// [0x18] movz x0, #0x100      ; buf_va low 16 bits
+/// [0x1c] movk x0, #0x20, lsl #16 ; buf_va = 0x200100 (stack page)
+/// [0x20] mov  x1, #32         ; buf_len = 32
+/// [0x24] svc  #0              ; recvblk — blocks if empty, returns msg
+/// [0x28] mov  x8, #1          ; SYS_WRITE
+/// [0x2c] mov  x0, #1          ; fd = stdout
+/// [0x30] adr  x1, +0x34       ; buf -> 0x64 ("B: woke!\n\r")
+/// [0x34] mov  x2, #10         ; len = 10
+/// [0x38] svc  #0              ; write "B: woke!"
+/// [0x3c] mov  x8, #2          ; SYS_EXIT
+/// [0x40] svc  #0              ; exit
+/// [0x44] "B: block\n\r\0"     ; 10 bytes
+/// [0x64] "B: woke!\n\r\0"     ; 10 bytes
+/// ```
+const TASK_BLKIPC_RECEIVER_BYTES: [u8; 128] = {
+    let mut buf = [0u8; 128];
+    // [0x00] mov x8, #1 = MOVZ x8, #1 = 0xD2800028
+    buf[0] = 0x28; buf[1] = 0x00; buf[2] = 0x80; buf[3] = 0xD2;
+    // [0x04] mov x0, #1 = MOVZ x0, #1 = 0xD2800020
+    buf[4] = 0x20; buf[5] = 0x00; buf[6] = 0x80; buf[7] = 0xD2;
+    // [0x08] adr x1, +0x3c (target 0x44, offset 60)
+    //   immlo = 0, immhi = 15 = 0x100001E1
+    buf[8] = 0xE1; buf[9] = 0x01; buf[10] = 0x00; buf[11] = 0x10;
+    // [0x0c] mov x2, #10 = MOVZ x2, #10 = 0xD2800142
+    buf[12] = 0x42; buf[13] = 0x01; buf[14] = 0x80; buf[15] = 0xD2;
+    // [0x10] svc #0 = 0xD4000001
+    buf[16] = 0x01; buf[17] = 0x00; buf[18] = 0x00; buf[19] = 0xD4;
+    // [0x14] mov x8, #6 = MOVZ x8, #6 = 0xD28000C8
+    buf[20] = 0xC8; buf[21] = 0x00; buf[22] = 0x80; buf[23] = 0xD2;
+    // [0x18] movz x0, #0x100 = MOVZ x0, #0x100 = 0xD2802000
+    buf[24] = 0x00; buf[25] = 0x20; buf[26] = 0x80; buf[27] = 0xD2;
+    // [0x1c] movk x0, #0x20, lsl #16 = MOVK x0, #0x20, LSL #16 = 0xF2A00400
+    buf[28] = 0x00; buf[29] = 0x04; buf[30] = 0xA0; buf[31] = 0xF2;
+    // [0x20] mov x1, #32 = MOVZ x1, #32 = 0xD2800C21
+    buf[32] = 0x21; buf[33] = 0x0C; buf[34] = 0x80; buf[35] = 0xD2;
+    // [0x24] svc #0 = 0xD4000001
+    buf[36] = 0x01; buf[37] = 0x00; buf[38] = 0x00; buf[39] = 0xD4;
+    // [0x28] mov x8, #1 = MOVZ x8, #1 = 0xD2800028
+    buf[40] = 0x28; buf[41] = 0x00; buf[42] = 0x80; buf[43] = 0xD2;
+    // [0x2c] mov x0, #1 = MOVZ x0, #1 = 0xD2800020
+    buf[44] = 0x20; buf[45] = 0x00; buf[46] = 0x80; buf[47] = 0xD2;
+    // [0x30] adr x1, +0x34 (target 0x64, offset 52)
+    //   immlo = 0, immhi = 13 = 0x100001A1
+    buf[48] = 0xA1; buf[49] = 0x01; buf[50] = 0x00; buf[51] = 0x10;
+    // [0x34] mov x2, #10 = MOVZ x2, #10 = 0xD2800142
+    buf[52] = 0x42; buf[53] = 0x01; buf[54] = 0x80; buf[55] = 0xD2;
+    // [0x38] svc #0 = 0xD4000001
+    buf[56] = 0x01; buf[57] = 0x00; buf[58] = 0x00; buf[59] = 0xD4;
+    // [0x3c] mov x8, #2 = MOVZ x8, #2 = 0xD2800048
+    buf[60] = 0x48; buf[61] = 0x00; buf[62] = 0x80; buf[63] = 0xD2;
+    // [0x40] svc #0 = 0xD4000001
+    buf[64] = 0x01; buf[65] = 0x00; buf[66] = 0x00; buf[67] = 0xD4;
+    // [0x44] "B: block\n\r\0" (10 bytes) at offset 68
+    buf[68] = b'B'; buf[69] = b':'; buf[70] = b' '; buf[71] = b'b';
+    buf[72] = b'l'; buf[73] = b'o'; buf[74] = b'c'; buf[75] = b'k';
+    buf[76] = b'\n'; buf[77] = b'\r'; buf[78] = 0x00;
+    // [0x64] "B: woke!\n\r\0" (10 bytes) at offset 100
+    buf[100] = b'B'; buf[101] = b':'; buf[102] = b' '; buf[103] = b'w';
+    buf[104] = b'o'; buf[105] = b'k'; buf[106] = b'e'; buf[107] = b'!';
+    buf[108] = b'\n'; buf[109] = b'\r'; buf[110] = 0x00;
+    buf
+};
+
 // ---------------------------------------------------------------------------
 // Build the user address space
 // ---------------------------------------------------------------------------
@@ -1121,6 +1316,82 @@ pub fn drop_to_el0_ipc() {
     drop_to_el0_with(root_pa);
 }
 
+/// Drop to EL0 with the M6 blocking-IPC demo: spawn a sender (task A)
+/// and a receiver (task B), each with its own user address space, and
+/// eret into task A. The sender writes "A: send", yields (so B runs and
+/// calls recvblk — blocking because its mailbox is empty), then sends
+/// "wake!" to B. The `ipc_send` path sees B is Blocked, wakes it (Ready,
+/// enqueued), and the scheduler resumes B — which re-enters the recvblk
+/// svc, finds "wake!" waiting, and continues to write "B: woke!" and
+/// exit. Meanwhile A writes "A: done" and exits.
+///
+/// This is the first use of the `Blocked` task state: a task sleeps on
+/// a condition (empty mailbox) and another task wakes it by satisfying
+/// the condition (sending a message). The kernel is the intermediary —
+/// the same pattern a real OS uses for blocking read(), wait(), and
+/// futex. The "retry the syscall on wake" trick (rewind ELR by 4 before
+/// blocking) is the classic re-entrant syscall pattern.
+///
+/// Like `ipc`, this does not return to the monitor loop — control comes
+/// back via `on_el0_return` when the last task exits.
+pub fn drop_to_el0_blkipc() {
+    // ---- 1. Build two independent user address spaces ----
+    // SAFETY: single-core, MMU on, TTBR0 still the empty root.
+    let ttbr0_a = unsafe { build_task_user_space(0, &TASK_BLKIPC_SENDER_BYTES) };
+    let ttbr0_b = unsafe { build_task_user_space(1, &TASK_BLKIPC_RECEIVER_BYTES) };
+
+    // ---- 2. Spawn both tasks ----
+    // Task A (sender): TID 1. Task B (receiver): TID 2.
+    // SAFETY: single-core, interrupts masked (monitor context).
+    let tid_a = unsafe {
+        crate::sched::spawn(b"blkA", ttbr0_a, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+    };
+    let tid_b = unsafe {
+        crate::sched::spawn(b"blkB", ttbr0_b, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+    };
+
+    match (tid_a, tid_b) {
+        (Some(a), Some(b)) => {
+            println!(
+                "[kernel] M6 blocking IPC: spawned sender (TID {a}) and receiver (TID {b})"
+            );
+        }
+        _ => {
+            println!("[kernel] blocking IPC: failed to spawn tasks (table full?)");
+            return;
+        }
+    }
+
+    // ---- 3. Drop into task A (the sender) ----
+    let first = unsafe { crate::sched::scheduler() }.dequeue();
+    let first = match first {
+        Some(tid) => tid,
+        None => {
+            println!("[kernel] blocking IPC: ready queue empty after spawn?!");
+            return;
+        }
+    };
+
+    // SAFETY: first is a valid TID from the scheduler.
+    let t = match unsafe { crate::sched::task(first) } {
+        Some(t) => t,
+        None => {
+            println!("[kernel] blocking IPC: task {first} vanished?!");
+            return;
+        }
+    };
+    t.state = crate::sched::TaskState::Running;
+    let root_pa = t.ttbr0_pa;
+    unsafe { crate::sched::set_current_tid(first) };
+
+    println!(
+        "[kernel] dropping to EL0 — task {:?} (TID {first}), blocking IPC demo",
+        t.name_str()
+    );
+
+    drop_to_el0_with(root_pa);
+}
+
 /// Called when the user program exits and we return to EL1/monitor.
 /// The `__el0_return` trampoline in vectors.rs jumps here.
 #[unsafe(no_mangle)]
@@ -1334,6 +1605,72 @@ pub fn handle_svc_from_el0(frame: &mut super::vectors::TrapFrame) {
                 }
                 Err(e) => {
                     frame.x[0] = e as u64; // negative errno
+                }
+            }
+        }
+        SYS_RECVBLK => {
+            // recvblk(buf, buf_len): blocking receive. Like recv, but if
+            // the mailbox is empty, the task is put to sleep (Blocked)
+            // instead of returning -EAGAIN. When a send arrives, the
+            // sender's ipc_send wakes this task (Ready, enqueued); the
+            // scheduler resumes it and it re-enters the syscall — which
+            // this time finds the message waiting and returns it.
+            //
+            // The "re-enter the syscall" trick: we rewind ELR by 4 (one
+            // instruction — the svc) before blocking, so when the task
+            // is woken and erets, it re-executes the svc and comes back
+            // here. The second time through, the mailbox is non-empty
+            // (the sender filled it before waking us), so we take the
+            // Ok path and return the message. This is the classic
+            // "retry the syscall on wake" pattern — the same shape a
+            // real OS uses for blocking read()/wait()/futex.
+            let buf_va = frame.x[0] as usize;
+            let buf_len = frame.x[1] as usize;
+
+            if buf_len == 0 {
+                frame.x[0] = (-22i64) as u64; // -EINVAL
+                return;
+            }
+            let buf_len = buf_len.min(crate::sched::MSG_MAX);
+
+            let mut msg = [0u8; crate::sched::MSG_MAX];
+            // SAFETY: exception context, single-core, DAIF set.
+            match unsafe { crate::sched::ipc_recv(&mut msg[..buf_len]) } {
+                Ok((n, from)) => {
+                    // Mailbox had a message — copy it out and return.
+                    for i in 0..n {
+                        unsafe {
+                            core::ptr::with_exposed_provenance_mut::<u8>(buf_va + i)
+                                .write_volatile(msg[i]);
+                        }
+                    }
+                    frame.x[0] = n as u64; // bytes received
+                    frame.x[1] = from as u64; // sender TID
+                }
+                Err(_eagain) => {
+                    // Mailbox empty — block. Rewind ELR by 4 so the
+                    // svc re-executes when we're woken, then call
+                    // block_and_switch. If there's no other task to
+                    // run (nobody to send to us), we have a deadlock:
+                    // fall back to returning -EAGAIN rather than hang
+                    // — the user program can yield and retry, or exit.
+                    frame.elr = frame.elr.wrapping_sub(4);
+                    // SAFETY: exception context, single-core, DAIF set.
+                    let switched = unsafe { crate::sched::block_and_switch(frame) };
+                    if !switched {
+                        // Nobody else to run — can't block. Restore
+                        // ELR (we're not actually retrying) and return
+                        // -EAGAIN. This is the single-task case: the
+                        // blocking recv degrades to non-blocking when
+                        // there's no other task to produce a message.
+                        frame.elr = frame.elr.wrapping_add(4);
+                        frame.x[0] = (-11i64) as u64; // -EAGAIN
+                    }
+                    // If switched: we're now running the next task.
+                    // When this task is woken and rescheduled, it
+                    // re-enters the svc (ELR was rewound), comes back
+                    // here, and finds the message waiting. Don't touch
+                    // the frame — it holds the next task's context.
                 }
             }
         }

@@ -386,7 +386,44 @@ pub unsafe fn ipc_send(dst_tid: usize, data: &[u8]) -> Result<(), i64> {
     t.mailbox[..n].copy_from_slice(&data[..n]);
     t.mailbox_len = n;
     t.mailbox_from = current_tid();
+
+    // M6 blocking IPC: if the receiver is Blocked (sitting in a recv
+    // that found an empty mailbox), the message it was waiting for has
+    // just arrived. Wake it — set it to Ready and enqueue it so the
+    // scheduler picks it up. When it runs, it retries the recv svc and
+    // finds this message. The sender is the alarm clock; the kernel is
+    // the intermediary.
+    if t.state == TaskState::Blocked {
+        t.state = TaskState::Ready;
+        // SAFETY: t is a raw-pointer deref of TASK_TABLE[dst_tid];
+        // SCHEDULER is a separate static. No aliasing conflict.
+        // Single-core, DAIF-set exception context.
+        unsafe { scheduler() }.enqueue(dst_tid);
+    }
+
     Ok(())
+}
+
+/// Wake a Blocked task: set it to Ready and enqueue it. Returns true if
+/// the task was Blocked (and is now woken), false otherwise. Currently
+/// called only from `ipc_send` (inlined above), but exposed as a public
+/// API for future blocking primitives (e.g. blocking send, sleep, wait).
+///
+/// # Safety
+/// Single-core, interrupts masked (called from the SVC handler at
+/// EL1, DAIF set by exception entry).
+pub unsafe fn wake(tid: usize) -> bool {
+    if tid == 0 || tid >= MAX_TASKS {
+        return false;
+    }
+    // SAFETY: tid is in bounds; single-core, no concurrent access.
+    let t = unsafe { &raw mut TASK_TABLE[tid] };
+    if unsafe { (*t).state } != TaskState::Blocked {
+        return false;
+    }
+    unsafe { (*t).state = TaskState::Ready };
+    unsafe { scheduler() }.enqueue(tid);
+    true
 }
 
 /// Receive a message into `buf`. If the mailbox is empty, returns
@@ -508,6 +545,77 @@ pub unsafe fn save_and_switch(frame: &mut TrapFrame) -> bool {
     // Remember who is running now.
     unsafe { set_current_tid(next) };
 
+    true
+}
+
+/// Block the current task and switch to the next Ready one. This is the
+/// M6 blocking-IPC primitive: a task that calls a blocking `recv` on an
+/// empty mailbox voluntarily removes itself from the ready queue until
+/// something wakes it (a `send` to its mailbox, which sets it back to
+/// Ready and enqueues it).
+///
+/// Unlike [`save_and_switch`], which re-enqueues the current task as
+/// Ready (cooperative yield — "I'll run again later"), this sets the
+/// current task to [`TaskState::Blocked`] and does *not* enqueue it. The
+/// task sits dormant until a specific event wakes it. The caller is
+/// responsible for setting up the wake condition *before* calling this
+/// (e.g. the recv handler has already noted that this task is blocked on
+/// its mailbox; the send handler will check `state == Blocked` and wake).
+///
+/// `frame` is the on-stack TrapFrame the exception stub built. The caller
+/// should adjust `frame.elr` (e.g. rewind it by 4 to re-execute the svc)
+/// *before* calling if the task should retry its syscall on wake — this
+/// is the standard "the handler hasn't produced a return value yet, so
+/// re-enter it" pattern. The frame is copied into the TCB's `saved`
+/// field; the next task's saved frame is copied onto the stack in its
+/// place, and `__vectors_restore` erets to the next task.
+///
+/// Returns `true` if a switch happened, `false` if there is no other
+/// Ready task (in which case the current task is left Blocked and the
+/// caller must handle the "nobody to switch to" case — typically by
+/// returning to the monitor, since a Blocked task with no other runners
+/// is a deadlock).
+///
+/// # Safety
+/// `frame` points to the on-stack TrapFrame. Single-core, interrupts
+/// masked (exception handler, DAIF set). See [`save_and_switch`].
+pub unsafe fn block_and_switch(frame: &mut TrapFrame) -> bool {
+    let cur = current_tid();
+    if cur == 0 {
+        // The kernel itself can't block — there's no TCB for TID 0.
+        return false;
+    }
+
+    // Save the current task's context (with the caller's ELR adjustment)
+    // and mark it Blocked — not Ready, not enqueued. It sleeps until a
+    // specific wake (e.g. ipc_send to its mailbox).
+    // SAFETY: cur is in bounds; single-core, no concurrent access.
+    if let Some(t) = unsafe { task(cur) } {
+        t.saved = *frame;
+        t.state = TaskState::Blocked;
+    }
+
+    // Pick the next task. If nobody is ready, we have a potential
+    // deadlock — return false so the caller can fall back (e.g. return
+    // to the monitor rather than hang).
+    let next = match unsafe { scheduler() }.dequeue() {
+        Some(tid) => tid,
+        None => return false,
+    };
+
+    // Load the next task's saved context into the stack frame slot.
+    // SAFETY: next is from the scheduler's ready queue — a valid TID.
+    let next_task = match unsafe { task(next) } {
+        Some(t) => t,
+        None => return false,
+    };
+    *frame = next_task.saved;
+    next_task.state = TaskState::Running;
+
+    if next_task.ttbr0_pa != 0 {
+        crate::arch::aarch64::mmu::set_user_ttbr0(next_task.ttbr0_pa);
+    }
+    unsafe { set_current_tid(next) };
     true
 }
 

@@ -539,6 +539,9 @@ pub fn run_command(line: &[u8]) {
             println!(
                 "  ipc             M6: IPC demo — sender sends a message, receiver gets it"
             );
+            println!(
+                "  blkipc          M6: blocking IPC — receiver blocks on recvblk, sender wakes it"
+            );
         }
         "brk" => {
             arch::aarch64::vectors::demo_brk();
@@ -816,6 +819,20 @@ pub fn run_command(line: &[u8]) {
             // through the kernel from one task to another. Like
             // `spawn2`, this does not return to this monitor loop.
             arch::aarch64::user::drop_to_el0_ipc();
+        }
+        "blkipc" => {
+            // M6: blocking IPC demo. Like `ipc` but the receiver calls
+            // SYS_RECVBLK (blocking receive) instead of SYS_RECV. When
+            // B's mailbox is empty, the kernel puts B to sleep (Blocked
+            // state) and switches to A. A sends "wake!" — the send path
+            // sees B is Blocked, wakes it (Ready, enqueued), and the
+            // scheduler resumes B, which re-enters the recvblk svc,
+            // finds the message, and continues. This is the first use
+            // of the Blocked task state: a task sleeps on a condition
+            // and another task wakes it — the same pattern a real OS
+            // uses for blocking read()/wait()/futex. Like `ipc`, this
+            // does not return to this monitor loop.
+            arch::aarch64::user::drop_to_el0_blkipc();
         }
         other => println!("unknown command {other:?} - try 'help'"),
     }

@@ -33,12 +33,12 @@ freshness: cached 2h (checked 2026-06-20T18:56:00Z)
 - translate virtual addresses (AT S1E1R hardware probe + software walk with cross-check)
 - respond to timer interrupts (arm, fire, re-arm — the heartbeat pattern)
 - parse the devicetree blob and cross-check discovered values against board constants
-- interactive monitor with commands: help, brk, svc, unaligned, translate, walk, guard, wx, noexec, low, abort, tick, ticks, ticktest, dtb, tree, el0, el0fault, tasks, spawn2, preempt, ipc
+- interactive monitor with commands: help, brk, svc, unaligned, translate, walk, guard, wx, noexec, low, abort, tick, ticks, ticktest, dtb, tree, el0, el0fault, tasks, spawn2, preempt, ipc, blkipc
 
 ## needs
 
 - M5: EL0 and syscalls — THIRD PIECE DONE (fault recovery — the kernel survives its first serviced fault: EL0 data/instruction aborts now kill the task, not the kernel). Next: per-task kernel stacks, scheduler integration.
-- M6: scheduler and IPC — THIRD PIECE DONE (IPC message passing: per-task mailboxes, SYS_SEND/SYS_RECV syscalls, 'ipc' monitor command. Sender task A writes "A: sending", sends "hello B!" to TID 2's mailbox, yields. Receiver task B writes "B: waiting", yields, calls SYS_RECV, gets the message, writes "B: got msg!", exits. The message passes through the kernel — no shared memory. Non-blocking: -EAGAIN if mailbox full/empty. Next: blocking IPC (Blocked state), multi-core (PSCI CPU_ON), per-task kernel stacks).
+- M6: scheduler and IPC — FOURTH PIECE DONE (blocking IPC: SYS_RECVBLK syscall, block_and_switch, wake-on-send. The Blocked state's first real use: a task sleeps on an empty mailbox, another task sends to it and the kernel wakes the sleeper. The "retry the syscall on wake" trick (rewind ELR by 4 before blocking) is the classic re-entrant syscall pattern. 'blkipc' monitor command proves it: B blocks, A sends "wake!", B wakes and continues. Next: per-task kernel stacks, multi-core (PSCI CPU_ON), blocking send).
 - M7: Apple Silicon bring-up via m1n1 — EL2 entry, FDT-driven console discovery, AIC driver, timers-over-FIQ
 - QEMU virt machine with -cpu max (for 16 KiB granule; cortex-a72 doesn't support it)
 - Rust stable toolchain with aarch64-unknown-none-softfloat target
