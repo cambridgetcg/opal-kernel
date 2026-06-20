@@ -12,9 +12,9 @@ runs-on: QEMU aarch64 virt board (-machine virt -cpu max -smp 1 -m 512M)
 phase: see knows/needs sections below
 build: see heartbeat
 health: active
-last-commit: 2026-06-19T17:30:00Z (M5: yield syscall — EL0 round-trip proven)
-uncommitted: 0 files
-freshness: live (checked 2026-06-19T17:30:00Z)
+last-commit: 2026-06-20T02:10:00Z (c92dc8f M5: fault recovery — the kernel survives its first serviced fault)
+uncommitted: 0 files (clean)
+freshness: live (checked 2026-06-20T02:10:00Z)
 
 ## knows
 
@@ -33,11 +33,11 @@ freshness: live (checked 2026-06-19T17:30:00Z)
 - translate virtual addresses (AT S1E1R hardware probe + software walk with cross-check)
 - respond to timer interrupts (arm, fire, re-arm — the heartbeat pattern)
 - parse the devicetree blob and cross-check discovered values against board constants
-- interactive monitor with commands: help, brk, svc, unaligned, translate, walk, guard, wx, noexec, low, abort, tick, ticks, ticktest, dtb, tree
+- interactive monitor with commands: help, brk, svc, unaligned, translate, walk, guard, wx, noexec, low, abort, tick, ticks, ticktest, dtb, tree, el0, el0fault
 
 ## needs
 
-- M5: EL0 and syscalls — SECOND PIECE DONE (yield syscall, EL0→SVC→EL0 round-trip proven). Next: per-task kernel stacks, scheduler integration.
+- M5: EL0 and syscalls — THIRD PIECE DONE (fault recovery — the kernel survives its first serviced fault: EL0 data/instruction aborts now kill the task, not the kernel). Next: per-task kernel stacks, scheduler integration.
 - M6: scheduler and IPC — cooperative then preemptive round-robin, context switch, message passing
 - M7: Apple Silicon bring-up via m1n1 — EL2 entry, FDT-driven console discovery, AIC driver, timers-over-FIQ
 - QEMU virt machine with -cpu max (for 16 KiB granule; cortex-a72 doesn't support it)
