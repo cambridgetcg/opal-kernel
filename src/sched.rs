@@ -47,16 +47,20 @@ use crate::arch::aarch64::vectors::TrapFrame;
 /// logic is honest about what it's doing when tasks multiply.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TaskState {
+    /// The task has called `exit` or was killed on a fault. Its slot
+    /// in the table is available for reuse — the scheduler will zero
+    /// the Task on allocation, so no stale state leaks.
+    ///
+    /// This variant is deliberately first (discriminant 0) so that a
+    /// zeroed `.bss` — what the boot stub produces — reads as Exited,
+    /// and `alloc_task()` finds free slots without any explicit init.
+    Exited,
     /// The task exists and can run, but is not currently running.
     /// It is in the ready queue, waiting to be picked.
     Ready,
     /// The task is currently executing on the CPU. At most one task
     /// is Running at any time (single-core).
     Running,
-    /// The task has called `exit` or was killed on a fault. Its slot
-    /// in the table is available for reuse — the scheduler will zero
-    /// the Task on allocation, so no stale state leaks.
-    Exited,
     /// The task is waiting on something (a timer, an IPC message).
     /// Not in the ready queue; the thing it waits for will wake it
     /// back to Ready. Unused until M6's IPC half, but present so the
@@ -280,6 +284,125 @@ pub fn current_tid() -> usize {
 /// already saved.
 pub unsafe fn set_current_tid(tid: usize) {
     unsafe { core::ptr::write_volatile(&raw mut CURRENT_TID, tid) }
+}
+
+/// Spawn a new user task: allocate a slot, set its name, user page-table
+/// root, and initial saved register state (entry point, SP, SPSR for EL0).
+/// The task starts in the Ready state and is enqueued.
+///
+/// Returns the TID, or None if the table is full.
+///
+/// # Safety
+/// Single-core, interrupts masked (called from the monitor before
+/// dropping to EL0).
+pub unsafe fn spawn(name: &[u8], ttbr0_pa: u64, entry: u64, sp: u64) -> Option<usize> {
+    let tid = unsafe { alloc_task()? };
+    // SAFETY: tid just allocated, in bounds. alloc_task left the slot
+    // in the Exited state; we set it to Ready below. We can't use
+    // task() here because task() returns None for Exited slots.
+    let t = unsafe { &mut *(&raw mut TASK_TABLE[tid]) };
+    t.saved = TrapFrame::empty();
+    t.saved.elr = entry; // eret resumes here in EL0
+    t.saved.sp = sp; // SP_EL0
+    // SPSR for EL0: M=0b0000, bit[4]=0 (AArch64), DAIF=0b1111 at [9:6].
+    // Same value as user.rs's drop_to_el0_with.
+    t.saved.spsr = 0x3C0;
+    t.ttbr0_pa = ttbr0_pa;
+    t.state = TaskState::Ready;
+    t.set_name(name);
+    unsafe { scheduler() }.enqueue(tid);
+    Some(tid)
+}
+
+// ---------------------------------------------------------------------------
+// M6 context switch — the heart of the scheduler
+// ---------------------------------------------------------------------------
+
+/// Save the current task's register state and switch to the next Ready task.
+///
+/// This is the M6 context switch. It is called from the `yield` syscall
+/// handler ([`crate::arch::aarch64::user::handle_svc_from_el0`]) with the
+/// trap frame that the exception stub built on the kernel stack — the
+/// frame that `__vectors_restore` is about to reload and `eret` from.
+///
+/// The switch is, mechanically, three copies and a TTBR0 swap:
+///
+/// 1. **Save**: copy the frame *off* the stack into the current task's
+///    `saved` field. The frame on the stack is about to be overwritten.
+/// 2. **Pick**: dequeue the next Ready task (round-robin). If there is
+///    no other task, return — the current task just keeps running (the
+///    single-task yield, same as M5).
+/// 3. **Load**: copy the *next* task's `saved` frame *onto* the stack
+///    slot, overwriting the current frame in place. When
+///    `__vectors_restore` runs, it loads *these* registers and `eret`s
+///    to the new task — exactly the same code path as a normal syscall
+///    return, just with a different frame.
+/// 4. **Swap address space**: write the new task's `ttbr0_pa` to
+///    TTBR0_EL1. The kernel's TTBR1 is shared and untouched.
+///
+/// No new assembly. The existing `__vectors_restore` stub is the
+/// context-switch epilogue; this function is its prologue. The beauty
+/// is that the switch reuses the *same* hardware return path M5 built:
+/// load registers from a frame, `eret`. The only new idea is "a
+/// *different* task's frame."
+///
+/// # Safety
+///
+/// `frame` points to the TrapFrame the vector stub pushed on the kernel
+/// stack. The caller (syscall handler) holds a `&mut` to it for the
+/// duration. We copy bytes in and out of it; the restore stub reads
+/// exactly this memory. Single-core, interrupts masked (we are in an
+/// exception handler — DAIF is set by the exception entry).
+pub unsafe fn save_and_switch(frame: &mut TrapFrame) -> bool {
+    let cur = current_tid();
+
+    // If there is a current task (not the kernel, TID 0), save its
+    // context and mark it Ready to run again later.
+    if cur != 0 {
+        // SAFETY: cur is in bounds (set only by set_current_tid, which
+        // we call below with a value from alloc_task — also in bounds).
+        // Single-core, no concurrent access.
+        if let Some(t) = unsafe { task(cur) } {
+            t.saved = *frame;
+            if t.state == TaskState::Running {
+                t.state = TaskState::Ready;
+                // Re-enqueue so it gets picked again later.
+                unsafe { scheduler() }.enqueue(cur);
+            }
+        }
+    }
+
+    // Pick the next task.
+    let next = match unsafe { scheduler() }.dequeue() {
+        Some(tid) => tid,
+        // Nobody else to run — return false, caller returns to EL0
+        // normally (the single-task no-op yield, same as M5).
+        None => return false,
+    };
+
+    // Load the next task's saved context into the stack frame slot.
+    // SAFETY: next is from the scheduler's ready queue, which only
+    // holds valid TIDs of Ready tasks.
+    let next_task = match unsafe { task(next) } {
+        Some(t) => t,
+        None => return false, // shouldn't happen, but honest
+    };
+
+    // The frame copy: overwrite the on-stack frame with the next
+    // task's saved state. When __vectors_restore runs, it will load
+    // THESE registers and eret to the new task.
+    *frame = next_task.saved;
+    next_task.state = TaskState::Running;
+
+    // Swap the address space: the new task's user pages.
+    if next_task.ttbr0_pa != 0 {
+        crate::arch::aarch64::mmu::set_user_ttbr0(next_task.ttbr0_pa);
+    }
+
+    // Remember who is running now.
+    unsafe { set_current_tid(next) };
+
+    true
 }
 
 /// Dump the task table to the console — a diagnostic for the monitor.

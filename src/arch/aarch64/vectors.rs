@@ -279,6 +279,7 @@ __el0_return:
 /// two views must agree byte for byte: `#[repr(C)]` pins the layout, the
 /// const asserts below pin the numbers.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct TrapFrame {
     /// General-purpose registers x0..x30, exactly as the interrupted code
     /// left them. `x[30]` is the link register.

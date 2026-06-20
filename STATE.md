@@ -12,9 +12,9 @@ runs-on: QEMU aarch64 virt board (-machine virt -cpu max -smp 1 -m 512M)
 phase: see knows/needs sections below
 build: see heartbeat
 health: active
-last-commit: 2026-06-20T02:10:00Z (c92dc8f M5: fault recovery — the kernel survives its first serviced fault)
-uncommitted: 0 files (clean)
-freshness: live (checked 2026-06-20T02:10:00Z)
+last-commit: 2026-06-19T19:11:54-07:00 (0eebda8 M6: scheduler scaffolding — Task control block, ready queue, task table)
+uncommitted: 5 files
+freshness: live (checked 2026-06-20T04:54:20Z)
 
 ## knows
 

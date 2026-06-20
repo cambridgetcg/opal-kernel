@@ -124,6 +124,63 @@ struct UserStackPage([u8; mmu::GRANULE]);
 static mut USER_STACK_PAGE: UserStackPage = UserStackPage([0; mmu::GRANULE]);
 
 // ---------------------------------------------------------------------------
+// M6: per-task user address spaces
+// ---------------------------------------------------------------------------
+//
+// M5 had one user address space (one set of page tables, one code page,
+// one stack page). M6 needs *multiple* tasks, each with its own user
+// space. We cannot allocate, so we statically reserve a fixed number
+// of per-task address spaces. Each `UserTaskMem` is 64 KiB of .bss
+// (4 page tables × 16 KiB) + 32 KiB (code + stack pages) = 96 KiB.
+// Two tasks = 192 KiB — small for a teaching kernel with 512 MiB RAM.
+
+/// A complete per-task user address space: four levels of page tables
+/// plus a code page and a stack page. All zeroed by boot; `spawn_task`
+/// fills them in.
+#[repr(C)]
+struct UserTaskMem {
+    l0: mmu::PageTable,
+    l1: mmu::PageTable,
+    l2: mmu::PageTable,
+    l3: mmu::PageTable,
+    code: UserCodePage,
+    stack: UserStackPage,
+}
+
+/// Two per-task address spaces, enough for the M6 two-task demo.
+/// More can be added; MAX_TASKS is 8 but we only need 2 for the
+/// round-robin proof.
+static mut TASK_MEM_A: UserTaskMem = UserTaskMem {
+    l0: mmu::PageTable([0; 2048]),
+    l1: mmu::PageTable([0; 2048]),
+    l2: mmu::PageTable([0; 2048]),
+    l3: mmu::PageTable([0; 2048]),
+    code: UserCodePage([0; mmu::GRANULE]),
+    stack: UserStackPage([0; mmu::GRANULE]),
+};
+static mut TASK_MEM_B: UserTaskMem = UserTaskMem {
+    l0: mmu::PageTable([0; 2048]),
+    l1: mmu::PageTable([0; 2048]),
+    l2: mmu::PageTable([0; 2048]),
+    l3: mmu::PageTable([0; 2048]),
+    code: UserCodePage([0; mmu::GRANULE]),
+    stack: UserStackPage([0; mmu::GRANULE]),
+};
+
+/// Get the UserTaskMem for a given task slot (0 or 1). Returns a raw
+/// pointer so the caller can build the page tables and copy the program.
+///
+/// # Safety
+/// `slot` must be 0 or 1. Single-core, no concurrent access.
+unsafe fn task_mem(slot: usize) -> *mut UserTaskMem {
+    match slot {
+        0 => unsafe { &raw mut TASK_MEM_A },
+        1 => unsafe { &raw mut TASK_MEM_B },
+        _ => unreachable!("only 2 per-task address spaces exist"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The userspace program
 // ---------------------------------------------------------------------------
 
@@ -220,6 +277,77 @@ const USER_FAULT_PROGRAM_BYTES: [u8; 16] = {
     buf
 };
 
+/// The M6 two-task demo: a *second* userspace program for task B.
+///
+/// Task A is `USER_PROGRAM_BYTES` (prints "hello, EL0!", yields, prints
+/// "back from yield", exits). Task B is this program: prints "task B!",
+/// yields, prints "B done!", exits. With the scheduler's round-robin
+/// `yield`, the output interleaves A and B — proving two independent
+/// tasks in two independent address spaces are sharing one CPU.
+///
+/// ```asm
+/// [0x00] mov  x8, #1          ; SYS_WRITE
+/// [0x04] mov  x0, #1          ; fd = stdout
+/// [0x08] adr  x1, +0x30       ; buf -> 0x38 ("task B!\n\r")
+/// [0x0c] mov  x2, #8          ; len
+/// [0x10] svc  #0              ; syscall: write
+/// [0x14] mov  x8, #3          ; SYS_YIELD
+/// [0x18] svc  #0              ; syscall: yield (switches to task A)
+/// [0x1c] mov  x8, #1          ; SYS_WRITE (again)
+/// [0x20] mov  x0, #1          ; fd = stdout
+/// [0x24] adr  x1, +0x14       ; buf -> 0x38 ("B done!\n\r")
+/// [0x28] mov  x2, #8          ; len
+/// [0x2c] svc  #0              ; syscall: write
+/// [0x30] mov  x8, #2          ; SYS_EXIT
+/// [0x34] svc  #0              ; syscall: exit
+/// [0x38] "task B!\n\r\0"      ; 9 bytes + NUL
+/// [0x48] "B done!\n\r\0"      ; 9 bytes + NUL
+/// ```
+const TASK_B_PROGRAM_BYTES: [u8; 128] = {
+    let mut buf = [0u8; 128];
+    // [0x00] mov x8, #1 = MOVZ x8, #1 = 0xD2800028
+    buf[0] = 0x28; buf[1] = 0x00; buf[2] = 0x80; buf[3] = 0xD2;
+    // [0x04] mov x0, #1 = MOVZ x0, #1 = 0xD2800020
+    buf[4] = 0x20; buf[5] = 0x00; buf[6] = 0x80; buf[7] = 0xD2;
+    // [0x08] adr x1, +0x30 (target 0x38) = offset 0x38-0x08 = 0x30 = 48
+    //   immlo = 48 & 0x3 = 0, immhi = 48 >> 2 = 12 = 0xC
+    //   = 0x10000000 | (0 << 29) | (0xC << 5) | 1 = 0x10000181
+    buf[8] = 0x81; buf[9] = 0x01; buf[10] = 0x00; buf[11] = 0x10;
+    // [0x0c] mov x2, #8 = MOVZ x2, #8 = 0xD2800102
+    buf[12] = 0x02; buf[13] = 0x01; buf[14] = 0x80; buf[15] = 0xD2;
+    // [0x10] svc #0 = 0xD4000001
+    buf[16] = 0x01; buf[17] = 0x00; buf[18] = 0x00; buf[19] = 0xD4;
+    // [0x14] mov x8, #3 = MOVZ x8, #3 = 0xD2800068
+    buf[20] = 0x68; buf[21] = 0x00; buf[22] = 0x80; buf[23] = 0xD2;
+    // [0x18] svc #0 = 0xD4000001
+    buf[24] = 0x01; buf[25] = 0x00; buf[26] = 0x00; buf[27] = 0xD4;
+    // [0x1c] mov x8, #1 = MOVZ x8, #1 = 0xD2800028
+    buf[28] = 0x28; buf[29] = 0x00; buf[30] = 0x80; buf[31] = 0xD2;
+    // [0x20] mov x0, #1 = MOVZ x0, #1 = 0xD2800020
+    buf[32] = 0x20; buf[33] = 0x00; buf[34] = 0x80; buf[35] = 0xD2;
+    // [0x24] adr x1, +0x24 (target 0x48) = offset 0x48-0x24 = 0x24 = 36
+    //   immlo = 36 & 0x3 = 0, immhi = 36 >> 2 = 9
+    //   = 0x10000000 | (0 << 29) | (9 << 5) | 1 = 0x10000121
+    buf[36] = 0x21; buf[37] = 0x01; buf[38] = 0x00; buf[39] = 0x10;
+    // [0x28] mov x2, #8 = MOVZ x2, #8 = 0xD2800102
+    buf[40] = 0x02; buf[41] = 0x01; buf[42] = 0x80; buf[43] = 0xD2;
+    // [0x2c] svc #0 = 0xD4000001
+    buf[44] = 0x01; buf[45] = 0x00; buf[46] = 0x00; buf[47] = 0xD4;
+    // [0x30] mov x8, #2 = MOVZ x8, #2 = 0xD2800048
+    buf[48] = 0x48; buf[49] = 0x00; buf[50] = 0x80; buf[51] = 0xD2;
+    // [0x34] svc #0 = 0xD4000001
+    buf[52] = 0x01; buf[53] = 0x00; buf[54] = 0x00; buf[55] = 0xD4;
+    // [0x38] "task B!\n\r\0" (9 bytes + NUL)
+    buf[56] = b't'; buf[57] = b'a'; buf[58] = b's'; buf[59] = b'k';
+    buf[60] = b' '; buf[61] = b'B'; buf[62] = b'!'; buf[63] = b'\n';
+    buf[64] = b'\r'; buf[65] = 0x00;
+    // [0x48] "B done!\n\r\0" (9 bytes + NUL)
+    buf[72] = b'B'; buf[73] = b' '; buf[74] = b'd'; buf[75] = b'o';
+    buf[76] = b'n'; buf[77] = b'e'; buf[78] = b'!'; buf[79] = b'\n';
+    buf[80] = b'\r'; buf[81] = 0x00;
+    buf
+};
+
 // ---------------------------------------------------------------------------
 // Build the user address space
 // ---------------------------------------------------------------------------
@@ -248,7 +376,6 @@ pub fn build_fault_user_space() -> u64 {
 /// `el0` program and the faulting `el0fault` program share this path —
 /// the only difference is which bytes land in the code page.
 fn build_user_space_with(prog: &[u8]) -> u64 {
-    // ---- 1. Copy the program into the user code page ----
     // SAFETY: single core, no concurrent access. USER_CODE_PAGE is
     // .bss (zeroed by boot); we write the program bytes into it.
     unsafe {
@@ -263,31 +390,104 @@ fn build_user_space_with(prog: &[u8]) -> u64 {
 
     // ---- 2. Physical addresses of the user pages and tables ----
     // SAFETY: address-taking only (no reads/writes) on static muts.
-    let code_pa = mmu::virt_to_phys(unsafe { &raw const USER_CODE_PAGE }.expose_provenance()) as u64;
-    let stack_pa = mmu::virt_to_phys(unsafe { &raw const USER_STACK_PAGE }.expose_provenance()) as u64;
+    let code_pa =
+        mmu::virt_to_phys(unsafe { &raw const USER_CODE_PAGE }.expose_provenance()) as u64;
+    let stack_pa =
+        mmu::virt_to_phys(unsafe { &raw const USER_STACK_PAGE }.expose_provenance()) as u64;
     let l0_pa = mmu::virt_to_phys(unsafe { &raw const USER_TABLES.l0 }.expose_provenance()) as u64;
     let l1_pa = mmu::virt_to_phys(unsafe { &raw const USER_TABLES.l1 }.expose_provenance()) as u64;
     let l2_pa = mmu::virt_to_phys(unsafe { &raw const USER_TABLES.l2 }.expose_provenance()) as u64;
     let l3_pa = mmu::virt_to_phys(unsafe { &raw const USER_TABLES.l3 }.expose_provenance()) as u64;
 
-    // ---- 3. Wire the tree: L0 -> L1 -> L2 -> L3 ----
-    // SAFETY: single core, MMU on but TTBR0 is still the empty root
-    // (condemned in kmain). We are writing to USER_TABLES via their
-    // high aliases; the hardware walker is not looking at these tables
-    // yet (TTBR0 points at the kernel's empty_root). No concurrent
-    // reader exists.
-    unsafe {
-        let l0 = &raw mut USER_TABLES.l0.0 as *mut u64;
-        let l1 = &raw mut USER_TABLES.l1.0 as *mut u64;
-        let l2 = &raw mut USER_TABLES.l2.0 as *mut u64;
-        let l3 = &raw mut USER_TABLES.l3.0 as *mut u64;
+    // SAFETY: same invariant — we write the tables via their high
+    // aliases; the walker is not looking at them.
+    unsafe { wire_user_tables(l0_pa, l1_pa, l2_pa, l3_pa, code_pa, stack_pa) };
 
+    l0_pa
+}
+
+// ---------------------------------------------------------------------------
+// M6: per-task address space builder
+// ---------------------------------------------------------------------------
+
+/// Build a per-task user address space in the given `UserTaskMem` slot.
+/// Copies `prog` into the task's code page, wires its four-level page
+/// table tree (same geometry as the M5 single-task tables), and returns
+/// the PA of its L0 root — the value for TTBR0_EL1 when this task runs.
+///
+/// Each task gets its own completely independent user address space:
+/// its own L0/L1/L2/L3 tables, its own code page, its own stack page.
+/// The kernel's TTBR1 tree is shared and never changes.
+///
+/// # Safety
+/// `slot` must be 0 or 1 (selecting TASK_MEM_A or TASK_MEM_B).
+/// Single-core, no concurrent access.
+unsafe fn build_task_user_space(slot: usize, prog: &[u8]) -> u64 {
+    let mem = unsafe { task_mem(slot) };
+
+    // ---- 1. Copy the program into the task's code page ----
+    // SAFETY: mem is a valid pointer to a UserTaskMem; single-core.
+    unsafe {
+        let page = core::ptr::addr_of_mut!((*mem).code.0) as *mut u8;
+        let mut i = 0;
+        while i < prog.len() {
+            page.add(i).write_volatile(prog[i]);
+            i += 1;
+        }
+    }
+
+    // ---- 2. Physical addresses of the task's pages and tables ----
+    // SAFETY: address-taking only; all within the UserTaskMem.
+    let code_pa = mmu::virt_to_phys(core::ptr::addr_of!((*mem).code) as usize) as u64;
+    let stack_pa = mmu::virt_to_phys(core::ptr::addr_of!((*mem).stack) as usize) as u64;
+    let l0_pa = mmu::virt_to_phys(core::ptr::addr_of!((*mem).l0) as usize) as u64;
+    let l1_pa = mmu::virt_to_phys(core::ptr::addr_of!((*mem).l1) as usize) as u64;
+    let l2_pa = mmu::virt_to_phys(core::ptr::addr_of!((*mem).l2) as usize) as u64;
+    let l3_pa = mmu::virt_to_phys(core::ptr::addr_of!((*mem).l3) as usize) as u64;
+
+    // SAFETY: same invariant as build_user_space_with — we write the
+    // tables via their high aliases; the walker is not looking at them.
+    unsafe { wire_user_tables(l0_pa, l1_pa, l2_pa, l3_pa, code_pa, stack_pa) };
+
+    l0_pa
+}
+
+/// Wire a four-level user page table tree: L0→L1→L2→L3, with one code
+/// page (UserRx) and one stack page (UserRw) at the standard user VAs.
+/// Shared by the M5 single-task builder and the M6 per-task builder —
+/// the geometry is identical, only the backing pages differ.
+///
+/// # Safety
+/// The caller must provide valid PAs of 16 KiB-aligned tables and
+/// pages. Single-core, MMU on but TTBR0 not pointing at these tables
+/// yet (we write via their high aliases).
+unsafe fn wire_user_tables(
+    l0_pa: u64,
+    l1_pa: u64,
+    l2_pa: u64,
+    l3_pa: u64,
+    code_pa: u64,
+    stack_pa: u64,
+) {
+    // Recover the high-half VAs from the PAs so we can write the tables.
+    let l0 = mmu::phys_to_virt(l0_pa as usize) as *mut u64;
+    let l1 = mmu::phys_to_virt(l1_pa as usize) as *mut u64;
+    let l2 = mmu::phys_to_virt(l2_pa as usize) as *mut u64;
+    let l3 = mmu::phys_to_virt(l3_pa as usize) as *mut u64;
+
+    // SAFETY: we write through the high aliases of the table pages;
+    // the hardware walker is not looking at these tables yet (TTBR0
+    // still points at whatever was there before). Single-core.
+    unsafe {
         // L0[0] -> L1 (all user VAs are in the low half, bit 47 = 0)
-        l0.add(mmu::va_l0i(USER_CODE_VA)).write(mmu::table_desc(l1_pa));
+        l0.add(mmu::va_l0i(USER_CODE_VA))
+            .write(mmu::table_desc(l1_pa));
         // L1[0] -> L2 (all our VAs are < 2^36)
-        l1.add(mmu::va_l1i(USER_CODE_VA)).write(mmu::table_desc(l2_pa));
+        l1.add(mmu::va_l1i(USER_CODE_VA))
+            .write(mmu::table_desc(l2_pa));
         // L2 -> L3 (one 32 MiB region, refined to 16 KiB pages)
-        l2.add(mmu::va_l2i(USER_CODE_VA)).write(mmu::table_desc(l3_pa));
+        l2.add(mmu::va_l2i(USER_CODE_VA))
+            .write(mmu::table_desc(l3_pa));
 
         // L3: two pages — code (user RX) and stack (user RW).
         l3.add(mmu::va_l3i(USER_CODE_VA))
@@ -295,12 +495,7 @@ fn build_user_space_with(prog: &[u8]) -> u64 {
         l3.add(mmu::va_l3i(USER_STACK_VA))
             .write(mmu::page_desc(stack_pa, mmu::Attr::UserRw));
     }
-
-    l0_pa
 }
-
-// ---------------------------------------------------------------------------
-// The EL0 drop
 // ---------------------------------------------------------------------------
 
 /// Drop to EL0 and run the normal user program. When the program calls
@@ -388,6 +583,98 @@ fn drop_to_el0_with(root_pa: u64) {
             options(nostack),
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// M6: scheduled multi-task drop
+// ---------------------------------------------------------------------------
+
+/// Drop to EL0 with the M6 scheduler active: spawn two tasks (A and B),
+/// each with its own independent user address space, and eret into task A.
+///
+/// Task A runs `USER_PROGRAM_BYTES` (prints "hello, EL0!", yields, prints
+/// "back from yield", exits). Task B runs `TASK_B_PROGRAM_BYTES` (prints
+/// "task B!", yields, prints "B done!", exits). When A yields, the
+/// scheduler switches to B; when B yields, it switches back to A. The
+/// output interleaves, proving two tasks in two address spaces share one
+/// CPU — the kernel is now an operating system in the plural sense.
+///
+/// The first eret into task A is the same `eret` M5 uses; the difference
+/// is that CURRENT_TID is now 1 (task A), and the scheduler has task B
+/// queued Ready. When A's `svc yield` traps, `save_and_switch` swaps
+/// the frames and TTBR0, and the return `eret` resumes B instead.
+///
+/// Like `drop_to_el0`, this does not return to the caller's monitor loop
+/// — control comes back via `on_el0_return` (when the last task exits)
+/// or `kill_task_on_fault` (if a task faults).
+pub fn drop_to_el0_scheduled() {
+    // ---- 1. Build two independent user address spaces ----
+    // SAFETY: single-core, MMU on, TTBR0 still the empty root. We build
+    // the tables via their high aliases; the walker is not looking at
+    // them yet. slot 0 = task A, slot 1 = task B.
+    let ttbr0_a = unsafe { build_task_user_space(0, &USER_PROGRAM_BYTES) };
+    let ttbr0_b = unsafe { build_task_user_space(1, &TASK_B_PROGRAM_BYTES) };
+
+    // ---- 2. Spawn both tasks into the scheduler ----
+    // Task A: TID 1, the "hello, EL0!" program.
+    // Task B: TID 2, the "task B!" program.
+    // SAFETY: single-core, interrupts masked (monitor context).
+    let tid_a = unsafe {
+        crate::sched::spawn(b"A", ttbr0_a, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+    };
+    let tid_b = unsafe {
+        crate::sched::spawn(b"B", ttbr0_b, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+    };
+
+    match (tid_a, tid_b) {
+        (Some(a), Some(b)) => {
+            println!(
+                "[kernel] M6 scheduler: spawned task A (TID {a}) and task B (TID {b})"
+            );
+        }
+        _ => {
+            println!("[kernel] scheduler: failed to spawn tasks (table full?)");
+            return;
+        }
+    }
+
+    // ---- 3. Drop into task A ----
+    // The scheduler has A at the head of the ready queue. We dequeue it,
+    // mark it Running, set CURRENT_TID, install its TTBR0, and eret.
+    //
+    // SAFETY: single-core, monitor context. The dequeue gives us TID 1
+    // (task A was enqueued first).
+    let first = unsafe { crate::sched::scheduler() }.dequeue();
+    let first = match first {
+        Some(tid) => tid,
+        None => {
+            println!("[kernel] scheduler: ready queue empty after spawn?!");
+            return;
+        }
+    };
+
+    // SAFETY: first is a valid TID from the scheduler.
+    let t = match unsafe { crate::sched::task(first) } {
+        Some(t) => t,
+        None => {
+            println!("[kernel] scheduler: task {first} vanished?!");
+            return;
+        }
+    };
+    t.state = crate::sched::TaskState::Running;
+    let root_pa = t.ttbr0_pa;
+    unsafe { crate::sched::set_current_tid(first) };
+
+    println!(
+        "[kernel] dropping to EL0 — task {:?} (TID {first}), user code at VA {USER_CODE_VA:#x}",
+        t.name_str()
+    );
+
+    // The eret into task A is identical to M5's drop_to_el0_with: set
+    // TTBR0, SPSR, ELR, SP, eret. The only difference is that
+    // CURRENT_TID is now set, so the yield handler will call the
+    // scheduler instead of no-op-ing.
+    drop_to_el0_with(root_pa);
 }
 
 /// Called when the user program exits and we return to EL1/monitor.
@@ -510,29 +797,63 @@ pub fn handle_svc_from_el0(frame: &mut super::vectors::TrapFrame) {
             frame.x[0] = bytes_written;
         }
         SYS_YIELD => {
-            // yield(): the user voluntarily gives up the CPU. In the
-            // single-task kernel (M5) there is no other task to switch
-            // to, so yield is a no-op that simply returns — but the
-            // *mechanism* is real: the svc trapped to EL1, we are here,
-            // and eret will resume EL0 at the instruction after the svc.
-            // This is the first syscall that returns to the user, and
-            // the user program verifies it by printing a second
-            // message after the yield returns.
-            println!("[kernel] syscall: yield() — returning to EL0");
-            // x0 = 0 means success. The stub restores registers and
-            // erets back to EL0 at ELR (which points past the svc).
-            frame.x[0] = 0;
+            // yield(): the user voluntarily gives up the CPU. In M5 this
+            // was a no-op (no other task to switch to). In M6, the
+            // scheduler's save_and_switch saves the current task's
+            // context, picks the next Ready task, and overwrites the
+            // stack frame with the next task's saved state — so when
+            // __vectors_restore runs, it erets to a *different* task.
+            //
+            // If there is no other task (single-task mode, or the last
+            // task running), save_and_switch returns false and yield
+            // falls back to the M5 no-op: eret straight back.
+            let cur = crate::sched::current_tid();
+            let switched = if cur != 0 {
+                // SAFETY: we are in an exception handler (DAIF set),
+                // single-core, frame is the on-stack TrapFrame.
+                unsafe { crate::sched::save_and_switch(frame) }
+            } else {
+                false
+            };
+            if switched {
+                // We are now running the *next* task. Its x0 will be
+                // whatever it was when it last yielded — don't touch
+                // it. The frame already holds the new task's state.
+                // (The println below would interleave with the task's
+                // output, so we stay silent on the switch path.)
+            } else {
+                println!("[kernel] syscall: yield() — no other task, returning to EL0");
+                frame.x[0] = 0;
+            }
         }
         SYS_EXIT => {
-            // The user wants to exit. Instead of modifying the frame and
-            // using a trampoline, we call on_el0_return() directly —
-            // we're already at EL1 with a valid kernel stack.
-            println!("[kernel] syscall: exit()");
-            // Restore TTBR0 to the empty root before returning to the
-            // monitor, so the user address space is gone.
-            mmu::condemn_low_half();
-            // on_el0_return never returns — it runs the monitor loop.
-            on_el0_return();
+            // The user wants to exit. Mark the current task as Exited
+            // (M6: the scheduler needs to know this slot is free), then
+            // return to the monitor — or, if there is another task
+            // Ready, switch to it instead of returning to the monitor.
+            let cur = crate::sched::current_tid();
+            println!("[kernel] syscall: exit() (TID {cur})");
+            if cur != 0 {
+                // SAFETY: single-core, exception context.
+                if let Some(t) = unsafe { crate::sched::task(cur) } {
+                    t.state = crate::sched::TaskState::Exited;
+                }
+            }
+            // Is there another task to run? If so, switch to it.
+            // SAFETY: same exception-context invariant.
+            let switched = if cur != 0 {
+                unsafe { crate::sched::save_and_switch(frame) }
+            } else {
+                false
+            };
+            if !switched {
+                // No other task — return to the monitor.
+                mmu::condemn_low_half();
+                on_el0_return();
+            }
+            // else: we switched to the next task; its frame is loaded
+            // and __vectors_restore will eret to it. The monitor is not
+            // re-entered — the CPU stays in EL0, running tasks.
         }
         _ => {
             println!("[kernel] unknown syscall {nr}");

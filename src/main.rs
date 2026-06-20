@@ -532,6 +532,7 @@ pub fn run_command(line: &[u8]) {
             println!("  el0fault        drop to EL0, run a program that faults — test fault recovery");
             println!("  --- M6: scheduler and IPC ---");
             println!("  tasks           dump the task table (scheduler diagnostics)");
+            println!("  spawn2          M6: spawn two tasks, drop to EL0 with the scheduler active");
         }
         "brk" => {
             arch::aarch64::vectors::demo_brk();
@@ -778,6 +779,15 @@ pub fn run_command(line: &[u8]) {
             // scheduler — but it proves the data structures are live and
             // gives the next beat something to fill.
             sched::dump_tasks();
+        }
+        "spawn2" => {
+            // M6: spawn two tasks (A and B), each with its own user
+            // address space, and drop to EL0 with the scheduler active.
+            // When task A yields, the scheduler switches to task B;
+            // when B yields, it switches back. The output interleaves,
+            // proving two independent tasks share one CPU. Like `el0`,
+            // this does not return to this monitor loop.
+            arch::aarch64::user::drop_to_el0_scheduled();
         }
         other => println!("unknown command {other:?} - try 'help'"),
     }
