@@ -866,13 +866,15 @@ fn handle_sync_from_el0(frame: &mut TrapFrame, kind: Kind, source: Source) {
 /// EOI still runs, so the GIC does not get stuck) — honest about a
 /// surprise, but not fatal. M6's scheduler will add the timer-tick
 /// preemption path here; M3 just proves the pipe works.
-fn handle_irq(frame: &TrapFrame, kind: Kind, source: Source) {
-    // The frame is unused today — the handler does not modify any
-    // register, and the interrupted code resumes exactly where it
-    // stopped. M6's context switch will read frame.sp and frame.elr;
-    // for now the argument exists so the stub's calling convention
-    // has a stable shape to grow into.
-    let _ = (frame, kind, source);
+fn handle_irq(frame: &mut TrapFrame, kind: Kind, source: Source) {
+    // Since M3, this handler acknowledges the GIC, dispatches on the
+    // interrupt ID, and returns. M6 adds the preemptive path: on a
+    // timer tick, if a user task is running and preempt is enabled,
+    // we call save_and_switch to preempt it in favor of the next
+    // Ready task. The frame is the interrupted EL0 context (for
+    // timer-from-EL0) or the kernel's own context (for timer-from-EL1);
+    // save_and_switch only switches if there is another task Ready.
+    let _ = (kind, source);
 
     let gic = crate::board::virt::gic();
     let id = gic.acknowledge();
@@ -899,6 +901,34 @@ fn handle_irq(frame: &TrapFrame, kind: Kind, source: Source) {
                 .load(core::sync::atomic::Ordering::Relaxed);
             if period > 0 {
                 crate::arch::aarch64::timer::rearm(period);
+            }
+
+            // M6: preemptive scheduling. If preempt is enabled and a
+            // user task is currently running, the timer tick is our
+            // chance to switch to the next Ready task. save_and_switch
+            // saves the interrupted context (the frame the vector stub
+            // built — which is the user's EL0 register state, since
+            // the timer interrupted EL0) into the current task's TCB,
+            // picks the next Ready task, and overwrites the frame with
+            // its saved state. When __vectors_restore runs, it erets
+            // to the *new* task instead of the one that was running.
+            //
+            // If there is no other task Ready (only one task running,
+            // or no tasks at all — the kernel was interrupted), the
+            // switch returns false and the interrupted code resumes
+            // exactly where it stopped. This is the same no-op path
+            // the cooperative yield takes when alone.
+            //
+            // SAFETY: We are in an IRQ exception handler. DAIF is set
+            // (the CPU masks async exceptions on exception entry), so
+            // the scheduler state is safe to touch — no re-entrant IRQ
+            // can fire. `frame` is the on-stack TrapFrame the stub
+            // built; save_and_switch copies bytes in and out of it,
+            // and the restore stub reads it only after we return.
+            if crate::sched::preempt_enabled() && crate::sched::current_tid() != 0 {
+                if unsafe { crate::sched::save_and_switch(frame) } {
+                    crate::sched::bump_preempts();
+                }
             }
         }
         other => {

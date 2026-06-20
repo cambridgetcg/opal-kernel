@@ -533,6 +533,9 @@ pub fn run_command(line: &[u8]) {
             println!("  --- M6: scheduler and IPC ---");
             println!("  tasks           dump the task table (scheduler diagnostics)");
             println!("  spawn2          M6: spawn two tasks, drop to EL0 with the scheduler active");
+            println!(
+                "  preempt         M6: preemptive scheduling — two spinning tasks, timer-driven switch"
+            );
         }
         "brk" => {
             arch::aarch64::vectors::demo_brk();
@@ -788,6 +791,18 @@ pub fn run_command(line: &[u8]) {
             // proving two independent tasks share one CPU. Like `el0`,
             // this does not return to this monitor loop.
             arch::aarch64::user::drop_to_el0_scheduled();
+        }
+        "preempt" => {
+            // M6: preemptive scheduling. Spawn two tasks that SPIN
+            // forever (no yield, no exit), arm the timer, enable
+            // preemption. The timer IRQ fires every second and calls
+            // save_and_switch from the IRQ handler, preempting
+            // whichever task is spinning. Both "A" and "B" appear on
+            // the console — proof that the timer, not user code, drove
+            // the context switch. Like `spawn2`, this does not return
+            // to this monitor loop (the tasks never exit; Ctrl-A X to
+            // quit QEMU).
+            arch::aarch64::user::drop_to_el0_preempt();
         }
         other => println!("unknown command {other:?} - try 'help'"),
     }

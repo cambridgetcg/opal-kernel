@@ -348,6 +348,73 @@ const TASK_B_PROGRAM_BYTES: [u8; 128] = {
     buf
 };
 
+/// The M6 preemptive scheduling demo: two programs that write one
+/// character and then **spin forever** — no `yield` syscall, no
+/// `exit`. The only way the other task can run is if the **timer
+/// preempts** the spinning task. This is the proof that preemption
+/// works: if both "A" and "B" appear on the console, the timer IRQ
+/// switched tasks without any cooperation from the user programs.
+///
+/// Task A writes "A\n" then branches to itself (`b .` — an infinite
+/// loop at a single instruction). Task B writes "B\n" then does the
+/// same. Neither calls `yield` or `exit`. The scheduler's
+/// `save_and_switch` is called from the timer IRQ handler
+/// (`handle_irq` in vectors.rs), preempting whichever task is
+/// spinning and eret-ing into the other.
+///
+/// ```asm
+/// [0x00] mov  x8, #1          ; SYS_WRITE
+/// [0x04] mov  x0, #1          ; fd = stdout
+/// [0x08] adr  x1, +0x14       ; buf -> 0x1C (the message)
+/// [0x0c] mov  x2, #2          ; len = 2
+/// [0x10] svc  #0              ; write "A\n"
+/// [0x14] b    0x14            ; spin forever — the timer must preempt
+/// [0x18] 0, 0, 0, 0           ; padding
+/// [0x1c] "A\n\0"              ; the message
+/// ```
+const TASK_PREEMPT_A_BYTES: [u8; 32] = {
+    let mut buf = [0u8; 32];
+    // [0x00] mov x8, #1 = MOVZ x8, #1 = 0xD2800028
+    buf[0] = 0x28; buf[1] = 0x00; buf[2] = 0x80; buf[3] = 0xD2;
+    // [0x04] mov x0, #1 = MOVZ x0, #1 = 0xD2800020
+    buf[4] = 0x20; buf[5] = 0x00; buf[6] = 0x80; buf[7] = 0xD2;
+    // [0x08] adr x1, +0x14 (target 0x1C, offset = 0x14 = 20)
+    //   immlo = 20 & 0x3 = 0, immhi = 20 >> 2 = 5
+    //   = 0x10000000 | (0 << 29) | (5 << 5) | 1 = 0x100000A1
+    buf[8] = 0xA1; buf[9] = 0x00; buf[10] = 0x00; buf[11] = 0x10;
+    // [0x0c] mov x2, #2 = MOVZ x2, #2 = 0xD2800042
+    buf[12] = 0x42; buf[13] = 0x00; buf[14] = 0x80; buf[15] = 0xD2;
+    // [0x10] svc #0 = 0xD4000001
+    buf[16] = 0x01; buf[17] = 0x00; buf[18] = 0x00; buf[19] = 0xD4;
+    // [0x14] b . (branch to self, offset 0) = 0x14000000
+    buf[20] = 0x00; buf[21] = 0x00; buf[22] = 0x00; buf[23] = 0x14;
+    // [0x18] padding (4 bytes, zeroed)
+    // [0x1c] "A\n\0"
+    buf[28] = b'A'; buf[29] = b'\n'; buf[30] = 0x00;
+    buf
+};
+
+/// Task B for the preemptive demo: writes "B\n" then spins. See
+/// [`TASK_PREEMPT_A_BYTES`] for the design.
+const TASK_PREEMPT_B_BYTES: [u8; 32] = {
+    let mut buf = [0u8; 32];
+    // [0x00] mov x8, #1 = MOVZ x8, #1 = 0xD2800028
+    buf[0] = 0x28; buf[1] = 0x00; buf[2] = 0x80; buf[3] = 0xD2;
+    // [0x04] mov x0, #1 = MOVZ x0, #1 = 0xD2800020
+    buf[4] = 0x20; buf[5] = 0x00; buf[6] = 0x80; buf[7] = 0xD2;
+    // [0x08] adr x1, +0x14 (target 0x1C) = 0x100000A1
+    buf[8] = 0xA1; buf[9] = 0x00; buf[10] = 0x00; buf[11] = 0x10;
+    // [0x0c] mov x2, #2 = 0xD2800042
+    buf[12] = 0x42; buf[13] = 0x00; buf[14] = 0x80; buf[15] = 0xD2;
+    // [0x10] svc #0 = 0xD4000001
+    buf[16] = 0x01; buf[17] = 0x00; buf[18] = 0x00; buf[19] = 0xD4;
+    // [0x14] b . = 0x14000000
+    buf[20] = 0x00; buf[21] = 0x00; buf[22] = 0x00; buf[23] = 0x14;
+    // [0x1c] "B\n\0"
+    buf[28] = b'B'; buf[29] = b'\n'; buf[30] = 0x00;
+    buf
+};
+
 // ---------------------------------------------------------------------------
 // Build the user address space
 // ---------------------------------------------------------------------------
@@ -523,15 +590,24 @@ fn drop_to_el0_with(root_pa: u64) {
     // SPSR_EL1: the PSTATE for EL0.
     //   M[3:0] = 0b0000 = EL0
     //   bit [4] = 0 = AArch64 (NOT AArch32: bit 4 set means AArch32!)
-    //   DAIF = 0b1111 at bits [9:6] (all masked — EL0 cannot take async
-    //   exceptions directly; they trap to EL1 first)
+    //   DAIF = 0b0000 at bits [9:6] (all unmasked — EL0 runs with
+    //   interrupts enabled so the timer can preempt. The kernel's
+    //   SVC/fault handlers run at EL1 with DAIF set by hardware on
+    //   exception entry, so unmasking here is safe: the moment an
+    //   IRQ fires, the CPU drops to EL1 and DAIF is auto-set.)
     //   All other bits 0.
     //
     // The DAIF field lives at bits [9:6], NOT [7:4]: D=bit9, A=bit8,
-    // I=bit7, F=bit6. So 0b1111<<6 = 0x3C0. A common mistake is to put
+    // I=bit7, F=bit6. So 0b0000<<6 = 0x000. A common mistake is to put
     // the mask at [7:4] (0xF0) — that sets bit 4, which flips the target
     // into AArch32 mode and the exception comes back as "from AArch32".
-    let spsr: u64 = 0x3C0; // DAIF=1111 at [9:6], M=0000 at [3:0], bit[4]=0
+    //
+    // M6 changed this from 0x3C0 (DAIF=all masked) to 0x000 (DAIF=all
+    // unmasked): preemptive scheduling requires the timer IRQ to fire
+    // while EL0 is running, and DAIF.I=1 at EL0 masks it. The cooperative
+    // scheduler doesn't care (it isn't armed), but the preemptive one
+    // is dead on arrival without this.
+    let spsr: u64 = 0x000; // DAIF=0000 at [9:6], M=0000 at [3:0], bit[4]=0
 
     println!(
         "[kernel] dropping to EL0 — user code at VA {USER_CODE_VA:#x}, SP {USER_STACK_TOP:#x}"
@@ -677,6 +753,107 @@ pub fn drop_to_el0_scheduled() {
     drop_to_el0_with(root_pa);
 }
 
+/// Drop to EL0 with the M6 preemptive scheduler active: spawn two
+/// tasks that **spin forever** (no yield, no exit), arm the timer,
+/// and enable preemption. The timer IRQ fires every second and calls
+/// `save_and_switch` from the IRQ handler, preempting whichever task
+/// is spinning and eret-ing into the other. Both tasks' characters
+/// appear on the console — proof that the timer, not the user code,
+/// drove the context switch.
+///
+/// This is the M6 preemptive milestone: the kernel takes the CPU away
+/// from a running task without the task's cooperation. The cooperative
+/// `spawn2` proved the context switch mechanism; this proves it works
+/// when the *timer* pulls the trigger.
+///
+/// The tasks never exit (they spin), so the only way back to the
+/// monitor is Ctrl-A X (quit QEMU). In a real OS, a kill syscall or
+/// a timeout would tear down a spinning task — M6's IPC or a future
+/// beat will add that.
+pub fn drop_to_el0_preempt() {
+    // ---- 1. Build two independent user address spaces ----
+    // SAFETY: single-core, MMU on, TTBR0 still the empty root.
+    let ttbr0_a = unsafe { build_task_user_space(0, &TASK_PREEMPT_A_BYTES) };
+    let ttbr0_b = unsafe { build_task_user_space(1, &TASK_PREEMPT_B_BYTES) };
+
+    // ---- 2. Spawn both tasks ----
+    // SAFETY: single-core, interrupts masked (monitor context).
+    let tid_a = unsafe {
+        crate::sched::spawn(b"preA", ttbr0_a, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+    };
+    let tid_b = unsafe {
+        crate::sched::spawn(b"preB", ttbr0_b, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+    };
+
+    match (tid_a, tid_b) {
+        (Some(a), Some(b)) => {
+            println!(
+                "[kernel] M6 preempt: spawned task A (TID {a}) and task B (TID {b})"
+            );
+        }
+        _ => {
+            println!("[kernel] preempt: failed to spawn tasks (table full?)");
+            return;
+        }
+    }
+
+    // ---- 3. Arm the timer and enable preemption ----
+    // The timer fires once per second; each tick, the IRQ handler
+    // calls save_and_switch if preempt is enabled and a task is
+    // running. We arm *before* dropping to EL0 so the first tick
+    // can preempt task A as soon as it starts spinning.
+    let freq = crate::arch::aarch64::timer::frequency();
+    let period = freq; // 1 second
+    crate::arch::aarch64::timer::TICK_PERIOD
+        .store(period, core::sync::atomic::Ordering::Relaxed);
+    crate::arch::aarch64::timer::arm(period);
+    crate::sched::preempt_on();
+    println!(
+        "[kernel] preempt: timer armed (1 tick/sec), preemption enabled. Tasks will spin."
+    );
+
+    // ---- 4. Drop into task A ----
+    // Same path as spawn2: dequeue the first task, mark it Running,
+    // set CURRENT_TID, install its TTBR0, eret.
+    let first = unsafe { crate::sched::scheduler() }.dequeue();
+    let first = match first {
+        Some(tid) => tid,
+        None => {
+            println!("[kernel] preempt: ready queue empty after spawn?!");
+            return;
+        }
+    };
+
+    // SAFETY: first is a valid TID from the scheduler.
+    let t = match unsafe { crate::sched::task(first) } {
+        Some(t) => t,
+        None => {
+            println!("[kernel] preempt: task {first} vanished?!");
+            return;
+        }
+    };
+    t.state = crate::sched::TaskState::Running;
+    let root_pa = t.ttbr0_pa;
+    unsafe { crate::sched::set_current_tid(first) };
+
+    // Unmask IRQ at the CPU so the timer can fire. This must happen
+    // before the eret — the timer is armed, preemption is on, but
+    // the CPU won't take the IRQ until DAIF.I is clear.
+    unsafe {
+        core::arch::asm!(
+            "msr DAIFClr, #2",
+            options(nostack, preserves_flags),
+        );
+    }
+
+    println!(
+        "[kernel] dropping to EL0 — task {:?} (TID {first}), preemptive scheduling live",
+        t.name_str()
+    );
+
+    drop_to_el0_with(root_pa);
+}
+
 /// Called when the user program exits and we return to EL1/monitor.
 /// The `__el0_return` trampoline in vectors.rs jumps here.
 #[unsafe(no_mangle)]
@@ -734,6 +911,7 @@ extern "C" fn on_el0_return() -> ! {
 pub fn kill_task_on_fault() -> ! {
     // Tear down the user address space: restore TTBR0 to the empty root
     // so no stale user translations linger. Same path as a clean exit.
+    crate::sched::preempt_off();
     mmu::condemn_low_half();
     println!("[kernel] user task killed on fault — returning to monitor.");
     // Re-enter the monitor via the same return path as a clean exit.
@@ -848,6 +1026,11 @@ pub fn handle_svc_from_el0(frame: &mut super::vectors::TrapFrame) {
             };
             if !switched {
                 // No other task — return to the monitor.
+                // Disable preemption: the timer may still be armed,
+                // but with no tasks running the IRQ handler would
+                // otherwise call save_and_switch with CURRENT_TID=0
+                // (the no-op path, but we make it explicit).
+                crate::sched::preempt_off();
                 mmu::condemn_low_half();
                 on_el0_return();
             }

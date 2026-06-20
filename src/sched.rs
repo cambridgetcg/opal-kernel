@@ -304,9 +304,10 @@ pub unsafe fn spawn(name: &[u8], ttbr0_pa: u64, entry: u64, sp: u64) -> Option<u
     t.saved = TrapFrame::empty();
     t.saved.elr = entry; // eret resumes here in EL0
     t.saved.sp = sp; // SP_EL0
-    // SPSR for EL0: M=0b0000, bit[4]=0 (AArch64), DAIF=0b1111 at [9:6].
+    // SPSR for EL0: M=0b0000, bit[4]=0 (AArch64), DAIF=0b0000 at [9:6]
+    // (all unmasked — interrupts enabled so the timer can preempt).
     // Same value as user.rs's drop_to_el0_with.
-    t.saved.spsr = 0x3C0;
+    t.saved.spsr = 0x000;
     t.ttbr0_pa = ttbr0_pa;
     t.state = TaskState::Ready;
     t.set_name(name);
@@ -424,9 +425,10 @@ pub fn dump_tasks() {
     }
     let s = unsafe { &*(&raw const SCHEDULER) };
     println!(
-        "  scheduler: {} ready, current=TID {}",
+        "  scheduler: {} ready, current=TID {}, preempts={}",
         s.count,
-        current_tid()
+        current_tid(),
+        preempts()
     );
 }
 
@@ -460,3 +462,57 @@ const _: () = {
     // A Task must be a reasonable size (no accidental bloat).
     assert!(core::mem::size_of::<Task>() < 400);
 };
+
+// ---------------------------------------------------------------------------
+// M6 preemptive scheduling — the timer drives the switch
+// ---------------------------------------------------------------------------
+
+/// Is preemptive scheduling enabled? When true, the timer IRQ handler
+/// calls [`save_and_switch`] on each tick when a user task is running,
+/// preempting it in favor of the next Ready task. Default off: the
+/// cooperative `yield` syscall is the only context switch until this is
+/// turned on (by the monitor's `preempt` command).
+///
+/// The flag is the boundary between M6's two halves: cooperative
+/// scheduling (yield-driven, already working) and preemptive scheduling
+/// (timer-driven, this piece). The wiring is the same `save_and_switch`
+/// either way — the only question is *who pulls the trigger*: the user
+/// code (svc) or the timer (IRQ).
+static PREEMPT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// How many times the timer has preempted a running task. A diagnostic
+/// counter, separate from the cooperative yield count — the two between
+/// them tell you whether switches were voluntary or involuntary. Printed
+/// by `dump_tasks` and the `preempt` monitor command.
+static PREEMPTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Is preemptive scheduling currently enabled?
+pub fn preempt_enabled() -> bool {
+    PREEMPT.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Enable preemptive scheduling. After this, the timer IRQ will call
+/// [`save_and_switch`] on each tick when a user task is running. The
+/// caller is responsible for arming the timer and unmasking IRQ.
+pub fn preempt_on() {
+    PREEMPT.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Disable preemptive scheduling. Called when the last task exits and
+/// we return to the monitor — the timer may still be armed, but the
+/// IRQ handler will no longer switch tasks (it checks this flag before
+/// calling [`save_and_switch`]).
+pub fn preempt_off() {
+    PREEMPT.store(false, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many preemptions have occurred (timer-driven context switches).
+pub fn preempts() -> u64 {
+    PREEMPTS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Increment the preemption counter. Called from the IRQ handler after
+/// a successful timer-driven context switch.
+pub fn bump_preempts() {
+    PREEMPTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
