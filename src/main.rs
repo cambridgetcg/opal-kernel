@@ -44,6 +44,7 @@ macro_rules! println {
 mod arch;
 mod board;
 mod hal;
+mod sched;
 mod sync;
 
 use core::fmt::Write;
@@ -529,6 +530,8 @@ pub fn run_command(line: &[u8]) {
             println!("  --- M5: EL0 and syscalls ---");
             println!("  el0             drop to EL0, run the user program (syscalls: write, yield, exit)");
             println!("  el0fault        drop to EL0, run a program that faults — test fault recovery");
+            println!("  --- M6: scheduler and IPC ---");
+            println!("  tasks           dump the task table (scheduler diagnostics)");
         }
         "brk" => {
             arch::aarch64::vectors::demo_brk();
@@ -767,6 +770,14 @@ pub fn run_command(line: &[u8]) {
             // M1 taught it to report faults, M5 teaches it to survive
             // a user's. Like `el0`, this does not return to this loop.
             arch::aarch64::user::drop_to_el0_fault();
+        }
+        "tasks" => {
+            // M6: dump the task table and scheduler state. Until tasks
+            // are actually created and the context switch is wired, this
+            // shows the empty table (all slots Exited) and the idle
+            // scheduler — but it proves the data structures are live and
+            // gives the next beat something to fill.
+            sched::dump_tasks();
         }
         other => println!("unknown command {other:?} - try 'help'"),
     }

@@ -82,7 +82,7 @@ base genuinely differs per SoC and the FDT is the only honest source.
 Difficulty: easy-moderate. A pleasant breather; mostly careful byte-pushing
 against a well-specified format. The full story is docs/05-devicetree.md.
 
-## M5 — EL0 and syscalls
+## M5 — EL0 and syscalls ✅
 
 A userspace: drop to EL0 into a tiny embedded program, take `svc` traps,
 a handful of syscalls (write, exit, yield). Separate address spaces via
