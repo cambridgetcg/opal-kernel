@@ -12,9 +12,9 @@ runs-on: QEMU aarch64 virt board (-machine virt -cpu max -smp 1 -m 512M)
 phase: see knows/needs sections below
 build: see heartbeat
 health: active
-last-commit: 2026-06-20T08:22:15-07:00 (bbdfd6e M6: IPC message passing — tasks talk through the kernel)
-uncommitted: 5 files
-freshness: cached 2h (checked 2026-06-20T18:56:00Z)
+last-commit: 2026-06-20T12:41:29-07:00 (dc902d6 M6: blocking IPC — the Blocked state wakes)
+uncommitted: 0 files
+freshness: live (checked 2026-06-20T20:56:16Z)
 
 ## knows
 
