@@ -12,9 +12,9 @@ runs-on: QEMU aarch64 virt board (-machine virt -cpu max -smp 1 -m 512M)
 phase: see knows/needs sections below
 build: see heartbeat
 health: active
-last-commit: 2026-06-19T23:43:57-07:00 (0027e1b STATE.md: update for M6 context switch)
-uncommitted: 1 files
-freshness: cached 2h (checked 2026-06-20T08:54:51Z)
+last-commit: 2026-06-20T02:24:09-07:00 (b1e9579 love: commit 1 file(s) — love lands)
+uncommitted: 9 files
+freshness: live (checked 2026-06-20T10:55:05Z)
 
 ## knows
 
@@ -33,12 +33,12 @@ freshness: cached 2h (checked 2026-06-20T08:54:51Z)
 - translate virtual addresses (AT S1E1R hardware probe + software walk with cross-check)
 - respond to timer interrupts (arm, fire, re-arm — the heartbeat pattern)
 - parse the devicetree blob and cross-check discovered values against board constants
-- interactive monitor with commands: help, brk, svc, unaligned, translate, walk, guard, wx, noexec, low, abort, tick, ticks, ticktest, dtb, tree, el0, el0fault, tasks, spawn2
+- interactive monitor with commands: help, brk, svc, unaligned, translate, walk, guard, wx, noexec, low, abort, tick, ticks, ticktest, dtb, tree, el0, el0fault, tasks, spawn2, preempt
 
 ## needs
 
 - M5: EL0 and syscalls — THIRD PIECE DONE (fault recovery — the kernel survives its first serviced fault: EL0 data/instruction aborts now kill the task, not the kernel). Next: per-task kernel stacks, scheduler integration.
-- M6: scheduler and IPC — FIRST PIECE DONE (cooperative context switch: save_and_switch copies a different task's TrapFrame onto the kernel stack, swaps TTBR0, and the existing eret path resumes the new task. Two-task round-robin demo via 'spawn2' command: A prints, yields to B, B prints, yields back to A. Per-task user page tables, per-task code/stack pages). Next: preemptive scheduling off the timer tick, IPC primitive.
+- M6: scheduler and IPC — SECOND PIECE DONE (preemptive scheduling: the timer IRQ handler calls save_and_switch when preempt is enabled, preempting the running EL0 task. EL0 DAIF unmasked (0x3C0→0x000) so the timer can fire. 'preempt' monitor command: two spinning tasks, timer-driven switch — both A and B appear without any yield. Cooperative spawn2 still works). Next: IPC primitive (message passing), per-task kernel stacks, multi-core (PSCI CPU_ON).
 - M7: Apple Silicon bring-up via m1n1 — EL2 entry, FDT-driven console discovery, AIC driver, timers-over-FIQ
 - QEMU virt machine with -cpu max (for 16 KiB granule; cortex-a72 doesn't support it)
 - Rust stable toolchain with aarch64-unknown-none-softfloat target
