@@ -527,7 +527,8 @@ pub fn run_command(line: &[u8]) {
             );
             println!("  tree            dump the full devicetree tree (nodes, properties, values)");
             println!("  --- M5: EL0 and syscalls ---");
-            println!("  el0             drop to EL0, run the user program (syscalls: write, exit)");
+            println!("  el0             drop to EL0, run the user program (syscalls: write, yield, exit)");
+            println!("  el0fault        drop to EL0, run a program that faults — test fault recovery");
         }
         "brk" => {
             arch::aarch64::vectors::demo_brk();
@@ -756,6 +757,16 @@ pub fn run_command(line: &[u8]) {
             // normally; drop_to_el0() erets and the next code that
             // runs is the user program at EL0.
             arch::aarch64::user::drop_to_el0();
+        }
+        "el0fault" => {
+            // M5: drop to EL0 and run a program that *deliberately*
+            // faults (stores to an unmapped address). The data abort
+            // traps to EL1, handle_sync_from_el0 reports it and calls
+            // kill_task_on_fault — the kernel survives and returns to
+            // the monitor. This is the kernel's first fault *recovery*:
+            // M1 taught it to report faults, M5 teaches it to survive
+            // a user's. Like `el0`, this does not return to this loop.
+            arch::aarch64::user::drop_to_el0_fault();
         }
         other => println!("unknown command {other:?} - try 'help'"),
     }

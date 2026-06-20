@@ -542,8 +542,10 @@ extern "C" fn exception_dispatch(frame: &mut TrapFrame, kind: u64, source: u64) 
 const EC_UNKNOWN: u64 = 0x00; // undefined/disabled instruction & friends
 const EC_SVC64: u64 = 0x15; // svc from AArch64
 const EC_IABT_SAME_EL: u64 = 0x21; // instruction abort, same EL
+const EC_IABT_LOWER_EL: u64 = 0x20; // instruction abort, lower EL (EL0)
 const EC_PC_ALIGN: u64 = 0x22; // PC alignment fault
 const EC_DABT_SAME_EL: u64 = 0x25; // data abort, same EL
+const EC_DABT_LOWER_EL: u64 = 0x24; // data abort, lower EL (EL0)
 const EC_SP_ALIGN: u64 = 0x26; // SP alignment fault
 const EC_BRK64: u64 = 0x3c; // brk from AArch64
 
@@ -770,9 +772,12 @@ fn print_walk_level(fsc: u64) {
 ///   which reads x8 for the syscall number, handles it, and either
 ///   returns (eret back to EL0) or sets up a return to EL1 (for exit).
 /// - **Anything else**: a user fault (data abort, instruction abort,
-///   alignment, etc.). Report it and park — M6 will kill the task
-///   instead of parking the kernel. This is the honest maximum for a
-///   single-task kernel.
+///   alignment, etc.). Report it, then call [`user::kill_task_on_fault`]
+///   — the kernel condemns the user address space and returns to the
+///   monitor. This is the first fault the kernel *recovers from* rather
+///   than merely reporting: M1 taught it to say what happened; M5 teaches
+///   it to survive it. M6 will replace the kill with a real scheduler-aware
+///   task teardown.
 fn handle_sync_from_el0(frame: &mut TrapFrame, kind: Kind, source: Source) {
     let ec = (frame.esr >> 26) & 0x3f;
     match ec {
@@ -787,8 +792,13 @@ fn handle_sync_from_el0(frame: &mut TrapFrame, kind: Kind, source: Source) {
             // the trampoline at EL1.
             let _ = (kind, source, imm);
         }
-        EC_DABT_SAME_EL => {
+        EC_DABT_LOWER_EL => {
             // A data abort from EL0 — the user touched a bad address.
+            // EC 0x24 is "Data Abort from a lower EL": the ISS/DFSC
+            // encoding is the same as same-EL (0x25), but the syndrome
+            // also carries the access size and sign in bits [15:11] for
+            // lower-EL aborts — we ignore those; DFSC (bits [5:0]) is
+            // all we need to classify the fault.
             let dfsc = frame.esr & 0x3f;
             let wnr = if frame.esr & (1 << 6) != 0 {
                 "write to"
@@ -800,29 +810,29 @@ fn handle_sync_from_el0(frame: &mut TrapFrame, kind: Kind, source: Source) {
                 kind,
                 source,
                 format_args!(
-                    "EL0 data abort — a userspace {wnr} {:#x} failed (DFSC {dfsc:#04x})",
+                    "EL0 data abort — a userspace {wnr} {:#x} failed (EC {EC_DABT_LOWER_EL:#04x}, DFSC {dfsc:#04x})",
                     frame.far
                 ),
             );
             println!("  status  : {}", fault_status(dfsc));
-            println!("  verdict : FATAL — the kernel cannot service user faults yet (M6).");
-            println!("            Parking. (In a real OS this would kill the task, not the kernel.)");
-            super::park();
+            println!("  verdict : user task killed — the kernel survives its first serviced fault.");
+            println!("            (In a real OS this would kill the task, not the kernel. Now it does.)");
+            super::user::kill_task_on_fault();
         }
-        EC_IABT_SAME_EL => {
+        EC_IABT_LOWER_EL => {
             let ifsc = frame.esr & 0x3f;
             report(
                 frame,
                 kind,
                 source,
                 format_args!(
-                    "EL0 instruction abort — fetching code from {:#x} failed (IFSC {ifsc:#04x})",
+                    "EL0 instruction abort — fetching code from {:#x} failed (EC {EC_IABT_LOWER_EL:#04x}, IFSC {ifsc:#04x})",
                     frame.far
                 ),
             );
             println!("  status  : {}", fault_status(ifsc));
-            println!("  verdict : FATAL — user tried to execute an unmapped/forbidden address.");
-            super::park();
+            println!("  verdict : user task killed — attempted to execute an unmapped/forbidden address.");
+            super::user::kill_task_on_fault();
         }
         _ => {
             report(
@@ -834,8 +844,8 @@ fn handle_sync_from_el0(frame: &mut TrapFrame, kind: Kind, source: Source) {
                     frame.esr & 0x01ff_ffff
                 ),
             );
-            println!("  verdict : FATAL — unhandled EL0 exception.");
-            super::park();
+            println!("  verdict : user task killed — unhandled EL0 exception.");
+            super::user::kill_task_on_fault();
         }
     }
 }

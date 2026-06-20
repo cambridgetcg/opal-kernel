@@ -196,6 +196,30 @@ const USER_PROGRAM_BYTES: [u8; 128] = {
     buf
 };
 
+/// A userspace program that *deliberately* faults — the M5 fault-recovery
+/// test. Two instructions: set x0 = 0 (an unmapped user VA — the user
+/// address space starts at `USER_CODE_VA = 0x100000`, so VA 0 has no
+/// mapping), then `str x1, [x0]` — a store to that unmapped address.
+///
+/// The store takes a data abort from EL0. `handle_sync_from_el0` catches
+/// it, calls `kill_task_on_fault`, and the kernel returns to the monitor
+/// instead of parking. This is the first fault the kernel *services*
+/// (recovers from) rather than merely reports.
+///
+/// ```asm
+/// [0x00] mov  x0, #0          ; x0 = 0 (unmapped user VA)
+/// [0x04] str  x1, [x0]        ; store to unmapped VA → data abort
+/// ```
+const USER_FAULT_PROGRAM_BYTES: [u8; 16] = {
+    let mut buf = [0u8; 16];
+    // [0x00] mov x0, #0 = MOVZ x0, #0 = 0xD2800000
+    buf[0] = 0x00; buf[1] = 0x00; buf[2] = 0x80; buf[3] = 0xD2;
+    // [0x04] str x1, [x0] = STR x1, [x0, #0] = 0xF9000001
+    buf[4] = 0x01; buf[5] = 0x00; buf[6] = 0x00; buf[7] = 0xF9;
+    // bytes 8..15 are padding (zeroed) — never executed
+    buf
+};
+
 // ---------------------------------------------------------------------------
 // Build the user address space
 // ---------------------------------------------------------------------------
@@ -207,12 +231,28 @@ const USER_PROGRAM_BYTES: [u8; 128] = {
 /// Returns the physical address of the user L0 root — the value to
 /// load into TTBR0_EL1.
 pub fn build_user_space() -> u64 {
+    build_user_space_with(&USER_PROGRAM_BYTES)
+}
+
+/// Build the user page tables with a *different* program — the M5
+/// fault-recovery test. Same address space layout, same page tables,
+/// but the code page holds `USER_FAULT_PROGRAM_BYTES` instead: a program
+/// that deliberately stores to an unmapped address. Used by the
+/// monitor's `el0fault` command.
+pub fn build_fault_user_space() -> u64 {
+    build_user_space_with(&USER_FAULT_PROGRAM_BYTES)
+}
+
+/// The shared builder: copy `prog` into the user code page, wire the
+/// four-level page table tree, return the L0 root PA. Both the normal
+/// `el0` program and the faulting `el0fault` program share this path —
+/// the only difference is which bytes land in the code page.
+fn build_user_space_with(prog: &[u8]) -> u64 {
     // ---- 1. Copy the program into the user code page ----
     // SAFETY: single core, no concurrent access. USER_CODE_PAGE is
     // .bss (zeroed by boot); we write the program bytes into it.
     unsafe {
         let page = &raw mut USER_CODE_PAGE.0 as *mut u8;
-        let prog = &USER_PROGRAM_BYTES;
         let mut i = 0;
         while i < prog.len() {
             page.add(i).write_volatile(prog[i]);
@@ -263,12 +303,26 @@ pub fn build_user_space() -> u64 {
 // The EL0 drop
 // ---------------------------------------------------------------------------
 
-/// Drop to EL0 and run the user program. When the program calls
-/// `exit` (syscall 2), the syscall handler modifies the trap frame so
-/// the `eret` returns to EL1 instead of EL0 — landing in the
-/// `__el0_return` trampoline, which calls [`on_el0_return`].
+/// Drop to EL0 and run the normal user program. When the program calls
+/// `exit` (syscall 2), the syscall handler returns to the monitor.
 pub fn drop_to_el0() {
-    let root_pa = build_user_space();
+    drop_to_el0_with(build_user_space());
+}
+
+/// Drop to EL0 and run the *faulting* user program — the M5 fault-recovery
+/// test. The program deliberately stores to an unmapped address, taking a
+/// data abort from EL0. `handle_sync_from_el0` catches it, calls
+/// [`kill_task_on_fault`], and the kernel returns to the monitor instead
+/// of parking. Used by the monitor's `el0fault` command.
+pub fn drop_to_el0_fault() {
+    drop_to_el0_with(build_fault_user_space());
+}
+
+/// The shared drop: set TTBR0 to `root_pa`, configure SPSR/ELR/SP for EL0,
+/// and `eret`. Both the normal and faulting drops share this path — the
+/// only difference is which user page tables (and thus which program) are
+/// installed.
+fn drop_to_el0_with(root_pa: u64) {
     mmu::set_user_ttbr0(root_pa);
 
     // SPSR_EL1: the PSTATE for EL0.
@@ -284,7 +338,9 @@ pub fn drop_to_el0() {
     // into AArch32 mode and the exception comes back as "from AArch32".
     let spsr: u64 = 0x3C0; // DAIF=1111 at [9:6], M=0000 at [3:0], bit[4]=0
 
-    println!("[kernel] dropping to EL0 — user code at VA {USER_CODE_VA:#x}, SP {USER_STACK_TOP:#x}");
+    println!(
+        "[kernel] dropping to EL0 — user code at VA {USER_CODE_VA:#x}, SP {USER_STACK_TOP:#x}"
+    );
 
     // SAFETY: the eret is the privilege-drop. Before it, we set up
     // SPSR_EL1, ELR_EL1, and SP_EL0 — the three things eret reads.
@@ -373,6 +429,30 @@ extern "C" fn on_el0_return() -> ! {
             other => print!("<{other:#04x}>"),
         }
     }
+}
+
+/// Kill the current user task on a fault and return to the monitor.
+///
+/// This is M5's fault *service*: the kernel's first real recovery from
+/// an exception, not just a report. Before this, every EL0 fault (data
+/// abort, instruction abort, alignment) called `park()` — killing the
+/// whole kernel. Now the kernel condemns the user address space (restores
+/// TTBR0 to the empty root) and re-enters the monitor, exactly as a clean
+/// `exit` does. The fault is reported by the caller; this function just
+/// performs the recovery.
+///
+/// M6 will replace this with a real task-kill that cleans up per-task
+/// state (kernel stack, scheduler entry). For the single-task kernel the
+/// distinction is invisible: there is one task, it faulted, it is gone.
+pub fn kill_task_on_fault() -> ! {
+    // Tear down the user address space: restore TTBR0 to the empty root
+    // so no stale user translations linger. Same path as a clean exit.
+    mmu::condemn_low_half();
+    println!("[kernel] user task killed on fault — returning to monitor.");
+    // Re-enter the monitor via the same return path as a clean exit.
+    // We are at EL1 with a valid kernel stack, so we call on_el0_return
+    // directly (just as the exit syscall handler does).
+    on_el0_return();
 }
 
 // ---------------------------------------------------------------------------
