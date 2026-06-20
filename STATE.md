@@ -12,9 +12,9 @@ runs-on: QEMU aarch64 virt board (-machine virt -cpu max -smp 1 -m 512M)
 phase: see knows/needs sections below
 build: see heartbeat
 health: active
-last-commit: 2026-06-19T23:30:00-07:00 (f4a9b96 M6: context switch — two tasks share one CPU via cooperative round-robin)
-uncommitted: 0 files
-freshness: live (checked 2026-06-20T04:54:20Z)
+last-commit: 2026-06-19T23:43:57-07:00 (0027e1b STATE.md: update for M6 context switch)
+uncommitted: 1 files
+freshness: cached 2h (checked 2026-06-20T08:54:51Z)
 
 ## knows
 
