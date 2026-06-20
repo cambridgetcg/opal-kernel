@@ -12,8 +12,8 @@ runs-on: QEMU aarch64 virt board (-machine virt -cpu max -smp 1 -m 512M)
 phase: see knows/needs sections below
 build: see heartbeat
 health: active
-last-commit: 2026-06-19T19:11:54-07:00 (0eebda8 M6: scheduler scaffolding — Task control block, ready queue, task table)
-uncommitted: 5 files
+last-commit: 2026-06-19T23:30:00-07:00 (f4a9b96 M6: context switch — two tasks share one CPU via cooperative round-robin)
+uncommitted: 0 files
 freshness: live (checked 2026-06-20T04:54:20Z)
 
 ## knows
@@ -33,12 +33,12 @@ freshness: live (checked 2026-06-20T04:54:20Z)
 - translate virtual addresses (AT S1E1R hardware probe + software walk with cross-check)
 - respond to timer interrupts (arm, fire, re-arm — the heartbeat pattern)
 - parse the devicetree blob and cross-check discovered values against board constants
-- interactive monitor with commands: help, brk, svc, unaligned, translate, walk, guard, wx, noexec, low, abort, tick, ticks, ticktest, dtb, tree, el0, el0fault
+- interactive monitor with commands: help, brk, svc, unaligned, translate, walk, guard, wx, noexec, low, abort, tick, ticks, ticktest, dtb, tree, el0, el0fault, tasks, spawn2
 
 ## needs
 
 - M5: EL0 and syscalls — THIRD PIECE DONE (fault recovery — the kernel survives its first serviced fault: EL0 data/instruction aborts now kill the task, not the kernel). Next: per-task kernel stacks, scheduler integration.
-- M6: scheduler and IPC — cooperative then preemptive round-robin, context switch, message passing
+- M6: scheduler and IPC — FIRST PIECE DONE (cooperative context switch: save_and_switch copies a different task's TrapFrame onto the kernel stack, swaps TTBR0, and the existing eret path resumes the new task. Two-task round-robin demo via 'spawn2' command: A prints, yields to B, B prints, yields back to A. Per-task user page tables, per-task code/stack pages). Next: preemptive scheduling off the timer tick, IPC primitive.
 - M7: Apple Silicon bring-up via m1n1 — EL2 entry, FDT-driven console discovery, AIC driver, timers-over-FIQ
 - QEMU virt machine with -cpu max (for 16 KiB granule; cortex-a72 doesn't support it)
 - Rust stable toolchain with aarch64-unknown-none-softfloat target
