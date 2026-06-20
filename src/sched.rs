@@ -81,9 +81,15 @@ pub enum TaskState {
 /// switch loads this frame and `eret`s — the same path M5's single-task
 /// yield takes, just from a different frame.
 ///
-/// `ttbr0_pa` is the physical address of the task's user L0 page-table
+/// `ttbr0_pa` is the physical address of the task's user page-table
 /// root. Context switch writes this to TTBR0_EL1, giving each task its
 /// own address space. The kernel's TTBR1 is shared and untouched.
+///
+/// `mailbox` is the task's IPC inbox — a fixed-size kernel buffer where
+/// messages sent to this task land. The `send` syscall copies into it;
+/// the `recv` syscall copies out of it. No shared memory: tasks talk
+/// through the kernel, not past it. `mailbox_len` is 0 when the mailbox
+/// is empty; `mailbox_from` is the sender's TID (0 = never received).
 #[repr(C)]
 pub struct Task {
     /// The saved CPU state — what to restore on resume. This is the
@@ -100,6 +106,22 @@ pub struct Task {
     /// printed in scheduler diagnostics. 8 bytes so it fits in two
     /// stores and never needs an allocator.
     pub name: [u8; 8],
+    /// IPC mailbox: up to 32 bytes of message data. Zeroed by boot
+    /// and by Task::empty(). The `send` syscall writes into it; the
+    /// `recv` syscall reads from it. One message at a time — if the
+    /// mailbox is full, send returns -EAGAIN (the sender can yield
+    /// and retry). This is the simplest possible message passing:
+    /// no channels, no queues, just one slot per task. Enough to
+    /// prove the idea; a real OS would add buffering, blocking, and
+    /// typed channels.
+    pub mailbox: [u8; 32],
+    /// How many bytes are in the mailbox. 0 = empty, >0 = message
+    /// waiting. Set by `send`, cleared by `recv`.
+    pub mailbox_len: usize,
+    /// The TID of the task that sent the current mailbox message.
+    /// 0 = no sender (mailbox empty or never received). Returned to
+    /// the receiver so it knows who said hello.
+    pub mailbox_from: usize,
 }
 
 impl Task {
@@ -111,6 +133,9 @@ impl Task {
             ttbr0_pa: 0,
             state: TaskState::Exited,
             name: [0; 8],
+            mailbox: [0; 32],
+            mailbox_len: 0,
+            mailbox_from: 0,
         }
     }
 
@@ -316,6 +341,86 @@ pub unsafe fn spawn(name: &[u8], ttbr0_pa: u64, entry: u64, sp: u64) -> Option<u
 }
 
 // ---------------------------------------------------------------------------
+// M6 IPC — message passing between tasks
+// ---------------------------------------------------------------------------
+
+/// The maximum message size: the mailbox is 32 bytes. Messages longer
+/// than this are truncated to this length. Small — this is a teaching
+/// kernel, and 32 bytes is enough to say "hello" or pass a number.
+pub const MSG_MAX: usize = 32;
+
+/// Send a message to task `dst_tid`. Copies up to 32 bytes from `data`
+/// into the receiver's mailbox.
+///
+/// Returns `Ok(())` on success, or an error code as a negative i64:
+///   - `-ESRCH` (3): no such task (TID out of range or Exited)
+///   - `-EAGAIN` (11): mailbox full (the receiver hasn't read the last
+///     message yet — the sender can yield and retry)
+///
+/// This is non-blocking: if the mailbox is full, the sender gets
+/// `-EAGAIN` and can decide to yield (letting the receiver run and
+/// drain) or try again later. A blocking send would set the sender's
+/// state to Blocked and wake it when the mailbox empties — that's
+/// the next step, but the non-blocking version proves the copy path
+/// first.
+///
+/// # Safety
+/// Single-core, interrupts masked (called from the SVC handler at
+/// EL1, DAIF set by exception entry).
+pub unsafe fn ipc_send(dst_tid: usize, data: &[u8]) -> Result<(), i64> {
+    const ESRCH: i64 = 3;
+    const EAGAIN: i64 = 11;
+
+    if dst_tid == 0 || dst_tid >= MAX_TASKS {
+        return Err(ESRCH);
+    }
+    // SAFETY: single-core, exception context, DAIF set.
+    let t = unsafe { &mut *(&raw mut TASK_TABLE[dst_tid]) };
+    if t.state == TaskState::Exited {
+        return Err(ESRCH);
+    }
+    if t.mailbox_len > 0 {
+        return Err(EAGAIN);
+    }
+    let n = data.len().min(MSG_MAX);
+    t.mailbox[..n].copy_from_slice(&data[..n]);
+    t.mailbox_len = n;
+    t.mailbox_from = current_tid();
+    Ok(())
+}
+
+/// Receive a message into `buf`. If the mailbox is empty, returns
+/// `-EAGAIN` (the caller can yield and retry, or spin). If a message
+/// is waiting, copies it into `buf` (up to `buf.len()` bytes), clears
+/// the mailbox, and returns `Ok((len, sender_tid))`.
+///
+/// Returns `Ok((usize, usize))` = (bytes copied, sender TID) on
+/// success, or an error code as a negative i64:
+///   - `-EAGAIN` (11): no message waiting
+///
+/// # Safety
+/// Single-core, interrupts masked (called from the SVC handler).
+pub unsafe fn ipc_recv(buf: &mut [u8]) -> Result<(usize, usize), i64> {
+    const EAGAIN: i64 = 11;
+
+    let cur = current_tid();
+    if cur == 0 || cur >= MAX_TASKS {
+        return Err(EAGAIN);
+    }
+    // SAFETY: single-core, exception context.
+    let t = unsafe { &mut *(&raw mut TASK_TABLE[cur]) };
+    if t.mailbox_len == 0 {
+        return Err(EAGAIN);
+    }
+    let n = t.mailbox_len.min(buf.len());
+    buf[..n].copy_from_slice(&t.mailbox[..n]);
+    let from = t.mailbox_from;
+    t.mailbox_len = 0;
+    t.mailbox_from = 0;
+    Ok((n, from))
+}
+
+// ---------------------------------------------------------------------------
 // M6 context switch — the heart of the scheduler
 // ---------------------------------------------------------------------------
 
@@ -417,10 +522,12 @@ pub fn dump_tasks() {
             continue;
         }
         println!(
-            "  TID {tid}: {:8}  state={:?}  ttbr0={:#x}",
+            "  TID {tid}: {:8}  state={:?}  ttbr0={:#x}  mbox={}b from={}",
             t.name_str(),
             t.state,
-            t.ttbr0_pa
+            t.ttbr0_pa,
+            t.mailbox_len,
+            t.mailbox_from,
         );
     }
     let s = unsafe { &*(&raw const SCHEDULER) };

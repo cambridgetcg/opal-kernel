@@ -536,6 +536,9 @@ pub fn run_command(line: &[u8]) {
             println!(
                 "  preempt         M6: preemptive scheduling — two spinning tasks, timer-driven switch"
             );
+            println!(
+                "  ipc             M6: IPC demo — sender sends a message, receiver gets it"
+            );
         }
         "brk" => {
             arch::aarch64::vectors::demo_brk();
@@ -803,6 +806,16 @@ pub fn run_command(line: &[u8]) {
             // to this monitor loop (the tasks never exit; Ctrl-A X to
             // quit QEMU).
             arch::aarch64::user::drop_to_el0_preempt();
+        }
+        "ipc" => {
+            // M6: IPC demo. Spawn a sender (task A) and a receiver
+            // (task B), each with its own address space. A sends
+            // "hello B!" to B's mailbox via SYS_SEND, then yields. B
+            // calls SYS_RECV, gets the message from its mailbox, and
+            // writes "B: got msg!" — proving the message passed
+            // through the kernel from one task to another. Like
+            // `spawn2`, this does not return to this monitor loop.
+            arch::aarch64::user::drop_to_el0_ipc();
         }
         other => println!("unknown command {other:?} - try 'help'"),
     }

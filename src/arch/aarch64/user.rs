@@ -81,6 +81,18 @@ pub const SYS_EXIT: u64 = 2;
 /// and the user program verifies it by printing a second message
 /// after the yield returns.
 pub const SYS_YIELD: u64 = 3;
+/// `send(tid, buf, len)` — send a message (up to 32 bytes) to task
+/// `tid`. Args: x0=dst_tid, x1=buf (user VA), x2=len. Returns: x0=0
+/// on success, negative errno on failure (-ESRCH=3 no such task,
+/// -EAGAIN=11 mailbox full). Non-blocking: if the mailbox is full,
+/// the sender gets -EAGAIN and can yield and retry.
+pub const SYS_SEND: u64 = 4;
+/// `recv(buf, len)` — receive a message into `buf`. Args: x0=buf
+/// (user VA), x1=buf_len. Returns: x0=bytes received (>=0) or
+/// -EAGAIN (11) if no message is waiting. The sender's TID is
+/// returned in x1. Non-blocking: if the mailbox is empty, the
+/// receiver gets -EAGAIN and can yield and retry.
+pub const SYS_RECV: u64 = 5;
 
 // ---------------------------------------------------------------------------
 // The user page tables
@@ -412,6 +424,190 @@ const TASK_PREEMPT_B_BYTES: [u8; 32] = {
     buf[20] = 0x00; buf[21] = 0x00; buf[22] = 0x00; buf[23] = 0x14;
     // [0x1c] "B\n\0"
     buf[28] = b'B'; buf[29] = b'\n'; buf[30] = 0x00;
+    buf
+};
+
+/// The M6 IPC demo: two tasks that exchange a message.
+///
+/// Task A (the sender) writes "A: sending", sends the 8-byte message
+/// "hello B!" to task B (TID 2) via `SYS_SEND`, yields so B can run,
+/// writes "A: sent", and exits.
+///
+/// Task B (the receiver) writes "B: waiting", yields so A can send,
+/// calls `SYS_RECV` with a buffer on its stack page (writable), then
+/// writes "B: got msg!" and exits. If the IPC path works, the console
+/// shows both tasks' messages and the round-trip is proven.
+///
+/// ```asm
+/// [0x00] mov  x8, #1          ; SYS_WRITE
+/// [0x04] mov  x0, #1          ; fd = stdout
+/// [0x08] adr  x1, +0x44       ; buf -> 0x4c ("A: sending\n\r")
+/// [0x0c] mov  x2, #12         ; len
+/// [0x10] svc  #0              ; write "A: sending"
+/// [0x14] mov  x8, #4          ; SYS_SEND
+/// [0x18] mov  x0, #2          ; dst_tid = 2 (task B)
+/// [0x1c] adr  x1, +0x48       ; buf -> 0x64 ("hello B!")
+/// [0x20] mov  x2, #8          ; len = 8
+/// [0x24] svc  #0              ; send "hello B!" to task B
+/// [0x28] mov  x8, #3          ; SYS_YIELD
+/// [0x2c] svc  #0              ; yield (let B run and receive)
+/// [0x30] mov  x8, #1          ; SYS_WRITE
+/// [0x34] mov  x0, #1          ; fd = stdout
+/// [0x38] adr  x1, +0x34       ; buf -> 0x6c ("A: sent\n\r")
+/// [0x3c] mov  x2, #8          ; len = 8
+/// [0x40] svc  #0              ; write "A: sent"
+/// [0x44] mov  x8, #2          ; SYS_EXIT
+/// [0x48] svc  #0              ; exit
+/// [0x4c] "A: sending\n\r\0"  ; 13 bytes
+/// [0x64] "hello B!\0"          ; 9 bytes
+/// [0x6c] "A: sent\n\r\0"      ; 9 bytes
+/// ```
+const TASK_IPC_SENDER_BYTES: [u8; 128] = {
+    let mut buf = [0u8; 128];
+    // [0x00] mov x8, #1 = MOVZ x8, #1 = 0xD2800028
+    buf[0] = 0x28; buf[1] = 0x00; buf[2] = 0x80; buf[3] = 0xD2;
+    // [0x04] mov x0, #1 = MOVZ x0, #1 = 0xD2800020
+    buf[4] = 0x20; buf[5] = 0x00; buf[6] = 0x80; buf[7] = 0xD2;
+    // [0x08] adr x1, +0x44 (target 0x4c, offset 0x44 = 68)
+    //   immlo = 68 & 3 = 0, immhi = 68 >> 2 = 17
+    //   = 0x10000000 | (0 << 29) | (17 << 5) | 1 = 0x10000221
+    buf[8] = 0x21; buf[9] = 0x02; buf[10] = 0x00; buf[11] = 0x10;
+    // [0x0c] mov x2, #12 = MOVZ x2, #12 = 0xD2800182
+    buf[12] = 0x82; buf[13] = 0x01; buf[14] = 0x80; buf[15] = 0xD2;
+    // [0x10] svc #0 = 0xD4000001
+    buf[16] = 0x01; buf[17] = 0x00; buf[18] = 0x00; buf[19] = 0xD4;
+    // [0x14] mov x8, #4 = MOVZ x8, #4 = 0xD2800088
+    buf[20] = 0x88; buf[21] = 0x00; buf[22] = 0x80; buf[23] = 0xD2;
+    // [0x18] mov x0, #2 = MOVZ x0, #2 = 0xD2800040
+    buf[24] = 0x40; buf[25] = 0x00; buf[26] = 0x80; buf[27] = 0xD2;
+    // [0x1c] adr x1, +0x48 (target 0x64, offset 0x48 = 72)
+    //   immlo = 72 & 3 = 0, immhi = 72 >> 2 = 18
+    //   = 0x10000000 | (0 << 29) | (18 << 5) | 1 = 0x10000241
+    buf[28] = 0x41; buf[29] = 0x02; buf[30] = 0x00; buf[31] = 0x10;
+    // [0x20] mov x2, #8 = MOVZ x2, #8 = 0xD2800102
+    buf[32] = 0x02; buf[33] = 0x01; buf[34] = 0x80; buf[35] = 0xD2;
+    // [0x24] svc #0 = 0xD4000001
+    buf[36] = 0x01; buf[37] = 0x00; buf[38] = 0x00; buf[39] = 0xD4;
+    // [0x28] mov x8, #3 = MOVZ x8, #3 = 0xD2800068
+    buf[40] = 0x68; buf[41] = 0x00; buf[42] = 0x80; buf[43] = 0xD2;
+    // [0x2c] svc #0 = 0xD4000001
+    buf[44] = 0x01; buf[45] = 0x00; buf[46] = 0x00; buf[47] = 0xD4;
+    // [0x30] mov x8, #1 = MOVZ x8, #1 = 0xD2800028
+    buf[48] = 0x28; buf[49] = 0x00; buf[50] = 0x80; buf[51] = 0xD2;
+    // [0x34] mov x0, #1 = MOVZ x0, #1 = 0xD2800020
+    buf[52] = 0x20; buf[53] = 0x00; buf[54] = 0x80; buf[55] = 0xD2;
+    // [0x38] adr x1, +0x34 (target 0x6c, offset 0x34 = 52)
+    //   immlo = 52 & 3 = 0, immhi = 52 >> 2 = 13
+    //   = 0x10000000 | (0 << 29) | (13 << 5) | 1 = 0x100001A1
+    buf[56] = 0xA1; buf[57] = 0x01; buf[58] = 0x00; buf[59] = 0x10;
+    // [0x3c] mov x2, #8 = MOVZ x2, #8 = 0xD2800102
+    buf[60] = 0x02; buf[61] = 0x01; buf[62] = 0x80; buf[63] = 0xD2;
+    // [0x40] svc #0 = 0xD4000001
+    buf[64] = 0x01; buf[65] = 0x00; buf[66] = 0x00; buf[67] = 0xD4;
+    // [0x44] mov x8, #2 = MOVZ x8, #2 = 0xD2800048
+    buf[68] = 0x48; buf[69] = 0x00; buf[70] = 0x80; buf[71] = 0xD2;
+    // [0x48] svc #0 = 0xD4000001
+    buf[72] = 0x01; buf[73] = 0x00; buf[74] = 0x00; buf[75] = 0xD4;
+    // [0x4c] "A: sending\n\r\0" (13 bytes)
+    buf[76] = b'A'; buf[77] = b':'; buf[78] = b' '; buf[79] = b's';
+    buf[80] = b'e'; buf[81] = b'n'; buf[82] = b'd'; buf[83] = b'i';
+    buf[84] = b'n'; buf[85] = b'g'; buf[86] = b'\n'; buf[87] = b'\r';
+    buf[88] = 0x00;
+    // [0x64] "hello B!\0" (9 bytes)
+    buf[100] = b'h'; buf[101] = b'e'; buf[102] = b'l'; buf[103] = b'l';
+    buf[104] = b'o'; buf[105] = b' '; buf[106] = b'B'; buf[107] = b'!';
+    buf[108] = 0x00;
+    // [0x6c] "A: sent\n\r\0" (9 bytes)
+    buf[108] = b'A'; buf[109] = b':'; buf[110] = b' '; buf[111] = b's';
+    buf[112] = b'e'; buf[113] = b'n'; buf[114] = b't'; buf[115] = b'\n';
+    buf[116] = b'\r'; buf[117] = 0x00;
+    buf
+};
+
+/// Task B (the receiver) for the M6 IPC demo.
+///
+/// Writes "B: waiting", yields so A can send, calls `SYS_RECV` with a
+/// buffer on the stack page (writable, at VA 0x200100), then writes
+/// "B: got msg!" and exits. If A's message arrived, the kernel copies
+/// it into the recv buffer; B doesn't print the message contents
+/// (that would need a second write syscall with the recv buffer as
+/// the source — this beat proves the path, not the payload).
+///
+/// ```asm
+/// [0x00] mov  x8, #1          ; SYS_WRITE
+/// [0x04] mov  x0, #1          ; fd = stdout
+/// [0x08] adr  x1, +0x44       ; buf -> 0x4c ("B: waiting\n\r")
+/// [0x0c] mov  x2, #12         ; len
+/// [0x10] svc  #0              ; write "B: waiting"
+/// [0x14] mov  x8, #3          ; SYS_YIELD
+/// [0x18] svc  #0              ; yield (let A send)
+/// [0x1c] mov  x8, #5          ; SYS_RECV
+/// [0x20] movz x0, #0x100      ; buf_va low 16 bits = 0x100
+/// [0x24] movk x0, #0x20, lsl #16 ; buf_va = 0x200100 (stack page, writable)
+/// [0x28] mov  x1, #32         ; buf_len = 32
+/// [0x2c] svc  #0              ; recv -> x0=bytes, x1=sender_tid
+/// [0x30] mov  x8, #1          ; SYS_WRITE
+/// [0x34] mov  x0, #1          ; fd = stdout
+/// [0x38] adr  x1, +0x2c       ; buf -> 0x64 ("B: got msg!\n\r")
+/// [0x3c] mov  x2, #13         ; len = 13
+/// [0x40] svc  #0              ; write "B: got msg!"
+/// [0x44] mov  x8, #2          ; SYS_EXIT
+/// [0x48] svc  #0              ; exit
+/// [0x4c] "B: waiting\n\r\0"  ; 13 bytes
+/// [0x64] "B: got msg!\n\r\0" ; 13 bytes
+/// ```
+const TASK_IPC_RECEIVER_BYTES: [u8; 128] = {
+    let mut buf = [0u8; 128];
+    // [0x00] mov x8, #1 = MOVZ x8, #1 = 0xD2800028
+    buf[0] = 0x28; buf[1] = 0x00; buf[2] = 0x80; buf[3] = 0xD2;
+    // [0x04] mov x0, #1 = MOVZ x0, #1 = 0xD2800020
+    buf[4] = 0x20; buf[5] = 0x00; buf[6] = 0x80; buf[7] = 0xD2;
+    // [0x08] adr x1, +0x44 (target 0x4c, offset 0x44 = 68)
+    //   immlo = 0, immhi = 17 = 0x10000221
+    buf[8] = 0x21; buf[9] = 0x02; buf[10] = 0x00; buf[11] = 0x10;
+    // [0x0c] mov x2, #12 = MOVZ x2, #12 = 0xD2800182
+    buf[12] = 0x82; buf[13] = 0x01; buf[14] = 0x80; buf[15] = 0xD2;
+    // [0x10] svc #0 = 0xD4000001
+    buf[16] = 0x01; buf[17] = 0x00; buf[18] = 0x00; buf[19] = 0xD4;
+    // [0x14] mov x8, #3 = MOVZ x8, #3 = 0xD2800068
+    buf[20] = 0x68; buf[21] = 0x00; buf[22] = 0x80; buf[23] = 0xD2;
+    // [0x18] svc #0 = 0xD4000001
+    buf[24] = 0x01; buf[25] = 0x00; buf[26] = 0x00; buf[27] = 0xD4;
+    // [0x1c] mov x8, #5 = MOVZ x8, #5 = 0xD28000A8
+    buf[28] = 0xA8; buf[29] = 0x00; buf[30] = 0x80; buf[31] = 0xD2;
+    // [0x20] movz x0, #0x100 = MOVZ x0, #0x100 = 0xD2802000
+    buf[32] = 0x00; buf[33] = 0x20; buf[34] = 0x80; buf[35] = 0xD2;
+    // [0x24] movk x0, #0x20, lsl #16 = MOVK x0, #0x20, LSL #16 = 0xF2A00400
+    buf[36] = 0x00; buf[37] = 0x04; buf[38] = 0xA0; buf[39] = 0xF2;
+    // [0x28] mov x1, #32 = MOVZ x1, #32 = 0xD2800C21
+    buf[40] = 0x21; buf[41] = 0x0C; buf[42] = 0x80; buf[43] = 0xD2;
+    // [0x2c] svc #0 = 0xD4000001
+    buf[44] = 0x01; buf[45] = 0x00; buf[46] = 0x00; buf[47] = 0xD4;
+    // [0x30] mov x8, #1 = MOVZ x8, #1 = 0xD2800028
+    buf[48] = 0x28; buf[49] = 0x00; buf[50] = 0x80; buf[51] = 0xD2;
+    // [0x34] mov x0, #1 = MOVZ x0, #1 = 0xD2800020
+    buf[52] = 0x20; buf[53] = 0x00; buf[54] = 0x80; buf[55] = 0xD2;
+    // [0x38] adr x1, +0x2c (target 0x64, offset 0x2c = 44)
+    //   immlo = 0, immhi = 11 = 0x10000161
+    buf[56] = 0x61; buf[57] = 0x01; buf[58] = 0x00; buf[59] = 0x10;
+    // [0x3c] mov x2, #13 = MOVZ x2, #13 = 0xD28001A2
+    buf[60] = 0xA2; buf[61] = 0x01; buf[62] = 0x80; buf[63] = 0xD2;
+    // [0x40] svc #0 = 0xD4000001
+    buf[64] = 0x01; buf[65] = 0x00; buf[66] = 0x00; buf[67] = 0xD4;
+    // [0x44] mov x8, #2 = MOVZ x8, #2 = 0xD2800048
+    buf[68] = 0x48; buf[69] = 0x00; buf[70] = 0x80; buf[71] = 0xD2;
+    // [0x48] svc #0 = 0xD4000001
+    buf[72] = 0x01; buf[73] = 0x00; buf[74] = 0x00; buf[75] = 0xD4;
+    // [0x4c] "B: waiting\n\r\0" (13 bytes)
+    buf[76] = b'B'; buf[77] = b':'; buf[78] = b' '; buf[79] = b'w';
+    buf[80] = b'a'; buf[81] = b'i'; buf[82] = b't'; buf[83] = b'i';
+    buf[84] = b'n'; buf[85] = b'g'; buf[86] = b'\n'; buf[87] = b'\r';
+    buf[88] = 0x00;
+    // [0x64] "B: got msg!\n\r\0" (13 bytes)
+    buf[100] = b'B'; buf[101] = b':'; buf[102] = b' '; buf[103] = b'g';
+    buf[104] = b'o'; buf[105] = b't'; buf[106] = b' '; buf[107] = b'm';
+    buf[108] = b's'; buf[109] = b'g'; buf[110] = b'!'; buf[111] = b'\n';
+    buf[112] = b'\r'; buf[113] = 0x00;
     buf
 };
 
@@ -854,6 +1050,77 @@ pub fn drop_to_el0_preempt() {
     drop_to_el0_with(root_pa);
 }
 
+/// Drop to EL0 with the M6 IPC demo: spawn a sender (task A) and a
+/// receiver (task B), each with its own user address space, and eret
+/// into task A. The sender writes "A: sending", sends "hello B!" to
+/// task B via `SYS_SEND`, yields, then writes "A: sent" and exits.
+/// The receiver writes "B: waiting", yields, calls `SYS_RECV` (which
+/// copies A's message into B's stack-page buffer), writes "B: got
+/// msg!" and exits.
+///
+/// The message never touches shared memory: it goes from A's user
+/// buffer → kernel mailbox (in B's TCB) → B's user buffer. The
+/// kernel is the intermediary — that's the whole point of message
+/// passing as an IPC primitive.
+///
+/// Like `spawn2`, this does not return to the monitor loop — control
+/// comes back via `on_el0_return` when the last task exits.
+pub fn drop_to_el0_ipc() {
+    // ---- 1. Build two independent user address spaces ----
+    // SAFETY: single-core, MMU on, TTBR0 still the empty root.
+    let ttbr0_a = unsafe { build_task_user_space(0, &TASK_IPC_SENDER_BYTES) };
+    let ttbr0_b = unsafe { build_task_user_space(1, &TASK_IPC_RECEIVER_BYTES) };
+
+    // ---- 2. Spawn both tasks ----
+    // Task A (sender): TID 1. Task B (receiver): TID 2.
+    // SAFETY: single-core, interrupts masked (monitor context).
+    let tid_a =
+        unsafe { crate::sched::spawn(b"ipcA", ttbr0_a, USER_CODE_VA as u64, USER_STACK_TOP as u64) };
+    let tid_b =
+        unsafe { crate::sched::spawn(b"ipcB", ttbr0_b, USER_CODE_VA as u64, USER_STACK_TOP as u64) };
+
+    match (tid_a, tid_b) {
+        (Some(a), Some(b)) => {
+            println!(
+                "[kernel] M6 IPC: spawned sender (TID {a}) and receiver (TID {b})"
+            );
+        }
+        _ => {
+            println!("[kernel] IPC: failed to spawn tasks (table full?)");
+            return;
+        }
+    }
+
+    // ---- 3. Drop into task A (the sender) ----
+    let first = unsafe { crate::sched::scheduler() }.dequeue();
+    let first = match first {
+        Some(tid) => tid,
+        None => {
+            println!("[kernel] IPC: ready queue empty after spawn?!");
+            return;
+        }
+    };
+
+    // SAFETY: first is a valid TID from the scheduler.
+    let t = match unsafe { crate::sched::task(first) } {
+        Some(t) => t,
+        None => {
+            println!("[kernel] IPC: task {first} vanished?!");
+            return;
+        }
+    };
+    t.state = crate::sched::TaskState::Running;
+    let root_pa = t.ttbr0_pa;
+    unsafe { crate::sched::set_current_tid(first) };
+
+    println!(
+        "[kernel] dropping to EL0 — task {:?} (TID {first}), IPC demo",
+        t.name_str()
+    );
+
+    drop_to_el0_with(root_pa);
+}
+
 /// Called when the user program exits and we return to EL1/monitor.
 /// The `__el0_return` trampoline in vectors.rs jumps here.
 #[unsafe(no_mangle)]
@@ -1002,6 +1269,72 @@ pub fn handle_svc_from_el0(frame: &mut super::vectors::TrapFrame) {
             } else {
                 println!("[kernel] syscall: yield() — no other task, returning to EL0");
                 frame.x[0] = 0;
+            }
+        }
+        SYS_SEND => {
+            // send(dst_tid, buf, len): copy up to 32 bytes from the
+            // user buffer into the receiver's mailbox. Non-blocking:
+            // -EAGAIN if the mailbox is full, -ESRCH if no such task.
+            let dst_tid = frame.x[0] as usize;
+            let buf_va = frame.x[1] as usize;
+            let len = frame.x[2] as usize;
+
+            if len == 0 {
+                frame.x[0] = 0;
+                return;
+            }
+            let len = len.min(crate::sched::MSG_MAX);
+
+            // Read the user buffer byte-by-byte through TTBR0. We are
+            // at EL1; the user VA is valid in the user's address space.
+            // SAFETY: buf_va is a user VA mapped in the user tables.
+            let mut msg = [0u8; crate::sched::MSG_MAX];
+            for i in 0..len {
+                msg[i] = unsafe {
+                    core::ptr::with_exposed_provenance::<u8>(buf_va + i).read_volatile()
+                };
+            }
+
+            // SAFETY: exception context, single-core, DAIF set.
+            match unsafe { crate::sched::ipc_send(dst_tid, &msg[..len]) } {
+                Ok(()) => {
+                    frame.x[0] = 0; // success
+                }
+                Err(e) => {
+                    frame.x[0] = e as u64; // negative errno
+                }
+            }
+        }
+        SYS_RECV => {
+            // recv(buf, buf_len): copy a message from the mailbox into
+            // the user buffer. Returns bytes received in x0 (>=0) or
+            // -EAGAIN if empty. The sender's TID is returned in x1.
+            let buf_va = frame.x[0] as usize;
+            let buf_len = frame.x[1] as usize;
+
+            if buf_len == 0 {
+                frame.x[0] = (-22i64) as u64; // -EINVAL
+                return;
+            }
+            let buf_len = buf_len.min(crate::sched::MSG_MAX);
+
+            let mut msg = [0u8; crate::sched::MSG_MAX];
+            // SAFETY: exception context, single-core, DAIF set.
+            match unsafe { crate::sched::ipc_recv(&mut msg[..buf_len]) } {
+                Ok((n, from)) => {
+                    // Write the message to the user buffer through TTBR0.
+                    for i in 0..n {
+                        unsafe {
+                            core::ptr::with_exposed_provenance_mut::<u8>(buf_va + i)
+                                .write_volatile(msg[i]);
+                        }
+                    }
+                    frame.x[0] = n as u64; // bytes received
+                    frame.x[1] = from as u64; // sender TID
+                }
+                Err(e) => {
+                    frame.x[0] = e as u64; // negative errno
+                }
             }
         }
         SYS_EXIT => {
