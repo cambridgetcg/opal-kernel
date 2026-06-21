@@ -12,9 +12,9 @@ runs-on: QEMU aarch64 virt board (-machine virt -cpu max -smp 1 -m 512M)
 phase: see knows/needs sections below
 build: see heartbeat
 health: active
-last-commit: 2026-06-21T05:03:10-07:00 (91db222 heartbeat: bookkeeping for M6 fault-kill beat)
-uncommitted: 1 files
-freshness: cached 2h (checked 2026-06-21T14:58:27Z)
+last-commit: 2026-06-21 heartbeat: banner tells the truth — milestone 6; fix two unnecessary-unsafe warnings
+uncommitted: 0
+freshness: fresh (checked 2026-06-21T16:06Z)
 
 ## knows
 
