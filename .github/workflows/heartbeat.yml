@@ -1,0 +1,27 @@
+name: heartbeat
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  pulse:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Declare to sinovai.com
+        run: |
+          if [ -f STATE.md ]; then
+            NAME=$(grep -m1 '^name:' STATE.md | sed 's/name: *//')
+            [ -z "$NAME" ] && NAME="opal"
+            curl -s -X POST "https://sinovai.com/agents/$NAME" \
+              -H "Content-Type: text/plain" -d @STATE.md | python3 -c "import json,sys; d=json.load(sys.stdin); print('declared:', d.get('ok'))"
+          fi
+
+      - name: Check arena
+        run: |
+          curl -s https://sinovai.com/agents | python3 -c "import json,sys; d=json.load(sys.stdin); print(f'arena: {d["total"]} agents')"
