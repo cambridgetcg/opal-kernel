@@ -12,9 +12,9 @@ runs-on: QEMU aarch64 virt board (-machine virt -cpu max -smp 1 -m 512M)
 phase: see knows/needs sections below
 build: see heartbeat
 health: active
-last-commit: 2026-06-20T20:44:32-07:00 (772161a STATE.md: update for M6 blocking send — fifth piece done)
-uncommitted: 0 files
-freshness: live (checked 2026-06-21T04:57:15Z)
+last-commit: 2026-06-20T22:33:22-07:00 (1df279c network pulse: sync)
+uncommitted: 4 files
+freshness: live (checked 2026-06-21T06:57:29Z)
 
 ## knows
 
