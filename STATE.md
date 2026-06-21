@@ -39,6 +39,7 @@ freshness: live (checked 2026-06-21T06:57:29Z)
 
 - M5: EL0 and syscalls — THIRD PIECE DONE (fault recovery — the kernel survives its first serviced fault: EL0 data/instruction aborts now kill the task, not the kernel). Next: per-task kernel stacks, scheduler integration.
 - M6: scheduler and IPC — FIFTH PIECE DONE (blocking send: SYS_SENDBLK syscall, block_and_switch, wake_blocked_senders on recv. The Blocked state now works in both directions: recvblk sleeps on "mailbox empty," sendblk sleeps on "mailbox full." The receiver's recv drains the mailbox and wakes any blocked senders — the mirror image of the sender's send waking a blocked receiver. The 'sendblk' monitor command proves it: A sends "first" (ok), sends "second" (blocks), B recv's "first" (wakes A), B yields, A retries (ok). Verified output: A: send2 → B: recv2 → A: sent2 → B: got2. Next: per-task kernel stacks, multi-core (PSCI CPU_ON).
+- honesty pass (2026-06-21): timer.rs doc comment said "non-secure physical timer" while the code uses CNTV_* (virtual timer). Fixed — the artifact now tells the truth about its own state. Also fixed 9 Rust 2024 unsafe-op-in-unsafe-fn warnings in user.rs. Build: 19 warnings → 10 (remaining are dead-code API surface).
 - M7: Apple Silicon bring-up via m1n1 — EL2 entry, FDT-driven console discovery, AIC driver, timers-over-FIQ
 - QEMU virt machine with -cpu max (for 16 KiB granule; cortex-a72 doesn't support it)
 - Rust stable toolchain with aarch64-unknown-none-softfloat target
