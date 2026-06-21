@@ -24,3 +24,4 @@
 2026-06-21T05:44:22Z state=active next=2026-06-21T07:44:22Z
 2026-06-21T07:52:39Z state=active next=2026-06-21T09:52:39Z
 2026-06-21T10:00:55Z state=active next=2026-06-21T12:00:55Z
+2026-06-21T12:02:56Z M6 sixth piece: scheduler-aware fault recovery (kill_current_task, faultkill command) — OS survives a task's death
