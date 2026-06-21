@@ -12,9 +12,9 @@ runs-on: QEMU aarch64 virt board (-machine virt -cpu max -smp 1 -m 512M)
 phase: see knows/needs sections below
 build: see heartbeat
 health: active
-last-commit: 2026-06-20T18:30:53-07:00 (2d3c29b network pulse: sync)
+last-commit: 2026-06-21T03:35:00-07:00 (772cc8e M6: blocking send — the Blocked state wakes in the other direction)
 uncommitted: 0 files
-freshness: live (checked 2026-06-21T02:56:59Z)
+freshness: live (checked 2026-06-21T03:35:00Z)
 
 ## knows
 
@@ -33,12 +33,12 @@ freshness: live (checked 2026-06-21T02:56:59Z)
 - translate virtual addresses (AT S1E1R hardware probe + software walk with cross-check)
 - respond to timer interrupts (arm, fire, re-arm — the heartbeat pattern)
 - parse the devicetree blob and cross-check discovered values against board constants
-- interactive monitor with commands: help, brk, svc, unaligned, translate, walk, guard, wx, noexec, low, abort, tick, ticks, ticktest, dtb, tree, el0, el0fault, tasks, spawn2, preempt, ipc, blkipc
+- interactive monitor with commands: help, brk, svc, unaligned, translate, walk, guard, wx, noexec, low, abort, tick, ticks, ticktest, dtb, tree, el0, el0fault, tasks, spawn2, preempt, ipc, blkipc, sendblk
 
 ## needs
 
 - M5: EL0 and syscalls — THIRD PIECE DONE (fault recovery — the kernel survives its first serviced fault: EL0 data/instruction aborts now kill the task, not the kernel). Next: per-task kernel stacks, scheduler integration.
-- M6: scheduler and IPC — FOURTH PIECE DONE (blocking IPC: SYS_RECVBLK syscall, block_and_switch, wake-on-send. The Blocked state's first real use: a task sleeps on an empty mailbox, another task sends to it and the kernel wakes the sleeper. The "retry the syscall on wake" trick (rewind ELR by 4 before blocking) is the classic re-entrant syscall pattern. 'blkipc' monitor command proves it: B blocks, A sends "wake!", B wakes and continues. Next: per-task kernel stacks, multi-core (PSCI CPU_ON), blocking send).
+- M6: scheduler and IPC — FIFTH PIECE DONE (blocking send: SYS_SENDBLK syscall, block_and_switch, wake_blocked_senders on recv. The Blocked state now works in both directions: recvblk sleeps on "mailbox empty," sendblk sleeps on "mailbox full." The receiver's recv drains the mailbox and wakes any blocked senders — the mirror image of the sender's send waking a blocked receiver. The 'sendblk' monitor command proves it: A sends "first" (ok), sends "second" (blocks), B recv's "first" (wakes A), B yields, A retries (ok). Verified output: A: send2 → B: recv2 → A: sent2 → B: got2. Next: per-task kernel stacks, multi-core (PSCI CPU_ON).
 - M7: Apple Silicon bring-up via m1n1 — EL2 entry, FDT-driven console discovery, AIC driver, timers-over-FIQ
 - QEMU virt machine with -cpu max (for 16 KiB granule; cortex-a72 doesn't support it)
 - Rust stable toolchain with aarch64-unknown-none-softfloat target
