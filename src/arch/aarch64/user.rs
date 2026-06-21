@@ -1175,8 +1175,8 @@ fn build_user_space_with(prog: &[u8]) -> u64 {
 
     // ---- 2. Physical addresses of the user pages and tables ----
     // SAFETY: address-taking only (no reads/writes) on static muts.
-    let code_pa = mmu::virt_to_phys(unsafe { &raw const USER_CODE_PAGE } as *const _ as usize) as u64;
-    let stack_pa = mmu::virt_to_phys(unsafe { &raw const USER_STACK_PAGE } as *const _ as usize) as u64;
+    let code_pa = mmu::virt_to_phys(&raw const USER_CODE_PAGE as *const _ as usize) as u64;
+    let stack_pa = mmu::virt_to_phys(&raw const USER_STACK_PAGE as *const _ as usize) as u64;
     let l0_pa = mmu::virt_to_phys(unsafe { &raw const USER_TABLES.l0 } as *const _ as usize) as u64;
     let l1_pa = mmu::virt_to_phys(unsafe { &raw const USER_TABLES.l1 } as *const _ as usize) as u64;
     let l2_pa = mmu::virt_to_phys(unsafe { &raw const USER_TABLES.l2 } as *const _ as usize) as u64;
