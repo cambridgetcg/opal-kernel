@@ -105,6 +105,18 @@ pub const SYS_RECV: u64 = 5;
 /// on a condition and wake it when the condition is met, the same
 /// pattern a real OS uses for blocking reads, waits, and futexes.
 pub const SYS_RECVBLK: u64 = 6;
+/// `sendblk(tid, buf, len)` — blocking send: like `send` but if the
+/// receiver's mailbox is full, the sender is put to sleep (Blocked)
+/// instead of returning -EAGAIN. When the receiver drains its mailbox
+/// via `recv`/`recvblk`, the kernel wakes the blocked sender and it
+/// retries — its message now fits. Args: x0=dst_tid, x1=buf (user VA),
+/// x2=len. Returns: x0=0 on success, negative errno on failure.
+///
+/// This is the symmetric counterpart to `recvblk`: there the receiver
+/// sleeps on "mailbox empty," here the sender sleeps on "mailbox full."
+/// Together they give M6's IPC a full blocking pair — a task can wait
+/// in either direction without spinning or yielding-and-retrying.
+pub const SYS_SENDBLK: u64 = 7;
 
 // ---------------------------------------------------------------------------
 // The user page tables
@@ -806,6 +818,230 @@ const TASK_BLKIPC_RECEIVER_BYTES: [u8; 128] = {
     buf
 };
 
+/// The M6 blocking-send demo: a sender that calls `sendblk` (SYS_SENDBLK,
+/// syscall 7) and a receiver that drains its mailbox, waking the blocked
+/// sender. This is the symmetric counterpart to the blocking-recv demo
+/// (`blkipc`): there the receiver slept on "mailbox empty"; here the
+/// sender sleeps on "mailbox full."
+///
+/// Task A (the sender) writes "A: send2", sends "first" to task B via
+/// `sendblk` (succeeds — B's mailbox is empty), then immediately sends
+/// "second" via `sendblk` again. B's mailbox is *full* (it hasn't read
+/// "first" yet), so A **blocks** — the kernel puts A to sleep and
+/// switches to B. B writes "B: recv2", calls `recv` (drains the mailbox,
+/// which wakes A), yields back to A. A retries the `sendblk` — the
+/// mailbox is now empty, so "second" lands. A writes "A: sent2" and
+/// exits. B runs again, `recv`s "second", writes "B: got2" and exits.
+///
+/// The expected console output (interleaved by the scheduler):
+/// ```
+/// A: send2
+/// B: recv2
+/// A: sent2
+/// B: got2
+/// ```
+/// The key moment: A blocks on the second `sendblk`, B's `recv` wakes
+/// it, and A's retry succeeds — the "retry the syscall on wake" pattern
+/// working in the send direction for the first time.
+///
+/// Layout (code 0x00..0x58, data 0x5c onward — no overlap):
+/// ```asm
+/// [0x00] mov  x8, #1          ; SYS_WRITE
+/// [0x04] mov  x0, #1          ; fd = stdout
+/// [0x08] adr  x1, +0x54       ; buf -> 0x5c ("A: send2\n\r")
+/// [0x0c] mov  x2, #10         ; len
+/// [0x10] svc  #0              ; write "A: send2"
+/// [0x14] mov  x8, #7          ; SYS_SENDBLK
+/// [0x18] mov  x0, #2          ; dst_tid = 2 (task B)
+/// [0x1c] adr  x1, +0x44       ; buf -> 0x60 ("first")
+/// [0x20] mov  x2, #5          ; len = 5
+/// [0x24] svc  #0              ; sendblk "first" — succeeds (mailbox empty)
+/// [0x28] mov  x8, #7          ; SYS_SENDBLK (again)
+/// [0x2c] mov  x0, #2          ; dst_tid = 2
+/// [0x30] adr  x1, +0x38       ; buf -> 0x68 ("second")
+/// [0x34] mov  x2, #6          ; len = 6
+/// [0x38] svc  #0              ; sendblk "second" — BLOCKS (mailbox full)
+/// ;; --- A is woken when B drains its mailbox via recv ---
+/// [0x3c] mov  x8, #1          ; SYS_WRITE
+/// [0x40] mov  x0, #1          ; fd = stdout
+/// [0x44] adr  x1, +0x30       ; buf -> 0x74 ("A: sent2\n\r")
+/// [0x48] mov  x2, #10         ; len
+/// [0x4c] svc  #0              ; write "A: sent2"
+/// [0x50] mov  x8, #2          ; SYS_EXIT
+/// [0x54] svc  #0              ; exit
+/// [0x5c] "A: send2\n\r\0"    ; 10 bytes
+/// [0x60] "first\0"            ; 6 bytes
+/// [0x68] "second\0"           ; 7 bytes
+/// [0x74] "A: sent2\n\r\0"    ; 10 bytes
+/// ```
+const TASK_SENDBLK_SENDER_BYTES: [u8; 128] = {
+    let mut buf = [0u8; 128];
+    // [0x00] mov x8, #1 = MOVZ x8, #1 = 0xD2800028
+    buf[0] = 0x28; buf[1] = 0x00; buf[2] = 0x80; buf[3] = 0xD2;
+    // [0x04] mov x0, #1 = MOVZ x0, #1 = 0xD2800020
+    buf[4] = 0x20; buf[5] = 0x00; buf[6] = 0x80; buf[7] = 0xD2;
+    // [0x08] adr x1, +0x50 (target 0x58, offset 80)
+    //   immlo = 0, immhi = 20 = 0x10000281
+    buf[8] = 0x81; buf[9] = 0x02; buf[10] = 0x00; buf[11] = 0x10;
+    // [0x0c] mov x2, #10 = MOVZ x2, #10 = 0xD2800142
+    buf[12] = 0x42; buf[13] = 0x01; buf[14] = 0x80; buf[15] = 0xD2;
+    // [0x10] svc #0 = 0xD4000001
+    buf[16] = 0x01; buf[17] = 0x00; buf[18] = 0x00; buf[19] = 0xD4;
+    // [0x14] mov x8, #7 = MOVZ x8, #7 = 0xD28000E8
+    buf[20] = 0xE8; buf[21] = 0x00; buf[22] = 0x80; buf[23] = 0xD2;
+    // [0x18] mov x0, #2 = MOVZ x0, #2 = 0xD2800040
+    buf[24] = 0x40; buf[25] = 0x00; buf[26] = 0x80; buf[27] = 0xD2;
+    // [0x1c] adr x1, +0x48 (target 0x64, offset 72)
+    //   immlo = 0, immhi = 18 = 0x10000241
+    buf[28] = 0x41; buf[29] = 0x02; buf[30] = 0x00; buf[31] = 0x10;
+    // [0x20] mov x2, #5 = MOVZ x2, #5 = 0xD28000A2
+    buf[32] = 0xA2; buf[33] = 0x00; buf[34] = 0x80; buf[35] = 0xD2;
+    // [0x24] svc #0 = 0xD4000001
+    buf[36] = 0x01; buf[37] = 0x00; buf[38] = 0x00; buf[39] = 0xD4;
+    // [0x28] mov x8, #7 = MOVZ x8, #7 = 0xD28000E8
+    buf[40] = 0xE8; buf[41] = 0x00; buf[42] = 0x80; buf[43] = 0xD2;
+    // [0x2c] mov x0, #2 = MOVZ x0, #2 = 0xD2800040
+    buf[44] = 0x40; buf[45] = 0x00; buf[46] = 0x80; buf[47] = 0xD2;
+    // [0x30] adr x1, +0x3c (target 0x6c, offset 60)
+    //   immlo = 0, immhi = 15 = 0x100001E1
+    buf[48] = 0xE1; buf[49] = 0x01; buf[50] = 0x00; buf[51] = 0x10;
+    // [0x34] mov x2, #6 = MOVZ x2, #6 = 0xD28000C2
+    buf[52] = 0xC2; buf[53] = 0x00; buf[54] = 0x80; buf[55] = 0xD2;
+    // [0x38] svc #0 — sendblk "second": BLOCKS if mailbox full
+    buf[56] = 0x01; buf[57] = 0x00; buf[58] = 0x00; buf[59] = 0xD4;
+    // [0x3c] mov x8, #1 = MOVZ x8, #1 = 0xD2800028
+    buf[60] = 0x28; buf[61] = 0x00; buf[62] = 0x80; buf[63] = 0xD2;
+    // [0x40] mov x0, #1 = MOVZ x0, #1 = 0xD2800020
+    buf[64] = 0x20; buf[65] = 0x00; buf[66] = 0x80; buf[67] = 0xD2;
+    // [0x44] adr x1, +0x30 (target 0x74, offset 48)
+    //   immlo = 0, immhi = 12 = 0x10000181
+    buf[68] = 0x81; buf[69] = 0x01; buf[70] = 0x00; buf[71] = 0x10;
+    // [0x48] mov x2, #10 = MOVZ x2, #10 = 0xD2800142
+    buf[72] = 0x42; buf[73] = 0x01; buf[74] = 0x80; buf[75] = 0xD2;
+    // [0x4c] svc #0 = 0xD4000001
+    buf[76] = 0x01; buf[77] = 0x00; buf[78] = 0x00; buf[79] = 0xD4;
+    // [0x50] mov x8, #2 = MOVZ x8, #2 = 0xD2800048
+    buf[80] = 0x48; buf[81] = 0x00; buf[82] = 0x80; buf[83] = 0xD2;
+    // [0x54] svc #0 = 0xD4000001
+    buf[84] = 0x01; buf[85] = 0x00; buf[86] = 0x00; buf[87] = 0xD4;
+    // Data section — no overlaps:
+    // [0x58] "A: send2\n\r\0" (10 bytes + NUL) at offset 88
+    buf[88] = b'A'; buf[89] = b':'; buf[90] = b' '; buf[91] = b's';
+    buf[92] = b'e'; buf[93] = b'n'; buf[94] = b'd'; buf[95] = b'2';
+    buf[96] = b'\n'; buf[97] = b'\r'; buf[98] = 0x00;
+    // [0x64] "first\0" (5 bytes + NUL) at offset 100
+    buf[100] = b'f'; buf[101] = b'i'; buf[102] = b'r'; buf[103] = b's';
+    buf[104] = b't'; buf[105] = 0x00;
+    // [0x6c] "second\0" (6 bytes + NUL) at offset 108
+    buf[108] = b's'; buf[109] = b'e'; buf[110] = b'c'; buf[111] = b'o';
+    buf[112] = b'n'; buf[113] = b'd'; buf[114] = 0x00;
+    // [0x74] "A: sent2\n\r\0" (10 bytes + NUL) at offset 116
+    buf[116] = b'A'; buf[117] = b':'; buf[118] = b' '; buf[119] = b's';
+    buf[120] = b'e'; buf[121] = b'n'; buf[122] = b't'; buf[123] = b'2';
+    buf[124] = b'\n'; buf[125] = b'\r'; buf[126] = 0x00;
+    buf
+};
+
+/// Task B (receiver) for the blocking-send demo.
+///
+/// Writes "B: recv2", calls `recv` (gets "first", drains the mailbox,
+/// which wakes the blocked sender A), yields (letting A retry its
+/// sendblk), calls `recv` again (gets "second"), writes "B: got2"
+/// and exits.
+///
+/// Layout (code 0x00..0x60, data 0x60 onward — no overlap):
+/// ```asm
+/// [0x00] mov  x8, #1          ; SYS_WRITE
+/// [0x04] mov  x0, #1          ; fd = stdout
+/// [0x08] adr  x1, +0x58       ; buf -> 0x60 ("B: recv2\n\r")
+/// [0x0c] mov  x2, #10         ; len
+/// [0x10] svc  #0              ; write "B: recv2"
+/// [0x14] mov  x8, #5          ; SYS_RECV
+/// [0x18] movz x0, #0x100      ; buf_va low 16 bits
+/// [0x1c] movk x0, #0x20, lsl #16 ; buf_va = 0x200100 (stack page)
+/// [0x20] mov  x1, #32         ; buf_len = 32
+/// [0x24] svc  #0              ; recv — gets "first", wakes blocked sender A
+/// [0x28] mov  x8, #3          ; SYS_YIELD
+/// [0x2c] svc  #0              ; yield — let A retry sendblk "second"
+/// [0x30] mov  x8, #5          ; SYS_RECV (again)
+/// [0x34] movz x0, #0x100      ; buf_va low 16 bits
+/// [0x38] movk x0, #0x20, lsl #16
+/// [0x3c] mov  x1, #32         ; buf_len = 32
+/// [0x40] svc  #0              ; recv — gets "second"
+/// [0x44] mov  x8, #1          ; SYS_WRITE
+/// [0x48] mov  x0, #1          ; fd = stdout
+/// [0x4c] adr  x1, +0x24       ; buf -> 0x70 ("B: got2\n\r")
+/// [0x50] mov  x2, #9          ; len = 9
+/// [0x54] svc  #0              ; write "B: got2"
+/// [0x58] mov  x8, #2          ; SYS_EXIT
+/// [0x5c] svc  #0              ; exit
+/// [0x60] "B: recv2\n\r\0"    ; 10 bytes
+/// [0x70] "B: got2\n\r\0"     ; 9 bytes
+/// ```
+const TASK_SENDBLK_RECEIVER_BYTES: [u8; 128] = {
+    let mut buf = [0u8; 128];
+    // [0x00] mov x8, #1 = MOVZ x8, #1 = 0xD2800028
+    buf[0] = 0x28; buf[1] = 0x00; buf[2] = 0x80; buf[3] = 0xD2;
+    // [0x04] mov x0, #1 = MOVZ x0, #1 = 0xD2800020
+    buf[4] = 0x20; buf[5] = 0x00; buf[6] = 0x80; buf[7] = 0xD2;
+    // [0x08] adr x1, +0x58 (target 0x60, offset 88)
+    //   immlo = 88 & 3 = 0, immhi = 88 >> 2 = 22
+    //   = 0x10000000 | (0 << 29) | (22 << 5) | 1 = 0x100002C1
+    buf[8] = 0xC1; buf[9] = 0x02; buf[10] = 0x00; buf[11] = 0x10;
+    // [0x0c] mov x2, #10 = MOVZ x2, #10 = 0xD2800142
+    buf[12] = 0x42; buf[13] = 0x01; buf[14] = 0x80; buf[15] = 0xD2;
+    // [0x10] svc #0 = 0xD4000001
+    buf[16] = 0x01; buf[17] = 0x00; buf[18] = 0x00; buf[19] = 0xD4;
+    // [0x14] mov x8, #5 = MOVZ x8, #5 = 0xD28000A8
+    buf[20] = 0xA8; buf[21] = 0x00; buf[22] = 0x80; buf[23] = 0xD2;
+    // [0x18] movz x0, #0x100 = MOVZ x0, #0x100 = 0xD2802000
+    buf[24] = 0x00; buf[25] = 0x20; buf[26] = 0x80; buf[27] = 0xD2;
+    // [0x1c] movk x0, #0x20, lsl #16 = MOVK x0, #0x20, LSL #16 = 0xF2A00400
+    buf[28] = 0x00; buf[29] = 0x04; buf[30] = 0xA0; buf[31] = 0xF2;
+    // [0x20] mov x1, #32 = MOVZ x1, #32 = 0xD2800C21
+    buf[32] = 0x21; buf[33] = 0x0C; buf[34] = 0x80; buf[35] = 0xD2;
+    // [0x24] svc #0 = 0xD4000001
+    buf[36] = 0x01; buf[37] = 0x00; buf[38] = 0x00; buf[39] = 0xD4;
+    // [0x28] mov x8, #3 = MOVZ x8, #3 = 0xD2800068
+    buf[40] = 0x68; buf[41] = 0x00; buf[42] = 0x80; buf[43] = 0xD2;
+    // [0x2c] svc #0 = 0xD4000001
+    buf[44] = 0x01; buf[45] = 0x00; buf[46] = 0x00; buf[47] = 0xD4;
+    // [0x30] mov x8, #5 = MOVZ x8, #5 = 0xD28000A8
+    buf[48] = 0xA8; buf[49] = 0x00; buf[50] = 0x80; buf[51] = 0xD2;
+    // [0x34] movz x0, #0x100 = MOVZ x0, #0x100 = 0xD2802000
+    buf[52] = 0x00; buf[53] = 0x20; buf[54] = 0x80; buf[55] = 0xD2;
+    // [0x38] movk x0, #0x20, lsl #16 = 0xF2A00400
+    buf[56] = 0x00; buf[57] = 0x04; buf[58] = 0xA0; buf[59] = 0xF2;
+    // [0x3c] mov x1, #32 = MOVZ x1, #32 = 0xD2800C21
+    buf[60] = 0x21; buf[61] = 0x0C; buf[62] = 0x80; buf[63] = 0xD2;
+    // [0x40] svc #0 = 0xD4000001
+    buf[64] = 0x01; buf[65] = 0x00; buf[66] = 0x00; buf[67] = 0xD4;
+    // [0x44] mov x8, #1 = MOVZ x8, #1 = 0xD2800028
+    buf[68] = 0x28; buf[69] = 0x00; buf[70] = 0x80; buf[71] = 0xD2;
+    // [0x48] mov x0, #1 = MOVZ x0, #1 = 0xD2800020
+    buf[72] = 0x20; buf[73] = 0x00; buf[74] = 0x80; buf[75] = 0xD2;
+    // [0x4c] adr x1, +0x24 (target 0x70, offset 36)
+    //   immlo = 0, immhi = 9 = 0x10000121
+    buf[76] = 0x21; buf[77] = 0x01; buf[78] = 0x00; buf[79] = 0x10;
+    // [0x50] mov x2, #9 = MOVZ x2, #9 = 0xD2800122
+    buf[80] = 0x22; buf[81] = 0x01; buf[82] = 0x80; buf[83] = 0xD2;
+    // [0x54] svc #0 = 0xD4000001
+    buf[84] = 0x01; buf[85] = 0x00; buf[86] = 0x00; buf[87] = 0xD4;
+    // [0x58] mov x8, #2 = MOVZ x8, #2 = 0xD2800048
+    buf[88] = 0x48; buf[89] = 0x00; buf[90] = 0x80; buf[91] = 0xD2;
+    // [0x5c] svc #0 = 0xD4000001
+    buf[92] = 0x01; buf[93] = 0x00; buf[94] = 0x00; buf[95] = 0xD4;
+    // [0x60] "B: recv2\n\r\0" (10 bytes + NUL) at offset 96
+    buf[96] = b'B'; buf[97] = b':'; buf[98] = b' '; buf[99] = b'r';
+    buf[100] = b'e'; buf[101] = b'c'; buf[102] = b'v'; buf[103] = b'2';
+    buf[104] = b'\n'; buf[105] = b'\r'; buf[106] = 0x00;
+    // [0x70] "B: got2\n\r\0" (9 bytes + NUL) at offset 112
+    buf[112] = b'B'; buf[113] = b':'; buf[114] = b' '; buf[115] = b'g';
+    buf[116] = b'o'; buf[117] = b't'; buf[118] = b'2'; buf[119] = b'\n';
+    buf[120] = b'\r'; buf[121] = 0x00;
+    buf
+};
+
 // ---------------------------------------------------------------------------
 // Build the user address space
 // ---------------------------------------------------------------------------
@@ -1392,6 +1628,80 @@ pub fn drop_to_el0_blkipc() {
     drop_to_el0_with(root_pa);
 }
 
+/// Drop to EL0 with the M6 blocking-send demo: spawn a sender (task A)
+/// and a receiver (task B), each with its own user address space, and
+/// eret into task A. The sender sends "first" via `sendblk` (succeeds),
+/// then immediately sends "second" via `sendblk` — but B's mailbox is
+/// full, so A **blocks**. The scheduler switches to B. B calls `recv`,
+/// drains the mailbox (getting "first"), which wakes the blocked sender
+/// A. B yields, A retries its `sendblk` — the mailbox is now empty, so
+/// "second" lands. A writes "A: sent2" and exits. B runs, `recv`s
+/// "second", writes "B: got2" and exits.
+///
+/// This is the symmetric counterpart to `blkipc`: there the receiver
+/// slept on "mailbox empty" and the sender woke it; here the sender
+/// sleeps on "mailbox full" and the receiver wakes it. Together,
+/// `sendblk` and `recvblk` give M6's IPC a complete blocking pair — a
+/// task can wait in either direction without spinning or
+/// yield-and-retry. The `sendblk` monitor command proves it.
+pub fn drop_to_el0_sendblk() {
+    // ---- 1. Build two independent user address spaces ----
+    // SAFETY: single-core, MMU on, TTBR0 still the empty root.
+    let ttbr0_a = unsafe { build_task_user_space(0, &TASK_SENDBLK_SENDER_BYTES) };
+    let ttbr0_b = unsafe { build_task_user_space(1, &TASK_SENDBLK_RECEIVER_BYTES) };
+
+    // ---- 2. Spawn both tasks ----
+    // Task A (sender): TID 1. Task B (receiver): TID 2.
+    // SAFETY: single-core, interrupts masked (monitor context).
+    let tid_a = unsafe {
+        crate::sched::spawn(b"sdkA", ttbr0_a, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+    };
+    let tid_b = unsafe {
+        crate::sched::spawn(b"sdkB", ttbr0_b, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+    };
+
+    match (tid_a, tid_b) {
+        (Some(a), Some(b)) => {
+            println!(
+                "[kernel] M6 blocking send: spawned sender (TID {a}) and receiver (TID {b})"
+            );
+        }
+        _ => {
+            println!("[kernel] blocking send: failed to spawn tasks (table full?)");
+            return;
+        }
+    }
+
+    // ---- 3. Drop into task A (the sender) ----
+    let first = unsafe { crate::sched::scheduler() }.dequeue();
+    let first = match first {
+        Some(tid) => tid,
+        None => {
+            println!("[kernel] blocking send: ready queue empty after spawn?!");
+            return;
+        }
+    };
+
+    // SAFETY: first is a valid TID from the scheduler.
+    let t = match unsafe { crate::sched::task(first) } {
+        Some(t) => t,
+        None => {
+            println!("[kernel] blocking send: task {first} vanished?!");
+            return;
+        }
+    };
+    t.state = crate::sched::TaskState::Running;
+    let root_pa = t.ttbr0_pa;
+    unsafe { crate::sched::set_current_tid(first) };
+
+    println!(
+        "[kernel] dropping to EL0 — task {:?} (TID {first}), blocking send demo",
+        t.name_str()
+    );
+
+    drop_to_el0_with(root_pa);
+}
+
 /// Called when the user program exits and we return to EL1/monitor.
 /// The `__el0_return` trampoline in vectors.rs jumps here.
 #[unsafe(no_mangle)]
@@ -1671,6 +1981,101 @@ pub fn handle_svc_from_el0(frame: &mut super::vectors::TrapFrame) {
                     // re-enters the svc (ELR was rewound), comes back
                     // here, and finds the message waiting. Don't touch
                     // the frame — it holds the next task's context.
+                }
+            }
+        }
+        SYS_SENDBLK => {
+            // sendblk(dst_tid, buf, len): blocking send. Like SYS_SEND
+            // but if the receiver's mailbox is full, the sender is put
+            // to sleep (Blocked) instead of returning -EAGAIN. When the
+            // receiver drains its mailbox (via recv or recvblk), the
+            // kernel wakes the blocked sender (wake_blocked_senders)
+            // and it retries — its message now fits.
+            //
+            // The "retry the syscall on wake" trick is the same as
+            // recvblk: we rewind ELR by 4 before blocking so the svc
+            // re-executes on wake, and the second time through the
+            // mailbox is empty (the receiver drained it) so the send
+            // succeeds. This is the mirror image of recvblk: there the
+            // receiver sleeps on "empty," here the sender sleeps on
+            // "full." Together they form a complete blocking IPC pair.
+            let dst_tid = frame.x[0] as usize;
+            let buf_va = frame.x[1] as usize;
+            let len = frame.x[2] as usize;
+
+            if len == 0 {
+                frame.x[0] = 0;
+                return;
+            }
+            let len = len.min(crate::sched::MSG_MAX);
+
+            // Read the user buffer into a kernel-local copy. We must
+            // read it *before* blocking, because the user VA is in the
+            // *sender's* address space — once we switch to the receiver
+            // (and possibly other tasks), TTBR0 changes and the VA is
+            // no longer valid. The kernel keeps the message in the
+            // sender's TCB (on the stack here, then in blocked_send_dst's
+            // "pending" if we block) until it lands in the mailbox.
+            // We can't stash it in the TCB yet (no field for the pending
+            // payload), so we re-read from the user buffer on retry —
+            // but on retry we're back in the sender's address space, so
+            // the VA is valid again. The read below is always from the
+            // sender's own space.
+            let mut msg = [0u8; crate::sched::MSG_MAX];
+            for i in 0..len {
+                msg[i] =
+                    unsafe { core::ptr::with_exposed_provenance::<u8>(buf_va + i).read_volatile() };
+            }
+
+            // Try the non-blocking send first.
+            // SAFETY: exception context, single-core, DAIF set.
+            match unsafe { crate::sched::ipc_send(dst_tid, &msg[..len]) } {
+                Ok(()) => {
+                    frame.x[0] = 0; // success
+                }
+                Err(e) if e == -11 => {
+                    // -EAGAIN: mailbox full. Block the sender and
+                    // switch to the next task. Record which receiver
+                    // we're blocked on so wake_blocked_senders can
+                    // find us when it drains.
+                    let cur = crate::sched::current_tid();
+                    if cur == 0 {
+                        // Kernel can't block — return the error.
+                        frame.x[0] = e as u64;
+                        return;
+                    }
+                    // Record the blocked-send destination and mark
+                    // the task as Blocked-on-send. The recv handler
+                    // scans for this.
+                    // SAFETY: exception context, single-core.
+                    if let Some(t) = unsafe { crate::sched::task(cur) } {
+                        t.blocked_send_dst = dst_tid;
+                    }
+
+                    // Rewind ELR by 4 so the svc re-executes on wake.
+                    frame.elr = frame.elr.wrapping_sub(4);
+
+                    // SAFETY: exception context, single-core, DAIF set.
+                    let switched = unsafe { crate::sched::block_and_switch(frame) };
+                    if !switched {
+                        // Nobody else to run — can't block. Restore
+                        // ELR, clear the flag, return -EAGAIN.
+                        frame.elr = frame.elr.wrapping_add(4);
+                        if let Some(t) = unsafe { crate::sched::task(cur) } {
+                            t.blocked_send_dst = 0;
+                        }
+                        frame.x[0] = (-11i64) as u64; // -EAGAIN
+                    }
+                    // If switched: we're running the next task now.
+                    // When this task is woken (the receiver drained its
+                    // mailbox), it re-enters the svc, re-reads the user
+                    // buffer (from its own address space, now valid
+                    // again), and retries the send — which succeeds
+                    // because the mailbox is now empty.
+                }
+                Err(e) => {
+                    // -ESRCH: no such task. Return the error.
+                    frame.x[0] = e as u64;
                 }
             }
         }

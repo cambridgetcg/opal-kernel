@@ -122,6 +122,17 @@ pub struct Task {
     /// 0 = no sender (mailbox empty or never received). Returned to
     /// the receiver so it knows who said hello.
     pub mailbox_from: usize,
+    /// If this task is Blocked in a `sendblk` (blocking send), this is
+    /// the TID of the receiver it was trying to send to. 0 = not
+    /// blocked on a send. Set by the SYS_SENDBLK handler before
+    /// calling `block_and_switch`; cleared by `wake_blocked_senders`
+    /// when the receiver drains its mailbox and wakes us. The
+    /// receiver's `recv` scans the task table for Blocked tasks with
+    /// `blocked_send_dst` == its own TID and wakes them — the same
+    /// "the kernel is the intermediary" pattern as recvblk, just
+    /// mirrored: the sender sleeps on "mailbox full" instead of the
+    /// receiver sleeping on "mailbox empty."
+    pub blocked_send_dst: usize,
 }
 
 impl Task {
@@ -136,6 +147,7 @@ impl Task {
             mailbox: [0; 32],
             mailbox_len: 0,
             mailbox_from: 0,
+            blocked_send_dst: 0,
         }
     }
 
@@ -454,7 +466,54 @@ pub unsafe fn ipc_recv(buf: &mut [u8]) -> Result<(usize, usize), i64> {
     let from = t.mailbox_from;
     t.mailbox_len = 0;
     t.mailbox_from = 0;
+
+    // M6 blocking send: now that the mailbox is drained, wake any task
+    // that was blocked in a sendblk waiting for this mailbox to empty.
+    // The sender retries its syscall on wake (ELR was rewound by 4) and
+    // finds the mailbox empty — its message fits this time. This is the
+    // mirror image of recvblk: there the sender wakes the receiver; here
+    // the receiver wakes the sender. The kernel is the intermediary in
+    // both directions.
+    unsafe { wake_blocked_senders(cur) };
+
     Ok((n, from))
+}
+
+/// Scan the task table for tasks Blocked on a `sendblk` to `recv_tid` and
+/// wake them (Ready, enqueued). Called by `ipc_recv` after it drains the
+/// mailbox — the space is now free, so a blocked sender's retry will
+/// succeed.
+///
+/// A blocked sender's `blocked_send_dst` names the receiver whose mailbox
+/// was full; we wake it if that receiver is `recv_tid` (the task that just
+/// drained its mailbox). Multiple senders could be blocked on the same
+/// receiver (rare with 8 task slots, but honest to handle); we wake all of
+/// them — the first to run gets the empty mailbox, the rest re-block if
+/// it fills again. This is the classic "thundering herd" trade-off in
+/// miniature; a real OS would queue them, but here waking-all-then-re-block
+/// is simpler and the scale is tiny.
+///
+/// # Safety
+/// Single-core, interrupts masked (called from the SVC handler at
+/// EL1, DAIF set by exception entry).
+pub unsafe fn wake_blocked_senders(recv_tid: usize) {
+    for tid in 1..MAX_TASKS {
+        // SAFETY: tid is in bounds; single-core, no concurrent access.
+        let t = unsafe { &raw mut TASK_TABLE[tid] };
+        // SAFETY: dereferencing in-bounds pointer; read of two usizes.
+        if unsafe { (*t).state } == TaskState::Blocked
+            && unsafe { (*t).blocked_send_dst } == recv_tid
+        {
+            // SAFETY: same invariant; clearing the flag and transitioning
+            // to Ready. The task will retry its sendblk syscall on resume.
+            unsafe {
+                (*t).blocked_send_dst = 0;
+                (*t).state = TaskState::Ready;
+            }
+            // SAFETY: SCHEDULER is a separate static; single-core.
+            unsafe { scheduler() }.enqueue(tid);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -542,6 +542,9 @@ pub fn run_command(line: &[u8]) {
             println!(
                 "  blkipc          M6: blocking IPC — receiver blocks on recvblk, sender wakes it"
             );
+            println!(
+                "  sendblk         M6: blocking send — sender blocks on sendblk, receiver wakes it"
+            );
         }
         "brk" => {
             arch::aarch64::vectors::demo_brk();
@@ -833,6 +836,21 @@ pub fn run_command(line: &[u8]) {
             // uses for blocking read()/wait()/futex. Like `ipc`, this
             // does not return to this monitor loop.
             arch::aarch64::user::drop_to_el0_blkipc();
+        }
+        "sendblk" => {
+            // M6: blocking send demo. Like `ipc` but the sender calls
+            // SYS_SENDBLK (blocking send, syscall 7) instead of SYS_SEND.
+            // A sends "first" (succeeds), then immediately sends "second"
+            // — but B's mailbox is full, so A blocks. The scheduler
+            // switches to B, which calls recv (drains "first"), waking A.
+            // B yields, A retries sendblk — the mailbox is empty now, so
+            // "second" lands. A writes "A: sent2" and exits; B recv's
+            // "second", writes "B: got2" and exits. This is the symmetric
+            // counterpart to blkipc: there the receiver slept on
+            // "mailbox empty"; here the sender sleeps on "mailbox full."
+            // Together they give M6's IPC a complete blocking pair.
+            // Like `blkipc`, this does not return to this monitor loop.
+            arch::aarch64::user::drop_to_el0_sendblk();
         }
         other => println!("unknown command {other:?} - try 'help'"),
     }
