@@ -818,7 +818,8 @@ fn handle_sync_from_el0(frame: &mut TrapFrame, kind: Kind, source: Source) {
             println!("  status  : {}", fault_status(dfsc));
             println!("  verdict : user task killed — the kernel survives its first serviced fault.");
             println!("            (In a real OS this would kill the task, not the kernel. Now it does.)");
-            super::user::kill_task_on_fault();
+            kill_task_from_el0(frame);
+            return;
         }
         EC_IABT_LOWER_EL => {
             let ifsc = frame.esr & 0x3f;
@@ -833,7 +834,8 @@ fn handle_sync_from_el0(frame: &mut TrapFrame, kind: Kind, source: Source) {
             );
             println!("  status  : {}", fault_status(ifsc));
             println!("  verdict : user task killed — attempted to execute an unmapped/forbidden address.");
-            super::user::kill_task_on_fault();
+            kill_task_from_el0(frame);
+            return;
         }
         _ => {
             report(
@@ -846,9 +848,46 @@ fn handle_sync_from_el0(frame: &mut TrapFrame, kind: Kind, source: Source) {
                 ),
             );
             println!("  verdict : user task killed — unhandled EL0 exception.");
-            super::user::kill_task_on_fault();
+            kill_task_from_el0(frame);
+            return;
         }
     }
+}
+
+/// Kill the faulting EL0 task and either resume the scheduler (if there
+/// is another Ready task) or return to the monitor (if all tasks are
+/// dead). This is the M6 evolution of M5's `kill_task_on_fault`:
+///
+/// - M5: one task faults → kernel returns to monitor (kills the whole
+///   "OS" because there was only one task).
+/// - M6: one task faults → kernel kills *that task*, marks its slot
+///   Exited, and switches to the next Ready task. The OS keeps running.
+///
+/// If `kill_current_task` returns `true`, the frame now holds the next
+/// task's saved context and `__vectors_restore` will eret to it. If it
+/// returns `false`, there are no more tasks — we disable preemption,
+/// condemn TTBR0, and return to the monitor via `on_el0_return`.
+///
+/// The `oops_exit()` call in `exception_dispatch`'s tail runs on the
+/// normal return path (after `kill_task_from_el0` returns). When we
+/// switch to a new task, we return through the same path — `oops_exit`
+/// is safe because the emergency flag is per-CPU and we're still at EL1
+/// in the exception handler.
+fn kill_task_from_el0(frame: &mut TrapFrame) {
+    // SAFETY: we are in an exception handler (DAIF set by hardware on
+    // exception entry), single-core, no concurrent access. The frame
+    // is the on-stack TrapFrame the stub built.
+    let switched = unsafe { crate::sched::kill_current_task(frame) };
+    if !switched {
+        // No more tasks — return to the monitor. Disable preemption
+        // (timer may still be armed) and condemn the user address space.
+        crate::sched::preempt_off();
+        crate::arch::aarch64::mmu::condemn_low_half();
+        crate::arch::aarch64::user::return_to_monitor();
+    }
+    // If switched: the frame now holds the next task's context. We
+    // return through exception_dispatch → oops_exit → __vectors_restore,
+    // which erets to the new task. The OS keeps running.
 }
 
 // ---------------------------------------------------------------------------

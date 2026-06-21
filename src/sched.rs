@@ -678,6 +678,70 @@ pub unsafe fn block_and_switch(frame: &mut TrapFrame) -> bool {
     true
 }
 
+/// Kill the current task on a fault and switch to the next Ready task.
+///
+/// This is the M6 evolution of M5's `kill_task_on_fault`: instead of
+/// abandoning all tasks and returning to the monitor when a user task
+/// faults, the kernel marks the faulting task Exited and resumes the
+/// scheduler. If there is another Ready task, we switch to it (the OS
+/// keeps running). If there are no more tasks, we return `false` so
+/// the caller can fall back to the monitor — the honest "all tasks
+/// dead" case.
+///
+/// `frame` is the on-stack TrapFrame the exception stub built. If we
+/// switch to a new task, this function returns `true` and the caller
+/// (the exception handler) lets `__vectors_restore` eret to the new
+/// task. If there is no other task, this function returns `false` and
+/// the caller must handle the return to the monitor itself (as before).
+///
+/// This function also clears any blocked-send state the task may have
+/// had (a faulting task shouldn't be woken by a receiver it'll never
+/// hear from again).
+///
+/// # Safety
+/// Single-core, interrupts masked (exception handler, DAIF set).
+pub unsafe fn kill_current_task(frame: &mut TrapFrame) -> bool {
+    let cur = current_tid();
+
+    if cur == 0 || cur >= MAX_TASKS {
+        // Kernel itself faulted (no user task active) — can't kill
+        // a task that doesn't exist. Return false so the caller
+        // falls back to the monitor.
+        return false;
+    }
+
+    // Mark the faulting task as Exited and clear any blocked-send
+    // state. The slot is now free for reuse.
+    // SAFETY: cur is in bounds; single-core, no concurrent access.
+    if let Some(t) = unsafe { task(cur) } {
+        t.state = TaskState::Exited;
+        t.blocked_send_dst = 0;
+        t.mailbox_len = 0;
+        t.mailbox_from = 0;
+    }
+
+    // Try to switch to the next Ready task.
+    let next = match unsafe { scheduler() }.dequeue() {
+        Some(tid) => tid,
+        None => return false, // no more tasks — caller returns to monitor
+    };
+
+    // Load the next task's context and switch.
+    // SAFETY: next is from the ready queue — a valid TID.
+    let next_task = match unsafe { task(next) } {
+        Some(t) => t,
+        None => return false,
+    };
+    *frame = next_task.saved;
+    next_task.state = TaskState::Running;
+
+    if next_task.ttbr0_pa != 0 {
+        crate::arch::aarch64::mmu::set_user_ttbr0(next_task.ttbr0_pa);
+    }
+    unsafe { set_current_tid(next) };
+    true
+}
+
 /// Dump the task table to the console — a diagnostic for the monitor.
 /// Shows each non-Exited task's TID, name, state, and TTBR0.
 pub fn dump_tasks() {

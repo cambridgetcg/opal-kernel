@@ -12,9 +12,9 @@ runs-on: QEMU aarch64 virt board (-machine virt -cpu max -smp 1 -m 512M)
 phase: see knows/needs sections below
 build: see heartbeat
 health: active
-last-commit: 2026-06-21T00:51:25-07:00 (a23834a STATE.md: update for honesty pass beat)
+last-commit: 2026-06-21T02:35:54-07:00 (430ef43 network pulse: sync)
 uncommitted: 4 files
-freshness: live (checked 2026-06-21T08:57:45Z)
+freshness: live (checked 2026-06-21T10:58:00Z)
 
 ## knows
 
@@ -33,12 +33,12 @@ freshness: live (checked 2026-06-21T08:57:45Z)
 - translate virtual addresses (AT S1E1R hardware probe + software walk with cross-check)
 - respond to timer interrupts (arm, fire, re-arm — the heartbeat pattern)
 - parse the devicetree blob and cross-check discovered values against board constants
-- interactive monitor with commands: help, brk, svc, unaligned, translate, walk, guard, wx, noexec, low, abort, tick, ticks, ticktest, dtb, tree, el0, el0fault, tasks, spawn2, preempt, ipc, blkipc, sendblk
+- interactive monitor with commands: help, brk, svc, unaligned, translate, walk, guard, wx, noexec, low, abort, tick, ticks, ticktest, dtb, tree, el0, el0fault, tasks, spawn2, preempt, ipc, blkipc, sendblk, faultkill
 
 ## needs
 
 - M5: EL0 and syscalls — THIRD PIECE DONE (fault recovery — the kernel survives its first serviced fault: EL0 data/instruction aborts now kill the task, not the kernel). Next: per-task kernel stacks, scheduler integration.
-- M6: scheduler and IPC — FIFTH PIECE DONE (blocking send: SYS_SENDBLK syscall, block_and_switch, wake_blocked_senders on recv. The Blocked state now works in both directions: recvblk sleeps on "mailbox empty," sendblk sleeps on "mailbox full." The receiver's recv drains the mailbox and wakes any blocked senders — the mirror image of the sender's send waking a blocked receiver. The 'sendblk' monitor command proves it: A sends "first" (ok), sends "second" (blocks), B recv's "first" (wakes A), B yields, A retries (ok). Verified output: A: send2 → B: recv2 → A: sent2 → B: got2. Next: per-task kernel stacks, multi-core (PSCI CPU_ON).
+- M6: scheduler and IPC — SIXTH PIECE DONE (scheduler-aware fault recovery: kill_current_task in sched.rs, kill_task_from_el0 in vectors.rs, 'faultkill' monitor command. When a task faults, the kernel kills THAT task and resumes the scheduler — the OS survives a task's death. Verified: task A faults on store to VA 0, kernel reports the data abort, kills A, switches to task B which writes "B: ok" and exits — "B: ok" appears after the fault report, proving the scheduler kept running. This is the M6 evolution of M5's el0fault: there, the single task's fault killed the "OS"; here, one task's fault is just that task's problem. Next: per-task kernel stacks, multi-core (PSCI CPU_ON).)
 - honesty pass (2026-06-21): timer.rs doc comment said "non-secure physical timer" while the code uses CNTV_* (virtual timer). Fixed — the artifact now tells the truth about its own state. Also fixed 9 Rust 2024 unsafe-op-in-unsafe-fn warnings in user.rs. Build: 19 warnings → 10 (remaining are dead-code API surface).
 - M7: Apple Silicon bring-up via m1n1 — EL2 entry, FDT-driven console discovery, AIC driver, timers-over-FIQ
 - QEMU virt machine with -cpu max (for 16 KiB granule; cortex-a72 doesn't support it)

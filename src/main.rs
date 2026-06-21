@@ -545,6 +545,9 @@ pub fn run_command(line: &[u8]) {
             println!(
                 "  sendblk         M6: blocking send — sender blocks on sendblk, receiver wakes it"
             );
+            println!(
+                "  faultkill       M6: scheduler-aware fault recovery — task faults, kernel kills it, OS keeps running"
+            );
         }
         "brk" => {
             arch::aarch64::vectors::demo_brk();
@@ -851,6 +854,17 @@ pub fn run_command(line: &[u8]) {
             // Together they give M6's IPC a complete blocking pair.
             // Like `blkipc`, this does not return to this monitor loop.
             arch::aarch64::user::drop_to_el0_sendblk();
+        }
+        "faultkill" => {
+            // M6: scheduler-aware fault recovery. Spawn two tasks where
+            // task A deliberately faults (stores to unmapped VA 0). The
+            // kernel kills task A and resumes the scheduler, which runs
+            // task B. Task B writes "B: ok" and exits - proof that the
+            // OS survived task A's death. This is the M6 evolution of
+            // M5's `el0fault`: there, the single task's fault killed
+            // the "OS"; here, one task's fault is just that task's
+            // problem, and the scheduler keeps running.
+            arch::aarch64::user::drop_to_el0_faultkill();
         }
         other => println!("unknown command {other:?} - try 'help'"),
     }

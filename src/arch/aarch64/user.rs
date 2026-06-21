@@ -1042,8 +1042,99 @@ const TASK_SENDBLK_RECEIVER_BYTES: [u8; 128] = {
     buf
 };
 
-// ---------------------------------------------------------------------------
-// Build the user address space
+/// The M6 scheduler-aware fault-recovery demo: two tasks where one
+/// deliberately faults. The kernel kills the faulting task and keeps
+/// running the survivor - the OS doesn't die when a task dies.
+///
+/// Task A (the faulting task) writes "A: alive", then immediately
+/// stores to unmapped VA 0 - a data abort from EL0. The exception
+/// handler calls `kill_current_task`, which marks task A Exited and
+/// switches to task B. Task B (the survivor, already queued Ready
+/// from spawn) writes "B: ok" and exits.
+///
+/// The key moment: after the fault report, B's output appears - proof
+/// that the kernel killed *task A* and resumed the *scheduler*, not
+/// returned to the monitor. This is the M6 evolution of M5's
+/// `el0fault` command: there, the single task's fault killed the
+/// "OS"; here, one task's fault is just that task's problem.
+///
+/// Task A layout (code 0x00..0x14, data 0x18 onward):
+/// - [0x00] mov x8, #1 (SYS_WRITE), [0x04] mov x0, #1 (stdout)
+/// - [0x08] adr x1, +0x10 -> 0x18 ("A: alive\n\r"), [0x0c] mov x2, #10
+/// - [0x10] svc #0 (write "A: alive")
+/// - [0x14] mov x0, #0 (unmapped VA), [0x18] str x1, [x0] (DATA ABORT)
+/// - [0x1c] (never reached)
+/// - [0x18] "A: alive\n\r\0" (10 bytes, overlaps with 0x18 instruction
+///   region but the store faults before executing 0x18; the data at
+///   0x18 is the string, but the code at 0x14-0x17 sets x0=0 and
+///   0x18-0x1b is str x1,[x0] which faults)
+///
+/// Wait - that overlaps. Let me fix: code is 0x00..0x1c, data at 0x20:
+/// - [0x00] mov x8, #1, [0x04] mov x0, #1
+/// - [0x08] adr x1, +0x18 -> 0x20 ("A: alive\n\r"), [0x0c] mov x2, #10
+/// - [0x10] svc #0 (write "A: alive")
+/// - [0x14] mov x0, #0 (unmapped VA)
+/// - [0x18] str x1, [x0] (DATA ABORT - never completes)
+/// - [0x1c] padding
+/// - [0x20] "A: alive\n\r\0"
+///
+/// Task B layout (code 0x00..0x1c, data 0x24 onward):
+/// - [0x00] mov x8, #1 (SYS_WRITE), [0x04] mov x0, #1 (stdout)
+/// - [0x08] adr x1, +0x1c -> 0x24 ("B: ok\n\r"), [0x0c] mov x2, #7
+/// - [0x10] svc #0 (write "B: ok")
+/// - [0x14] mov x8, #2 (SYS_EXIT), [0x18] svc #0 (exit)
+/// - [0x1c] padding
+/// - [0x24] "B: ok\n\r\0"
+const TASK_FAULTKILL_A_BYTES: [u8; 64] = {
+    let mut buf = [0u8; 64];
+    // [0x00] mov x8, #1 = MOVZ x8, #1 = 0xD2800028
+    buf[0] = 0x28; buf[1] = 0x00; buf[2] = 0x80; buf[3] = 0xD2;
+    // [0x04] mov x0, #1 = MOVZ x0, #1 = 0xD2800020
+    buf[4] = 0x20; buf[5] = 0x00; buf[6] = 0x80; buf[7] = 0xD2;
+    // [0x08] adr x1, +0x14 (target 0x1c, offset 0x14 = 20)
+    //   immlo = 20 & 3 = 0, immhi = 20 >> 2 = 5
+    //   = 0x10000000 | (0 << 29) | (5 << 5) | 1 = 0x100000A1
+    buf[8] = 0xA1; buf[9] = 0x00; buf[10] = 0x00; buf[11] = 0x10;
+    // [0x0c] mov x2, #10 = MOVZ x2, #10 = 0xD2800142
+    buf[12] = 0x42; buf[13] = 0x01; buf[14] = 0x80; buf[15] = 0xD2;
+    // [0x10] svc #0 = 0xD4000001
+    buf[16] = 0x01; buf[17] = 0x00; buf[18] = 0x00; buf[19] = 0xD4;
+    // [0x14] mov x0, #0 = MOVZ x0, #0 = 0xD2800000
+    buf[20] = 0x00; buf[21] = 0x00; buf[22] = 0x80; buf[23] = 0xD2;
+    // [0x18] str x1, [x0] = STR x1, [x0, #0] = 0xF9000001
+    buf[24] = 0x01; buf[25] = 0x00; buf[26] = 0x00; buf[27] = 0xF9;
+    // [0x1c] "A: alive\n\r\0" (10 bytes + NUL) at offset 28
+    buf[28] = b'A'; buf[29] = b':'; buf[30] = b' '; buf[31] = b'a';
+    buf[32] = b'l'; buf[33] = b'i'; buf[34] = b'v'; buf[35] = b'e';
+    buf[36] = b'\n'; buf[37] = b'\r'; buf[38] = 0x00;
+    buf
+};
+
+const TASK_FAULTKILL_B_BYTES: [u8; 64] = {
+    let mut buf = [0u8; 64];
+    // [0x00] mov x8, #1 = MOVZ x8, #1 = 0xD2800028
+    buf[0] = 0x28; buf[1] = 0x00; buf[2] = 0x80; buf[3] = 0xD2;
+    // [0x04] mov x0, #1 = MOVZ x0, #1 = 0xD2800020
+    buf[4] = 0x20; buf[5] = 0x00; buf[6] = 0x80; buf[7] = 0xD2;
+    // [0x08] adr x1, +0x1c (target 0x24, offset 0x1c = 28)
+    //   immlo = 28 & 3 = 0, immhi = 28 >> 2 = 7
+    //   = 0x10000000 | (0 << 29) | (7 << 5) | 1 = 0x100000E1
+    buf[8] = 0xE1; buf[9] = 0x00; buf[10] = 0x00; buf[11] = 0x10;
+    // [0x0c] mov x2, #7 = MOVZ x2, #7 = 0xD28000E2
+    buf[12] = 0xE2; buf[13] = 0x00; buf[14] = 0x80; buf[15] = 0xD2;
+    // [0x10] svc #0 = 0xD4000001
+    buf[16] = 0x01; buf[17] = 0x00; buf[18] = 0x00; buf[19] = 0xD4;
+    // [0x14] mov x8, #2 = MOVZ x8, #2 = 0xD2800048
+    buf[20] = 0x48; buf[21] = 0x00; buf[22] = 0x80; buf[23] = 0xD2;
+    // [0x18] svc #0 = 0xD4000001
+    buf[24] = 0x01; buf[25] = 0x00; buf[26] = 0x00; buf[27] = 0xD4;
+    // [0x1c] padding (4 bytes)
+    // [0x24] "B: ok\n\r\0" (7 bytes) at offset 36
+    buf[36] = b'B'; buf[37] = b':'; buf[38] = b' '; buf[39] = b'o';
+    buf[40] = b'k'; buf[41] = b'\n'; buf[42] = b'\r'; buf[43] = 0x00;
+    buf
+};
+
 // ---------------------------------------------------------------------------
 
 /// Build the user page tables and populate the user code page. Called
@@ -1704,7 +1795,73 @@ pub fn drop_to_el0_sendblk() {
     drop_to_el0_with(root_pa);
 }
 
-/// Called when the user program exits and we return to EL1/monitor.
+/// Drop to EL0 with the M6 scheduler-aware fault-recovery demo: spawn
+/// two tasks where task A deliberately faults (stores to unmapped VA 0).
+/// The kernel kills task A and resumes the scheduler, which runs task B.
+/// Task B writes "B: ok" and exits - proof that the OS survived task A's
+/// death. This is the M6 evolution of M5's `el0fault`: there, the single
+/// task's fault killed the "OS"; here, one task's fault is just that
+/// task's problem, and the scheduler keeps running.
+///
+/// Like `spawn2`, this does not return to the monitor loop - control
+/// comes back via `on_el0_return` when the last task (B) exits.
+pub fn drop_to_el0_faultkill() {
+    // ---- 1. Build two independent user address spaces ----
+    // SAFETY: single-core, MMU on, TTBR0 still the empty root.
+    let ttbr0_a = unsafe { build_task_user_space(0, &TASK_FAULTKILL_A_BYTES) };
+    let ttbr0_b = unsafe { build_task_user_space(1, &TASK_FAULTKILL_B_BYTES) };
+
+    // ---- 2. Spawn both tasks ----
+    // Task A (faulting): TID 1. Task B (survivor): TID 2.
+    // SAFETY: single-core, interrupts masked (monitor context).
+    let tid_a = unsafe {
+        crate::sched::spawn(b"ftkA", ttbr0_a, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+    };
+    let tid_b = unsafe {
+        crate::sched::spawn(b"ftkB", ttbr0_b, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+    };
+
+    match (tid_a, tid_b) {
+        (Some(a), Some(b)) => {
+            println!(
+                "[kernel] M6 fault-kill: spawned faulting task (TID {a}) and survivor (TID {b})"
+            );
+        }
+        _ => {
+            println!("[kernel] fault-kill: failed to spawn tasks (table full?)");
+            return;
+        }
+    }
+
+    // ---- 3. Drop into task A (the faulting task) ----
+    let first = unsafe { crate::sched::scheduler() }.dequeue();
+    let first = match first {
+        Some(tid) => tid,
+        None => {
+            println!("[kernel] fault-kill: ready queue empty after spawn?!");
+            return;
+        }
+    };
+
+    // SAFETY: first is a valid TID from the scheduler.
+    let t = match unsafe { crate::sched::task(first) } {
+        Some(t) => t,
+        None => {
+            println!("[kernel] fault-kill: task {first} vanished?!");
+            return;
+        }
+    };
+    t.state = crate::sched::TaskState::Running;
+    let root_pa = t.ttbr0_pa;
+    unsafe { crate::sched::set_current_tid(first) };
+
+    println!(
+        "[kernel] dropping to EL0 - task {:?} (TID {first}), fault-kill demo",
+        t.name_str()
+    );
+
+    drop_to_el0_with(root_pa);
+}
 /// The `__el0_return` trampoline in vectors.rs jumps here.
 #[unsafe(no_mangle)]
 extern "C" fn on_el0_return() -> ! {
@@ -1745,6 +1902,19 @@ extern "C" fn on_el0_return() -> ! {
     }
 }
 
+/// Return to the monitor after all user tasks have exited or been
+/// killed. This is the shared "back to EL1" path used by:
+/// - `on_el0_return` (clean exit via syscall)
+/// - `kill_task_from_el0` (fault recovery when no tasks remain)
+///
+/// Condemns TTBR0 (restores the empty root so no stale user translations
+/// linger), disables preemption, and re-enters the monitor loop.
+pub fn return_to_monitor() -> ! {
+    crate::sched::preempt_off();
+    mmu::condemn_low_half();
+    on_el0_return();
+}
+
 /// Kill the current user task on a fault and return to the monitor.
 ///
 /// This is M5's fault *service*: the kernel's first real recovery from
@@ -1755,9 +1925,11 @@ extern "C" fn on_el0_return() -> ! {
 /// `exit` does. The fault is reported by the caller; this function just
 /// performs the recovery.
 ///
-/// M6 will replace this with a real task-kill that cleans up per-task
-/// state (kernel stack, scheduler entry). For the single-task kernel the
-/// distinction is invisible: there is one task, it faulted, it is gone.
+/// M6 replaces this with scheduler-aware fault recovery: see
+/// `kill_task_from_el0` in vectors.rs, which kills the faulting task
+/// and resumes the scheduler if another task is Ready. This function
+/// is kept for the single-task `el0fault` monitor command (where there
+/// is no scheduler to resume — the one task died, the OS is done).
 pub fn kill_task_on_fault() -> ! {
     // Tear down the user address space: restore TTBR0 to the empty root
     // so no stale user translations linger. Same path as a clean exit.
