@@ -210,8 +210,8 @@ static mut TASK_MEM_B: UserTaskMem = UserTaskMem {
 /// `slot` must be 0 or 1. Single-core, no concurrent access.
 unsafe fn task_mem(slot: usize) -> *mut UserTaskMem {
     match slot {
-        0 => unsafe { &raw mut TASK_MEM_A },
-        1 => unsafe { &raw mut TASK_MEM_B },
+        0 => &raw mut TASK_MEM_A,
+        1 => &raw mut TASK_MEM_B,
         _ => unreachable!("only 2 per-task address spaces exist"),
     }
 }
@@ -1084,14 +1084,12 @@ fn build_user_space_with(prog: &[u8]) -> u64 {
 
     // ---- 2. Physical addresses of the user pages and tables ----
     // SAFETY: address-taking only (no reads/writes) on static muts.
-    let code_pa =
-        mmu::virt_to_phys(unsafe { &raw const USER_CODE_PAGE }.expose_provenance()) as u64;
-    let stack_pa =
-        mmu::virt_to_phys(unsafe { &raw const USER_STACK_PAGE }.expose_provenance()) as u64;
-    let l0_pa = mmu::virt_to_phys(unsafe { &raw const USER_TABLES.l0 }.expose_provenance()) as u64;
-    let l1_pa = mmu::virt_to_phys(unsafe { &raw const USER_TABLES.l1 }.expose_provenance()) as u64;
-    let l2_pa = mmu::virt_to_phys(unsafe { &raw const USER_TABLES.l2 }.expose_provenance()) as u64;
-    let l3_pa = mmu::virt_to_phys(unsafe { &raw const USER_TABLES.l3 }.expose_provenance()) as u64;
+    let code_pa = mmu::virt_to_phys(unsafe { &raw const USER_CODE_PAGE } as *const _ as usize) as u64;
+    let stack_pa = mmu::virt_to_phys(unsafe { &raw const USER_STACK_PAGE } as *const _ as usize) as u64;
+    let l0_pa = mmu::virt_to_phys(unsafe { &raw const USER_TABLES.l0 } as *const _ as usize) as u64;
+    let l1_pa = mmu::virt_to_phys(unsafe { &raw const USER_TABLES.l1 } as *const _ as usize) as u64;
+    let l2_pa = mmu::virt_to_phys(unsafe { &raw const USER_TABLES.l2 } as *const _ as usize) as u64;
+    let l3_pa = mmu::virt_to_phys(unsafe { &raw const USER_TABLES.l3 } as *const _ as usize) as u64;
 
     // SAFETY: same invariant — we write the tables via their high
     // aliases; the walker is not looking at them.
@@ -1131,13 +1129,17 @@ unsafe fn build_task_user_space(slot: usize, prog: &[u8]) -> u64 {
     }
 
     // ---- 2. Physical addresses of the task's pages and tables ----
-    // SAFETY: address-taking only; all within the UserTaskMem.
-    let code_pa = mmu::virt_to_phys(core::ptr::addr_of!((*mem).code) as usize) as u64;
-    let stack_pa = mmu::virt_to_phys(core::ptr::addr_of!((*mem).stack) as usize) as u64;
-    let l0_pa = mmu::virt_to_phys(core::ptr::addr_of!((*mem).l0) as usize) as u64;
-    let l1_pa = mmu::virt_to_phys(core::ptr::addr_of!((*mem).l1) as usize) as u64;
-    let l2_pa = mmu::virt_to_phys(core::ptr::addr_of!((*mem).l2) as usize) as u64;
-    let l3_pa = mmu::virt_to_phys(core::ptr::addr_of!((*mem).l3) as usize) as u64;
+    // SAFETY: address-taking only (no reads/writes) on the UserTaskMem
+    // fields, through a valid raw pointer. The `addr_of!` does not
+    // dereference — it computes the field's address — but Rust 2024's
+    // `unsafe_op_in_unsafe_fn` lint still requires an `unsafe` block
+    // because `*mem` is a raw-pointer dereference in the expression.
+    let code_pa = mmu::virt_to_phys(unsafe { core::ptr::addr_of!((*mem).code) } as usize) as u64;
+    let stack_pa = mmu::virt_to_phys(unsafe { core::ptr::addr_of!((*mem).stack) } as usize) as u64;
+    let l0_pa = mmu::virt_to_phys(unsafe { core::ptr::addr_of!((*mem).l0) } as usize) as u64;
+    let l1_pa = mmu::virt_to_phys(unsafe { core::ptr::addr_of!((*mem).l1) } as usize) as u64;
+    let l2_pa = mmu::virt_to_phys(unsafe { core::ptr::addr_of!((*mem).l2) } as usize) as u64;
+    let l3_pa = mmu::virt_to_phys(unsafe { core::ptr::addr_of!((*mem).l3) } as usize) as u64;
 
     // SAFETY: same invariant as build_user_space_with — we write the
     // tables via their high aliases; the walker is not looking at them.

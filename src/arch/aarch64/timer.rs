@@ -4,52 +4,54 @@
 //! fixed frequency, plus a comparator that fires an interrupt when the
 //! counter reaches a programmed value. There are actually four timers
 //! per core (secure physical, non-secure physical, virtual, and
-//! hypervisor), and we use the **non-secure physical timer** — the one
-//! the DTB lists as PPI 30, and the one Linux uses for EL1 ticking.
+//! hypervisor), and we use the **virtual timer** — the one the DTB
+//! lists as PPI 11 (GICv2 IRQ 27), and the one whose registers
+//! (`CNTV_*`) every line of code below actually touches.
 //!
 //! ## The three registers that matter
 //!
 //! - `CNTFRQ_EL0` — the counter frequency in Hz. Read-only at EL1 if
 //!   the firmware programmed it; on QEMU it is 62.5 MHz. We read it at
 //!   init to set the tick interval, never hardcode it.
-//! - `CNTP_CTL_EL0` — the timer's control: bit 0 = enable, bit 1 = the
-//!   interrupt status (read-only: 1 = fired, and the timer auto-clears
-//!   the condition when you write a new compare value), bit 2 = the
-//!   "auto-reload" mode (0 = one-shot, 1 = periodic via `CNTKPTVAL`).
-//! - `CNTP_CVAL_EL0` — the compare value. When `CNTVCT_EL0` >= this,
-//!   the timer fires. For a periodic tick, the handler writes
-//!   `current_count + period` after each fire.
+//! - `CNTV_CTL_EL0` — the virtual timer's control: bit 0 = enable,
+//!   bit 1 = the interrupt status (read-only: 1 = fired, and the timer
+//!   auto-clears the condition when you write a new compare value),
+//!   bit 2 = the "auto-reload" mode (0 = one-shot, 1 = periodic via
+//!   `CNTKVVAL`).
+//! - `CNTV_CVAL_EL0` — the virtual timer's compare value. When
+//!   `CNTVCT_EL0` >= this, the timer fires. For a periodic tick, the
+//!   handler writes `current_count + period` after each fire.
 //!
-//! (There is also `CNTP_TVAL_EL0` — a *relative* timer that holds the
+//! (There is also `CNTV_TVAL_EL0` — a *relative* timer that holds the
 //! number of ticks until the next fire, but `CVAL` is the cleaner model:
 //! one absolute comparison, no "how much time elapsed during the
 //! handler" arithmetic.)
 //!
-//! ## Why the physical timer, not the virtual timer
+//! ## Why the virtual timer
 //!
-//! At EL1 both work. The virtual timer (`CNTV_*`) counts against the
-//! virtual offset, which is zero until a hypervisor sets it — so at
-//! EL1 without virtualization, virtual == physical. Linux uses the
-//! virtual timer under a hypervisor (so the host controls time) and
-//! the non-secure physical timer in bare metal. We are bare metal (or
-//! under m1n1 which runs us at EL2/EL1 without timer virtualization),
-//! so the non-secure physical timer is the honest choice. The DTB
-//! confirms: PPI 30 is `arm,arch-timer`'s "non-secure physical" entry.
+//! At EL1 without a hypervisor, the virtual offset (`CNTVOFF_EL2`) is
+//! zero, so the virtual count equals the physical count — the two are
+//! indistinguishable. We choose the virtual timer (`CNTV_*`) for two
+//! reasons:
+//!
+//! 1. **M7 forward compatibility.** On Apple Silicon, m1n1 boots us at
+//!    EL2 and may set a virtual offset; the virtual timer is the one
+//!    that keeps working under that regime without surprises. Using it
+//!    from day one means no timer-register rename when we cross the
+//!    silicon boundary.
+//! 2. **The DTB confirms it.** The `/timer` node's `interrupts` property
+//!    lists four PPIs; entry 2 (PPI 11 → GICv2 IRQ 27) is the virtual
+//!    timer, and the boot banner cross-checks this against
+//!    `hal::gicv2::TIMER_IRQ` and reports "matches."
 //!
 //! ## The interrupt path
 //!
-//! The timer fires → GIC presents IRQ 30 as a PPI → the CPU takes an
+//! The timer fires → GIC presents IRQ 27 as a PPI → the CPU takes an
 //! IRQ exception → `handle_irq` in vectors.rs acknowledges the GIC
 //! → dispatches to [`on_tick`] here → [`end_interrupt`] on the GIC →
 //! `eret` back to interrupted code. The handler is the first exception
 //! in Opal that is **routine** — it runs, does its job, and returns,
 //! every time.
-
-/// The timer's PPI interrupt ID, as the GIC sees it. Matches
-/// `hal::gicv3::TIMER_IRQ`; duplicated here so this file is
-/// self-contained (the GIC constant is the contract; this is the
-/// local copy the timer references in comments).
-pub const TIMER_IRQ: u32 = 30;
 
 /// Read the counter frequency, in Hz. Set by firmware (QEMU: 62.5 MHz;
 /// real hardware: the bootloader, or the DTB's `clock-frequency`).
