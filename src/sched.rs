@@ -133,6 +133,18 @@ pub struct Task {
     /// mirrored: the sender sleeps on "mailbox full" instead of the
     /// receiver sleeping on "mailbox empty."
     pub blocked_send_dst: usize,
+    /// If this task is Blocked in a `sleep` syscall, this is the tick
+    /// count at which it should be woken. 0 = not sleeping. Set by
+    /// the SYS_SLEEP handler before calling `block_and_switch`;
+    /// cleared by `wake_sleepers` when the timer reaches this tick.
+    /// The timer IRQ handler scans the task table for Blocked tasks
+    /// with `wake_tick > 0 && wake_tick <= now` and wakes them — a
+    /// timer-driven wake, distinct from the IPC-driven wakes
+    /// (`recvblk` woken by `send`, `sendblk` woken by `recv`). This
+    /// is the same "sleep on a condition, wake when satisfied"
+    /// pattern, just with the timer as the satisfier instead of
+    /// another task.
+    pub wake_tick: u64,
 }
 
 impl Task {
@@ -148,6 +160,7 @@ impl Task {
             mailbox_len: 0,
             mailbox_from: 0,
             blocked_send_dst: 0,
+            wake_tick: 0,
         }
     }
 
@@ -731,6 +744,7 @@ pub unsafe fn kill_current_task(frame: &mut TrapFrame) -> bool {
     if let Some(t) = unsafe { task(cur) } {
         t.state = TaskState::Exited;
         t.blocked_send_dst = 0;
+        t.wake_tick = 0;
         t.mailbox_len = 0;
         t.mailbox_from = 0;
     }
@@ -868,4 +882,64 @@ pub fn preempts() -> u64 {
 /// a successful timer-driven context switch.
 pub fn bump_preempts() {
     PREEMPTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// M6 timer-driven wake — the sleep syscall
+// ---------------------------------------------------------------------------
+
+/// Wake all tasks whose `wake_tick` has elapsed. Called from the timer
+/// IRQ handler after `on_tick` bumps the tick counter: scan the task
+/// table for Blocked tasks with `wake_tick > 0 && wake_tick <= now`,
+/// set them Ready, enqueue them, and clear `wake_tick`. The scheduler
+/// picks them up on the next `save_and_switch` (either the same IRQ's
+/// preempt path or the next cooperative yield).
+///
+/// This is the timer-driven counterpart to the IPC-driven wakes:
+/// - `recvblk` → woken by `ipc_send` (another task satisfies the
+///   condition "mailbox empty")
+/// - `sendblk` → woken by `ipc_recv` / `wake_blocked_senders` (another
+///   task satisfies "mailbox full")
+/// - `sleep`   → woken by `wake_sleepers` (the *timer* satisfies "tick
+///   count reached")
+///
+/// The third wake condition completes the Blocked-state story: a task
+/// can sleep on another task (IPC) or on the passage of time (sleep).
+/// Both use the same `block_and_switch` → `Blocked` → wake → Ready →
+/// enqueue → resume path; the only difference is who pulls the trigger.
+///
+/// # Safety
+/// Single-core, interrupts masked (called from the timer IRQ handler,
+/// DAIF set by exception entry).
+pub unsafe fn wake_sleepers() {
+    let now = crate::arch::aarch64::timer::ticks();
+    for tid in 1..MAX_TASKS {
+        // SAFETY: tid is in bounds; single-core, no concurrent access.
+        let t = unsafe { &raw mut TASK_TABLE[tid] };
+        // Read wake_tick first — it's the cheapest filter and avoids
+        // touching the state field for the common case (not sleeping).
+        let wt = unsafe { (*t).wake_tick };
+        if wt == 0 {
+            continue;
+        }
+        if wt > now {
+            continue;
+        }
+        // The wake tick has elapsed. Only wake if still Blocked (a
+        // faulting task is Exited and should not be woken even if its
+        // wake_tick is stale).
+        if unsafe { (*t).state } != TaskState::Blocked {
+            // Clear the stale wake_tick regardless — a task that was
+            // woken by other means (e.g. killed) should not carry it
+            // forward.
+            unsafe { (*t).wake_tick = 0 };
+            continue;
+        }
+        // Wake: clear the wake condition, set Ready, enqueue.
+        unsafe {
+            (*t).wake_tick = 0;
+            (*t).state = TaskState::Ready;
+        }
+        unsafe { scheduler() }.enqueue(tid);
+    }
 }

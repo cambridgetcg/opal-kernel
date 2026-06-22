@@ -866,6 +866,17 @@ pub fn run_command(line: &[u8]) {
             // problem, and the scheduler keeps running.
             arch::aarch64::user::drop_to_el0_faultkill();
         }
+        "sleep" => {
+            // M6: timer-driven blocking. Spawn a sleeper (task A) and
+            // a runner (task B). Task A calls sleep(3) — blocking for
+            // 3 timer ticks. While A sleeps, B runs (yielding twice);
+            // when A's deadline passes, the timer IRQ's wake_sleepers
+            // wakes A and the scheduler resumes it. This is the third
+            // blocking primitive: recvblk/sendblk sleep on another
+            // task; sleep sleeps on the passage of time. Like `spawn2`,
+            // this does not return to this monitor loop.
+            arch::aarch64::user::drop_to_el0_sleep();
+        }
         other => println!("unknown command {other:?} - try 'help'"),
     }
 }

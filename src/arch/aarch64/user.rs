@@ -110,13 +110,22 @@ pub const SYS_RECVBLK: u64 = 6;
 /// instead of returning -EAGAIN. When the receiver drains its mailbox
 /// via `recv`/`recvblk`, the kernel wakes the blocked sender and it
 /// retries — its message now fits. Args: x0=dst_tid, x1=buf (user VA),
-/// x2=len. Returns: x0=0 on success, negative errno on failure.
-///
-/// This is the symmetric counterpart to `recvblk`: there the receiver
-/// sleeps on "mailbox empty," here the sender sleeps on "mailbox full."
-/// Together they give M6's IPC a full blocking pair — a task can wait
-/// in either direction without spinning or yielding-and-retrying.
+/// x2=len. Returns: x0=0 / -errno.
 pub const SYS_SENDBLK: u64 = 7;
+/// `sleep(ticks)` — put the calling task to sleep for `ticks` timer
+/// ticks. The task enters the Blocked state with a `wake_tick`
+/// deadline; the timer IRQ handler's `wake_sleepers` scans for tasks
+/// whose deadline has elapsed, sets them Ready, and enqueues them.
+/// When the task is resumed, the svc re-executes (ELR was rewound by
+/// 4) and the handler returns 0 — the sleep is complete. Args:
+/// x0=ticks. Returns: x0=0 on wake.
+///
+/// This is the M6 timer-driven blocking primitive — the third wake
+/// condition after `recvblk` (woken by a sender) and `sendblk` (woken
+/// by a receiver). It proves the Blocked state is general: a task can
+/// sleep on *any* condition, and the kernel has a uniform wake path.
+/// The timer is the satisfier here, not another task.
+pub const SYS_SLEEP: u64 = 8;
 
 // ---------------------------------------------------------------------------
 // The user page tables
@@ -1135,11 +1144,125 @@ const TASK_FAULTKILL_B_BYTES: [u8; 64] = {
     buf
 };
 
-// ---------------------------------------------------------------------------
+/// The M6 sleep demo: task A writes "A: sleep", calls sleep(3) —
+/// blocks for 3 timer ticks — then writes "A: woke!" and exits.
+/// Task B writes "B: run", yields, writes "B: run2", yields, writes
+/// "B: done" and exits. While A is sleeping, B runs; when A's
+/// deadline passes, the timer IRQ's wake_sleepers wakes A and the
+/// scheduler resumes it. This proves the third blocking primitive:
+/// a task sleeps on the *passage of time*, and the timer (not
+/// another task) satisfies the wake condition.
+///
+/// Task A program:
+/// ```asm
+/// [0x00] mov  x8, #1          ; SYS_WRITE
+/// [0x04] mov  x0, #1          ; fd = stdout
+/// [0x08] adr  x1, +0x34       ; buf -> 0x3c ("A: sleep\n\r")
+/// [0x0c] mov  x2, #10         ; len
+/// [0x10] svc  #0              ; syscall: write "A: sleep"
+/// [0x14] mov  x8, #8          ; SYS_SLEEP
+/// [0x18] mov  x0, #3          ; sleep for 3 ticks
+/// [0x1c] svc  #0              ; syscall: sleep(3) — blocks
+/// [0x20] mov  x8, #1          ; SYS_WRITE (resumed after wake)
+/// [0x24] mov  x0, #1          ; fd = stdout
+/// [0x28] adr  x1, +0x24       ; buf -> 0x4c ("A: woke!\n\r")
+/// [0x2c] mov  x2, #9          ; len
+/// [0x30] svc  #0              ; syscall: write "A: woke!"
+/// [0x34] mov  x8, #2          ; SYS_EXIT
+/// [0x38] svc  #0              ; syscall: exit
+/// [0x3c] "A: sleep\n\r\0"     ; 10 bytes + NUL at offset 60
+/// [0x4c] "A: woke!\n\r\0"     ; 9 bytes + NUL at offset 76
+/// ```
+const TASK_SLEEP_A_BYTES: [u8; 128] = {
+    let mut buf = [0u8; 128];
+    // [0x00] mov x8, #1 = MOVZ x8, #1 = 0xD2800028
+    buf[0] = 0x28; buf[1] = 0x00; buf[2] = 0x80; buf[3] = 0xD2;
+    // [0x04] mov x0, #1 = MOVZ x0, #1 = 0xD2800020
+    buf[4] = 0x20; buf[5] = 0x00; buf[6] = 0x80; buf[7] = 0xD2;
+    // [0x08] adr x1, +0x34 (target 0x3c, offset 0x34 = 52)
+    //   immlo = 52 & 3 = 0, immhi = 52 >> 2 = 13
+    //   = 0x10000000 | (0 << 29) | (13 << 5) | 1 = 0x100001A1
+    buf[8] = 0xA1; buf[9] = 0x01; buf[10] = 0x00; buf[11] = 0x10;
+    // [0x0c] mov x2, #10 = MOVZ x2, #10 = 0xD2800142
+    buf[12] = 0x42; buf[13] = 0x01; buf[14] = 0x80; buf[15] = 0xD2;
+    // [0x10] svc #0 = 0xD4000001
+    buf[16] = 0x01; buf[17] = 0x00; buf[18] = 0x00; buf[19] = 0xD4;
+    // [0x14] mov x8, #8 = MOVZ x8, #8 = 0xD2800108
+    buf[20] = 0x08; buf[21] = 0x01; buf[22] = 0x80; buf[23] = 0xD2;
+    // [0x18] mov x0, #3 = MOVZ x0, #3 = 0xD2800060
+    buf[24] = 0x60; buf[25] = 0x00; buf[26] = 0x80; buf[27] = 0xD2;
+    // [0x1c] svc #0 = 0xD4000001  — sleep(3), blocks
+    buf[28] = 0x01; buf[29] = 0x00; buf[30] = 0x00; buf[31] = 0xD4;
+    // [0x20] mov x8, #1 = MOVZ x8, #1 = 0xD2800028
+    buf[32] = 0x28; buf[33] = 0x00; buf[34] = 0x80; buf[35] = 0xD2;
+    // [0x24] mov x0, #1 = MOVZ x0, #1 = 0xD2800020
+    buf[36] = 0x20; buf[37] = 0x00; buf[38] = 0x80; buf[39] = 0xD2;
+    // [0x28] adr x1, +0x24 (target 0x4c, offset 0x24 = 36)
+    //   immlo = 36 & 3 = 0, immhi = 36 >> 2 = 9
+    //   = 0x10000000 | (0 << 29) | (9 << 5) | 1 = 0x10000121
+    buf[40] = 0x21; buf[41] = 0x01; buf[42] = 0x00; buf[43] = 0x10;
+    // [0x2c] mov x2, #9 = MOVZ x2, #9 = 0xD2800122
+    buf[44] = 0x22; buf[45] = 0x01; buf[46] = 0x80; buf[47] = 0xD2;
+    // [0x30] svc #0 = 0xD4000001
+    buf[48] = 0x01; buf[49] = 0x00; buf[50] = 0x00; buf[51] = 0xD4;
+    // [0x34] mov x8, #2 = MOVZ x8, #2 = 0xD2800048
+    buf[52] = 0x48; buf[53] = 0x00; buf[54] = 0x80; buf[55] = 0xD2;
+    // [0x38] svc #0 = 0xD4000001
+    buf[56] = 0x01; buf[57] = 0x00; buf[58] = 0x00; buf[59] = 0xD4;
+    // [0x3c] "A: sleep\n\r\0" (10 bytes + NUL) at offset 60
+    buf[60] = b'A'; buf[61] = b':'; buf[62] = b' '; buf[63] = b's';
+    buf[64] = b'l'; buf[65] = b'e'; buf[66] = b'e'; buf[67] = b'p';
+    buf[68] = b'\n'; buf[69] = b'\r'; buf[70] = 0x00;
+    // [0x4c] "A: woke!\n\r\0" (9 bytes + NUL) at offset 76
+    buf[76] = b'A'; buf[77] = b':'; buf[78] = b' '; buf[79] = b'w';
+    buf[80] = b'o'; buf[81] = b'k'; buf[82] = b'e'; buf[83] = b'!';
+    buf[84] = b'\n'; buf[85] = b'\r'; buf[86] = 0x00;
+    buf
+};
 
-/// Build the user page tables and populate the user code page. Called
-/// from the monitor's `el0` command (high world, MMU on) before dropping
-/// to EL0.
+/// Task B for the sleep demo: writes "B: run" then spins forever.
+/// While A sleeps, B runs (spinning); when A's deadline passes,
+/// the timer IRQ's wake_sleepers wakes A and the preempt path
+/// switches to A. A writes "A: woke!" and exits; the scheduler
+/// switches back to B (still spinning). Ctrl-A X to quit.
+///
+/// B spins (rather than yielding and exiting) so the timer has
+/// enough time to fire — B's syscalls complete in microseconds,
+/// but the timer fires after 1 second. Without spinning, B would
+/// exit before the timer ever fires.
+///
+/// ```asm
+/// [0x00] mov  x8, #1          ; SYS_WRITE
+/// [0x04] mov  x0, #1          ; fd = stdout
+/// [0x08] adr  x1, +0x0c       ; buf -> 0x14 ("B: run\n\r")
+/// [0x0c] mov  x2, #7          ; len
+/// [0x10] svc  #0              ; syscall: write "B: run"
+/// [0x14] b .                  ; spin forever
+/// [0x18] "B: run\n\r\0"       ; 7 bytes + NUL
+/// ```
+const TASK_SLEEP_B_BYTES: [u8; 32] = {
+    let mut buf = [0u8; 32];
+    // [0x00] mov x8, #1 = MOVZ x8, #1 = 0xD2800028
+    buf[0] = 0x28; buf[1] = 0x00; buf[2] = 0x80; buf[3] = 0xD2;
+    // [0x04] mov x0, #1 = MOVZ x0, #1 = 0xD2800020
+    buf[4] = 0x20; buf[5] = 0x00; buf[6] = 0x80; buf[7] = 0xD2;
+    // [0x08] adr x1, +0x0c (target 0x14, offset 12)
+    //   immlo = 12 & 3 = 0, immhi = 12 >> 2 = 3
+    //   = 0x10000000 | (0 << 29) | (3 << 5) | 1 = 0x10000061
+    buf[8] = 0x61; buf[9] = 0x00; buf[10] = 0x00; buf[11] = 0x10;
+    // [0x0c] mov x2, #7 = MOVZ x2, #7 = 0xD28000E2
+    buf[12] = 0xE2; buf[13] = 0x00; buf[14] = 0x80; buf[15] = 0xD2;
+    // [0x10] svc #0 = 0xD4000001
+    buf[16] = 0x01; buf[17] = 0x00; buf[18] = 0x00; buf[19] = 0xD4;
+    // [0x14] b . (branch to self, offset 0) = 0x14000000
+    buf[20] = 0x00; buf[21] = 0x00; buf[22] = 0x00; buf[23] = 0x14;
+    // [0x18] "B: run\n\r\0" (7 bytes + NUL = 8) at offset 24
+    buf[24] = b'B'; buf[25] = b':'; buf[26] = b' '; buf[27] = b'r';
+    buf[28] = b'u'; buf[29] = b'n'; buf[30] = b'\n'; buf[31] = 0x00;
+    buf
+};
+
+// ---------------------------------------------------------------------------
 ///
 /// Returns the physical address of the user L0 root — the value to
 /// load into TTBR0_EL1.
@@ -1862,6 +1985,106 @@ pub fn drop_to_el0_faultkill() {
 
     drop_to_el0_with(root_pa);
 }
+
+/// Drop to EL0 with the M6 sleep demo: spawn a sleeper (task A)
+/// and a runner (task B), arm the timer, and eret into task A.
+/// Task A writes "A: sleep", calls sleep(3) — blocking for 3 timer
+/// ticks — then writes "A: woke!" and exits. Task B writes "B: run",
+/// yields, writes "B: run2", yields, writes "B: done", exits. While
+/// A sleeps, B runs; when A's deadline passes, the timer IRQ's
+/// `wake_sleepers` wakes A and the scheduler resumes it.
+///
+/// This is the third blocking primitive — the timer-driven one.
+/// `recvblk` and `sendblk` sleep on *another task*; `sleep` sleeps
+/// on the *passage of time*. The wake path is the same (Ready +
+/// enqueue), but the satisfier is the timer IRQ, not a peer task.
+///
+/// The timer must be armed for `wake_sleepers` to fire, so we arm
+/// it (1 tick/sec) and unmask IRQ before dropping to EL0 — the same
+/// setup as `preempt`, but without enabling preemption (the sleep
+/// demo is cooperative: A blocks voluntarily, B yields voluntarily).
+///
+/// Like `spawn2`, this does not return to the monitor loop — control
+/// comes back via `on_el0_return` when the last task exits.
+pub fn drop_to_el0_sleep() {
+    // ---- 1. Build two independent user address spaces ----
+    // SAFETY: single-core, MMU on, TTBR0 still the empty root.
+    let ttbr0_a = unsafe { build_task_user_space(0, &TASK_SLEEP_A_BYTES) };
+    let ttbr0_b = unsafe { build_task_user_space(1, &TASK_SLEEP_B_BYTES) };
+
+    // ---- 2. Spawn both tasks ----
+    // Task A (sleeper): TID 1. Task B (runner): TID 2.
+    // SAFETY: single-core, interrupts masked (monitor context).
+    let tid_a = unsafe {
+        crate::sched::spawn(b"slpA", ttbr0_a, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+    };
+    let tid_b = unsafe {
+        crate::sched::spawn(b"slpB", ttbr0_b, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+    };
+
+    match (tid_a, tid_b) {
+        (Some(a), Some(b)) => {
+            println!("[kernel] M6 sleep: spawned sleeper (TID {a}) and runner (TID {b})");
+        }
+        _ => {
+            println!("[kernel] sleep: failed to spawn tasks (table full?)");
+            return;
+        }
+    }
+
+    // ---- 3. Arm the timer (1 tick/sec) ----
+    // sleep() needs the timer IRQ to fire so wake_sleepers can run.
+    // We arm the timer but do NOT enable preemption — this demo is
+    // cooperative (A blocks on sleep, B yields). The timer's only
+    // job here is to wake sleeping tasks.
+    let freq = crate::arch::aarch64::timer::frequency();
+    let period = freq; // 1 second
+    crate::arch::aarch64::timer::TICK_PERIOD.store(period, core::sync::atomic::Ordering::Relaxed);
+    crate::arch::aarch64::timer::arm(period);
+    // Enable preemption: when the timer wakes A, the IRQ handler's
+    // preempt path switches to A immediately. Without preemption, B
+    // would run to completion before the scheduler could pick up A
+    // from the ready queue (B's yields don't switch to A because A
+    // is Blocked, not Ready, until the timer fires).
+    crate::sched::preempt_on();
+    println!("[kernel] sleep: timer armed (1 tick/sec), preemption enabled for wake");
+
+    // ---- 4. Drop into task A (the sleeper) ----
+    let first = unsafe { crate::sched::scheduler() }.dequeue();
+    let first = match first {
+        Some(tid) => tid,
+        None => {
+            println!("[kernel] sleep: ready queue empty after spawn?!");
+            return;
+        }
+    };
+
+    // SAFETY: first is a valid TID from the scheduler.
+    let t = match unsafe { crate::sched::task(first) } {
+        Some(t) => t,
+        None => {
+            println!("[kernel] sleep: task {first} vanished?!");
+            return;
+        }
+    };
+    t.state = crate::sched::TaskState::Running;
+    let root_pa = t.ttbr0_pa;
+    unsafe { crate::sched::set_current_tid(first) };
+
+    // Unmask IRQ at the CPU so the timer can fire. This must happen
+    // before the eret — the timer is armed, but the CPU won't take
+    // the IRQ until DAIF.I is clear.
+    unsafe {
+        core::arch::asm!("msr DAIFClr, #2", options(nostack, preserves_flags));
+    }
+
+    println!(
+        "[kernel] dropping to EL0 - task {:?} (TID {first}), sleep demo",
+        t.name_str()
+    );
+
+    drop_to_el0_with(root_pa);
+}
 /// The `__el0_return` trampoline in vectors.rs jumps here.
 #[unsafe(no_mangle)]
 extern "C" fn on_el0_return() -> ! {
@@ -2225,6 +2448,86 @@ pub fn handle_svc_from_el0(frame: &mut super::vectors::TrapFrame) {
                     frame.x[0] = e as u64;
                 }
             }
+        }
+        SYS_SLEEP => {
+            // sleep(ticks): put the calling task to sleep for `ticks`
+            // timer ticks. The task enters the Blocked state with a
+            // wake_tick deadline; the timer IRQ handler's
+            // wake_sleepers scans for tasks whose deadline has
+            // elapsed, sets them Ready, and enqueues them. When the
+            // task is resumed, it continues at the instruction after
+            // the svc with x0=0 — the sleep is complete.
+            //
+            // Unlike recvblk/sendblk, sleep does NOT rewind ELR.
+            // Those syscalls rewind because they must re-check a
+            // condition (mailbox empty/full) on wake — the handler
+            // needs to run again to test it. Sleep has no condition
+            // to re-check: the timer is the satisfier, and when it
+            // fires, the sleep is simply done. So we set x0=0 (the
+            // return value) BEFORE blocking, and the task resumes
+            // after the svc with x0=0 already in place. Simpler than
+            // the IPC blocking primitives, and honestly so: the
+            // difference is "no condition to re-check."
+            //
+            // This is the third blocking primitive, and it completes
+            // the Blocked-state story: a task can sleep on another
+            // task (IPC: recvblk/sendblk) or on the passage of time
+            // (sleep). The kernel has a uniform wake path — Ready +
+            // enqueue — and the only difference is who pulls the
+            // trigger: another task (IPC) or the timer (sleep).
+            let ticks = frame.x[0];
+
+            // Zero ticks: return immediately (no sleep).
+            if ticks == 0 {
+                frame.x[0] = 0;
+                return;
+            }
+
+            let cur = crate::sched::current_tid();
+            if cur == 0 {
+                // Kernel can't sleep — return error.
+                frame.x[0] = (-22i64) as u64; // -EINVAL
+                return;
+            }
+
+            // Set the wake deadline: current tick count + ticks.
+            let now = crate::arch::aarch64::timer::ticks();
+            let deadline = now + ticks;
+            // SAFETY: exception context, single-core, DAIF set.
+            if let Some(t) = unsafe { crate::sched::task(cur) } {
+                t.wake_tick = deadline;
+            }
+
+            // Set the return value NOW, before blocking. When the
+            // task is woken and resumes, x0 is already 0 — the sleep
+            // succeeded. No ELR rewind needed.
+            frame.x[0] = 0;
+
+            // Block and switch to the next Ready task. The frame
+            // (with x0=0 and ELR pointing past the svc) is saved
+            // into the TCB; when wake_sleepers wakes us, the
+            // scheduler restores this frame and erets to the
+            // instruction after the svc.
+            // SAFETY: exception context, single-core, DAIF set.
+            let switched = unsafe { crate::sched::block_and_switch(frame) };
+            if !switched {
+                // Nobody else to run — can't block. Clear the
+                // wake_tick and return immediately. This is the
+                // single-task case: sleep degrades to a no-op when
+                // there's no other task to run while we sleep.
+                // (The timer can't wake us if there's no scheduler
+                // running to dispatch the wake — and without another
+                // task to switch to, we'd just hang at Blocked.)
+                if let Some(t) = unsafe { crate::sched::task(cur) } {
+                    t.wake_tick = 0;
+                }
+                // x0 is already 0 from above.
+            }
+            // If switched: we're running the next task now. When
+            // this task is woken (wake_sleepers), its saved frame
+            // (with x0=0, ELR past the svc) is restored and eret
+            // resumes it — the sleep is complete, the return value
+            // is in place, and the user program continues.
         }
         SYS_EXIT => {
             // The user wants to exit. Mark the current task as Exited

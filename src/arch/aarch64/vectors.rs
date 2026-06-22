@@ -943,6 +943,18 @@ fn handle_irq(frame: &mut TrapFrame, kind: Kind, source: Source) {
                 crate::arch::aarch64::timer::rearm(period);
             }
 
+            // M6: wake sleeping tasks whose deadline has elapsed.
+            // This is the timer-driven wake condition — the third
+            // blocking primitive after recvblk and sendblk. A task
+            // that called sleep(ticks) is Blocked with a wake_tick
+            // deadline; if that deadline has passed, wake it (Ready,
+            // enqueued) so the scheduler picks it up. The scan is
+            // O(MAX_TASKS) — tiny (8 slots), and only sleeping tasks
+            // have wake_tick != 0, so the common case is 8 cheap
+            // comparisons.
+            // SAFETY: IRQ handler, DAIF set, single-core.
+            unsafe { crate::sched::wake_sleepers() };
+
             // M6: preemptive scheduling. If preempt is enabled and a
             // user task is currently running, the timer tick is our
             // chance to switch to the next Ready task. save_and_switch
