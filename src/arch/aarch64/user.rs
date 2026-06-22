@@ -126,6 +126,32 @@ pub const SYS_SENDBLK: u64 = 7;
 /// sleep on *any* condition, and the kernel has a uniform wake path.
 /// The timer is the satisfier here, not another task.
 pub const SYS_SLEEP: u64 = 8;
+/// `exit(code)` — terminate the user program and return `code` to any
+/// task waiting on us via `wait`. Args: x0=exit_code. Does not return
+/// to EL0; the kernel returns to the monitor (or switches to the next
+/// task, or wakes a waiting parent). The code is stored in the TCB's
+/// `exit_code` field, read by `try_wait` when a parent calls `wait`.
+/// In M5/M6's earlier beats, exit took no arguments; this beat adds
+/// the code — the honest "a program's last word is a number" API.
+pub const SYS_EXIT_CODE: u64 = 9;
+/// `wait(child_tid)` — block until task `child_tid` exits, then return
+/// its exit code. Args: x0=child_tid. Returns: x0=exit_code (>=0 for a
+/// clean exit, -1 for a fault-killed task), or -ESRCH (3) if no such
+/// task. If the child has not exited yet, the caller enters the
+/// Blocked state with `waiting_on = child_tid`; when the child exits,
+/// `wake_waiters` wakes the parent and it retries the svc, finding the
+/// child Exited and the exit code available.
+///
+/// This is the fourth blocking primitive — the task-lifecycle one.
+/// `recvblk`/`sendblk` sleep on another task's mailbox; `sleep` sleeps
+/// on the timer; `wait` sleeps on a child's exit. The wake path is the
+/// same (Ready + enqueue + retry), but the satisfier is "the child's
+/// lifecycle ended." A parent that calls `wait` before the child exits
+/// blocks; when the child calls `exit(code)`, the exit handler sets
+/// `exit_code` and calls `wake_waiters`, which finds the parent and
+/// wakes it. The parent re-enters the `wait` svc, `try_wait` finds the
+/// child Exited, and returns the code.
+pub const SYS_WAIT: u64 = 10;
 
 // ---------------------------------------------------------------------------
 // The user page tables
@@ -1262,6 +1288,157 @@ const TASK_SLEEP_B_BYTES: [u8; 32] = {
     buf
 };
 
+/// The M6 wait demo: a parent (task A) that calls `wait(2)` to block
+/// until task B (the child) exits, and a child (task B) that writes
+/// "B: hi", yields (so A runs and calls wait), writes "B: bye", and
+/// exits with code 42. When B exits, `wake_waiters` wakes A; A
+/// retries the `wait` svc, finds B Exited, gets exit code 42 in x0,
+/// and writes "A: woke!" — proof that the parent blocked until the
+/// child's lifecycle ended, then received the exit code.
+///
+/// This is the fourth blocking primitive — the task-lifecycle one.
+/// `recvblk`/`sendblk` sleep on another task's mailbox; `sleep` sleeps
+/// on the timer; `wait` sleeps on a child's exit. The wake path is
+/// the same (Ready + enqueue + retry), but the satisfier is "the
+/// child exited." The exit handler stores the code in the TCB's
+/// `exit_code` and calls `wake_waiters`, which scans for Blocked
+/// tasks with `waiting_on == exiting_tid` and wakes them.
+///
+/// Parent A program:
+/// ```asm
+/// [0x00] mov  x8, #1          ; SYS_WRITE
+/// [0x04] mov  x0, #1          ; fd = stdout
+/// [0x08] adr  x1, +0x38       ; buf -> 0x40 ("A: wait\n\r")
+/// [0x0c] mov  x2, #9          ; len
+/// [0x10] svc  #0              ; write "A: wait"
+/// [0x14] mov  x8, #10         ; SYS_WAIT
+/// [0x18] mov  x0, #2          ; child_tid = 2
+/// [0x1c] svc  #0              ; wait(2) — blocks until B exits
+/// [0x20] mov  x8, #1          ; SYS_WRITE
+/// [0x24] mov  x0, #1          ; fd = stdout
+/// [0x28] adr  x1, +0x28       ; buf -> 0x50 ("A: woke!\n\r")
+/// [0x2c] mov  x2, #10         ; len
+/// [0x30] svc  #0              ; write "A: woke!"
+/// [0x34] mov  x8, #2          ; SYS_EXIT
+/// [0x38] svc  #0              ; exit
+/// [0x3c] padding
+/// [0x40] "A: wait\n\r\0"      ; 10 bytes
+/// [0x50] "A: woke!\n\r\0"     ; 11 bytes
+/// ```
+const TASK_WAIT_PARENT_BYTES: [u8; 96] = {
+    let mut buf = [0u8; 96];
+    // [0x00] mov x8, #1 = MOVZ x8, #1 = 0xD2800028
+    buf[0] = 0x28; buf[1] = 0x00; buf[2] = 0x80; buf[3] = 0xD2;
+    // [0x04] mov x0, #1 = MOVZ x0, #1 = 0xD2800020
+    buf[4] = 0x20; buf[5] = 0x00; buf[6] = 0x80; buf[7] = 0xD2;
+    // [0x08] adr x1, +0x38 (target 0x40, offset 56) = 0x100001C1
+    buf[8] = 0xC1; buf[9] = 0x01; buf[10] = 0x00; buf[11] = 0x10;
+    // [0x0c] mov x2, #9 = MOVZ x2, #9 = 0xD2800122
+    buf[12] = 0x22; buf[13] = 0x01; buf[14] = 0x80; buf[15] = 0xD2;
+    // [0x10] svc #0 = 0xD4000001
+    buf[16] = 0x01; buf[17] = 0x00; buf[18] = 0x00; buf[19] = 0xD4;
+    // [0x14] mov x8, #10 = MOVZ x8, #10 = 0xD2800148
+    buf[20] = 0x48; buf[21] = 0x01; buf[22] = 0x80; buf[23] = 0xD2;
+    // [0x18] mov x0, #2 = MOVZ x0, #2 = 0xD2800040
+    buf[24] = 0x40; buf[25] = 0x00; buf[26] = 0x80; buf[27] = 0xD2;
+    // [0x1c] svc #0 = 0xD4000001
+    buf[28] = 0x01; buf[29] = 0x00; buf[30] = 0x00; buf[31] = 0xD4;
+    // [0x20] mov x8, #1 = 0xD2800028
+    buf[32] = 0x28; buf[33] = 0x00; buf[34] = 0x80; buf[35] = 0xD2;
+    // [0x24] mov x0, #1 = 0xD2800020
+    buf[36] = 0x20; buf[37] = 0x00; buf[38] = 0x80; buf[39] = 0xD2;
+    // [0x28] adr x1, +0x28 (target 0x50, offset 40) = 0x10000141
+    buf[40] = 0x41; buf[41] = 0x01; buf[42] = 0x00; buf[43] = 0x10;
+    // [0x2c] mov x2, #10 = MOVZ x2, #10 = 0xD2800142
+    buf[44] = 0x42; buf[45] = 0x01; buf[46] = 0x80; buf[47] = 0xD2;
+    // [0x30] svc #0 = 0xD4000001
+    buf[48] = 0x01; buf[49] = 0x00; buf[50] = 0x00; buf[51] = 0xD4;
+    // [0x34] mov x8, #2 = 0xD2800048
+    buf[52] = 0x48; buf[53] = 0x00; buf[54] = 0x80; buf[55] = 0xD2;
+    // [0x38] svc #0 = 0xD4000001
+    buf[56] = 0x01; buf[57] = 0x00; buf[58] = 0x00; buf[59] = 0xD4;
+    // [0x3c] padding (4 bytes)
+    // [0x40] "A: wait\n\r\0" (10 bytes at offset 64)
+    buf[64] = b'A'; buf[65] = b':'; buf[66] = b' '; buf[67] = b'w';
+    buf[68] = b'a'; buf[69] = b'i'; buf[70] = b't'; buf[71] = b'\n';
+    buf[72] = b'\r'; buf[73] = 0x00;
+    // [0x50] "A: woke!\n\r\0" (11 bytes at offset 80)
+    buf[80] = b'A'; buf[81] = b':'; buf[82] = b' '; buf[83] = b'w';
+    buf[84] = b'o'; buf[85] = b'k'; buf[86] = b'e'; buf[87] = b'!';
+    buf[88] = b'\n'; buf[89] = b'\r'; buf[90] = 0x00;
+    buf
+};
+
+/// The M6 wait demo child (task B): writes "B: hi", yields (so A
+/// runs and calls `wait` — blocking because B hasn't exited yet),
+/// writes "B: bye", and exits with code 42 via `SYS_EXIT_CODE`. When
+/// B exits, the exit handler stores `exit_code = 42` and calls
+/// `wake_waiters`, which wakes A. A retries its `wait` svc and gets
+/// 42 in x0.
+///
+/// ```asm
+/// [0x00] mov  x8, #1          ; SYS_WRITE
+/// [0x04] mov  x0, #1          ; fd = stdout
+/// [0x08] adr  x1, +0x38       ; buf -> 0x40 ("B: hi\n\r")
+/// [0x0c] mov  x2, #6          ; len
+/// [0x10] svc  #0              ; write "B: hi"
+/// [0x14] mov  x8, #3          ; SYS_YIELD
+/// [0x18] svc  #0              ; yield (let A run and call wait)
+/// [0x1c] mov  x8, #1          ; SYS_WRITE
+/// [0x20] mov  x0, #1          ; fd = stdout
+/// [0x24] adr  x1, +0x24       ; buf -> 0x48 ("B: bye\n\r")
+/// [0x28] mov  x2, #7          ; len
+/// [0x2c] svc  #0              ; write "B: bye"
+/// [0x30] mov  x8, #9          ; SYS_EXIT_CODE
+/// [0x34] mov  x0, #42         ; exit code 42
+/// [0x38] svc  #0              ; exit(42)
+/// [0x3c] padding
+/// [0x40] "B: hi\n\r\0"        ; 7 bytes + NUL
+/// [0x48] "B: bye\n\r\0"       ; 7 bytes + NUL
+/// ```
+const TASK_WAIT_CHILD_BYTES: [u8; 96] = {
+    let mut buf = [0u8; 96];
+    // [0x00] mov x8, #1 = 0xD2800028
+    buf[0] = 0x28; buf[1] = 0x00; buf[2] = 0x80; buf[3] = 0xD2;
+    // [0x04] mov x0, #1 = 0xD2800020
+    buf[4] = 0x20; buf[5] = 0x00; buf[6] = 0x80; buf[7] = 0xD2;
+    // [0x08] adr x1, +0x38 (target 0x40, offset 56) = 0x100001C1
+    buf[8] = 0xC1; buf[9] = 0x01; buf[10] = 0x00; buf[11] = 0x10;
+    // [0x0c] mov x2, #6 = MOVZ x2, #6 = 0xD28000C2
+    buf[12] = 0xC2; buf[13] = 0x00; buf[14] = 0x80; buf[15] = 0xD2;
+    // [0x10] svc #0 = 0xD4000001
+    buf[16] = 0x01; buf[17] = 0x00; buf[18] = 0x00; buf[19] = 0xD4;
+    // [0x14] mov x8, #3 = 0xD2800068
+    buf[20] = 0x68; buf[21] = 0x00; buf[22] = 0x80; buf[23] = 0xD2;
+    // [0x18] svc #0 = 0xD4000001
+    buf[24] = 0x01; buf[25] = 0x00; buf[26] = 0x00; buf[27] = 0xD4;
+    // [0x1c] mov x8, #1 = 0xD2800028
+    buf[28] = 0x28; buf[29] = 0x00; buf[30] = 0x80; buf[31] = 0xD2;
+    // [0x20] mov x0, #1 = 0xD2800020
+    buf[32] = 0x20; buf[33] = 0x00; buf[34] = 0x80; buf[35] = 0xD2;
+    // [0x24] adr x1, +0x24 (target 0x48, offset 36) = 0x10000121
+    buf[36] = 0x21; buf[37] = 0x01; buf[38] = 0x00; buf[39] = 0x10;
+    // [0x28] mov x2, #7 = MOVZ x2, #7 = 0xD28000E2
+    buf[40] = 0xE2; buf[41] = 0x00; buf[42] = 0x80; buf[43] = 0xD2;
+    // [0x2c] svc #0 = 0xD4000001
+    buf[44] = 0x01; buf[45] = 0x00; buf[46] = 0x00; buf[47] = 0xD4;
+    // [0x30] mov x8, #9 = MOVZ x8, #9 = 0xD2800128
+    buf[48] = 0x28; buf[49] = 0x01; buf[50] = 0x80; buf[51] = 0xD2;
+    // [0x34] mov x0, #42 = MOVZ x0, #42 = 0xD2800540
+    buf[52] = 0x40; buf[53] = 0x05; buf[54] = 0x80; buf[55] = 0xD2;
+    // [0x38] svc #0 = 0xD4000001
+    buf[56] = 0x01; buf[57] = 0x00; buf[58] = 0x00; buf[59] = 0xD4;
+    // [0x3c] padding (4 bytes)
+    // [0x40] "B: hi\n\r\0" (7 bytes + NUL = 8) at offset 64
+    buf[64] = b'B'; buf[65] = b':'; buf[66] = b' '; buf[67] = b'h';
+    buf[68] = b'i'; buf[69] = b'\n'; buf[70] = b'\r'; buf[71] = 0x00;
+    // [0x48] "B: bye\n\r\0" (7 bytes + NUL = 8) at offset 72
+    buf[72] = b'B'; buf[73] = b':'; buf[74] = b' '; buf[75] = b'b';
+    buf[76] = b'y'; buf[77] = b'e'; buf[78] = b'\n'; buf[79] = b'\r';
+    buf[80] = 0x00;
+    buf
+};
+
 // ---------------------------------------------------------------------------
 ///
 /// Returns the physical address of the user L0 root — the value to
@@ -2085,6 +2262,79 @@ pub fn drop_to_el0_sleep() {
 
     drop_to_el0_with(root_pa);
 }
+
+/// Drop to EL0 with the M6 wait demo: spawn a parent (task A) and a
+/// child (task B), each with its own user address space, and eret
+/// into task A. Task A writes "A: wait" and calls `wait(2)` — blocking
+/// until task B exits. Task B writes "B: hi", yields (so A runs and
+/// calls wait), writes "B: bye", and exits with code 42 via
+/// `SYS_EXIT_CODE`. The exit handler stores `exit_code = 42`, calls
+/// `wake_waiters`, which wakes A; A retries the `wait` svc, finds B
+/// Exited, gets 42 in x0, and writes "A: woke!".
+///
+/// This is the fourth blocking primitive — the task-lifecycle one.
+/// `recvblk`/`sendblk` sleep on another task's mailbox; `sleep` sleeps
+/// on the timer; `wait` sleeps on a child's exit. The wake path is the
+/// same (Ready + enqueue + retry), but the satisfier is "the child
+/// exited."
+///
+/// Like `spawn2`, this does not return to the monitor loop — control
+/// comes back via `on_el0_return` when the last task (A) exits.
+pub fn drop_to_el0_wait() {
+    // ---- 1. Build two independent user address spaces ----
+    // SAFETY: single-core, MMU on, TTBR0 still the empty root.
+    let ttbr0_a = unsafe { build_task_user_space(0, &TASK_WAIT_PARENT_BYTES) };
+    let ttbr0_b = unsafe { build_task_user_space(1, &TASK_WAIT_CHILD_BYTES) };
+
+    // ---- 2. Spawn both tasks ----
+    // Task A (parent/waiter): TID 1. Task B (child): TID 2.
+    // SAFETY: single-core, interrupts masked (monitor context).
+    let tid_a = unsafe {
+        crate::sched::spawn(b"waiA", ttbr0_a, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+    };
+    let tid_b = unsafe {
+        crate::sched::spawn(b"waiB", ttbr0_b, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+    };
+
+    match (tid_a, tid_b) {
+        (Some(a), Some(b)) => {
+            println!("[kernel] M6 wait: spawned parent (TID {a}) and child (TID {b})");
+        }
+        _ => {
+            println!("[kernel] wait: failed to spawn tasks (table full?)");
+            return;
+        }
+    }
+
+    // ---- 3. Drop into task A (the parent) ----
+    let first = unsafe { crate::sched::scheduler() }.dequeue();
+    let first = match first {
+        Some(tid) => tid,
+        None => {
+            println!("[kernel] wait: ready queue empty after spawn?!");
+            return;
+        }
+    };
+
+    // SAFETY: first is a valid TID from the scheduler.
+    let t = match unsafe { crate::sched::task(first) } {
+        Some(t) => t,
+        None => {
+            println!("[kernel] wait: task {first} vanished?!");
+            return;
+        }
+    };
+    t.state = crate::sched::TaskState::Running;
+    let root_pa = t.ttbr0_pa;
+    unsafe { crate::sched::set_current_tid(first) };
+
+    println!(
+        "[kernel] dropping to EL0 - task {:?} (TID {first}), wait demo",
+        t.name_str()
+    );
+
+    drop_to_el0_with(root_pa);
+}
 /// The `__el0_return` trampoline in vectors.rs jumps here.
 #[unsafe(no_mangle)]
 extern "C" fn on_el0_return() -> ! {
@@ -2529,18 +2779,34 @@ pub fn handle_svc_from_el0(frame: &mut super::vectors::TrapFrame) {
             // resumes it — the sleep is complete, the return value
             // is in place, and the user program continues.
         }
-        SYS_EXIT => {
+        SYS_EXIT | SYS_EXIT_CODE => {
             // The user wants to exit. Mark the current task as Exited
-            // (M6: the scheduler needs to know this slot is free), then
-            // return to the monitor — or, if there is another task
-            // Ready, switch to it instead of returning to the monitor.
+            // (M6: the scheduler needs to know this slot is free), store
+            // the exit code (x0) for any waiting parent, wake any tasks
+            // blocked in `wait` on this TID, then return to the monitor
+            // — or, if there is another task Ready, switch to it.
+            //
+            // SYS_EXIT (x8=2) is the original no-arg exit; x0 holds
+            // whatever the program last left there (usually a fd or 0).
+            // SYS_EXIT_CODE (x8=9) is the explicit-code exit: x0 is the
+            // code. Both share this handler — the only difference is
+            // whether the program intended x0 as a code. For the old
+            // programs, x0 happens to be 0 or 1, which is harmless.
             let cur = crate::sched::current_tid();
-            println!("[kernel] syscall: exit() (TID {cur})");
+            let code = frame.x[0] as i64;
+            println!("[kernel] syscall: exit() (TID {cur}, code {code})");
             if cur != 0 {
                 // SAFETY: single-core, exception context.
                 if let Some(t) = unsafe { crate::sched::task(cur) } {
                     t.state = crate::sched::TaskState::Exited;
+                    t.exit_code = code;
                 }
+                // Wake any tasks blocked in `wait` on this TID. The
+                // exiting task is now Exited, so `try_wait` will find
+                // the exit code. This is the fourth blocking-condition
+                // wake — the child's exit satisfies the parent's wait.
+                // SAFETY: exception context, single-core, DAIF set.
+                unsafe { crate::sched::wake_waiters(cur) };
             }
             // Is there another task to run? If so, switch to it.
             // SAFETY: same exception-context invariant.
@@ -2562,6 +2828,62 @@ pub fn handle_svc_from_el0(frame: &mut super::vectors::TrapFrame) {
             // else: we switched to the next task; its frame is loaded
             // and __vectors_restore will eret to it. The monitor is not
             // re-entered — the CPU stays in EL0, running tasks.
+        }
+        SYS_WAIT => {
+            // wait(child_tid): block until task `child_tid` exits, then
+            // return its exit code. If the child has already exited,
+            // return immediately. If not, block (Blocked state with
+            // `waiting_on = child_tid`) and the child's exit handler
+            // will wake us via `wake_waiters`.
+            //
+            // The "retry the syscall on wake" trick: rewind ELR by 4
+            // before blocking, so the svc re-executes on wake. The
+            // second time through, `try_wait` finds the child Exited
+            // and returns the code — same pattern as recvblk/sendblk.
+            let child_tid = frame.x[0] as usize;
+            let cur = crate::sched::current_tid();
+
+            // SAFETY: exception context, single-core, DAIF set.
+            match unsafe { crate::sched::try_wait(child_tid) } {
+                Ok(code) => {
+                    // Child has exited — return the code.
+                    frame.x[0] = code as u64;
+                }
+                Err(e) if e == -11 => {
+                    // EAGAIN: child hasn't exited yet. Block.
+                    if cur == 0 {
+                        // Kernel can't block — return the error.
+                        frame.x[0] = e as u64;
+                        return;
+                    }
+                    // Record which child we're waiting for.
+                    // SAFETY: exception context, single-core.
+                    if let Some(t) = unsafe { crate::sched::task(cur) } {
+                        t.waiting_on = child_tid;
+                    }
+                    // Rewind ELR by 4 so the svc re-executes on wake.
+                    frame.elr = frame.elr.wrapping_sub(4);
+                    // SAFETY: exception context, single-core, DAIF set.
+                    let switched = unsafe { crate::sched::block_and_switch(frame) };
+                    if !switched {
+                        // Nobody else to run — can't block. Restore
+                        // ELR, clear the flag, return -EAGAIN.
+                        frame.elr = frame.elr.wrapping_add(4);
+                        if let Some(t) = unsafe { crate::sched::task(cur) } {
+                            t.waiting_on = 0;
+                        }
+                        frame.x[0] = (-11i64) as u64; // -EAGAIN
+                    }
+                    // If switched: we're running the next task. When the
+                    // child exits, wake_waiters wakes us; we re-enter
+                    // the svc, try_wait finds the child Exited, and
+                    // returns the code.
+                }
+                Err(e) => {
+                    // -ESRCH or other error: return it.
+                    frame.x[0] = e as u64;
+                }
+            }
         }
         _ => {
             println!("[kernel] unknown syscall {nr}");

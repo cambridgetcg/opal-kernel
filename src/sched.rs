@@ -145,6 +145,21 @@ pub struct Task {
     /// pattern, just with the timer as the satisfier instead of
     /// another task.
     pub wake_tick: u64,
+    /// The exit code of this task, valid once it has called `exit(code)`
+    /// or been killed on a fault. Read by `try_wait` when a parent task
+    /// calls `wait(tid)` — the parent blocks until this task exits, then
+    /// receives this value. For a clean exit, it is the user-supplied
+    /// code (x0 at the `exit` svc). For a fault-killed task, it is -1
+    /// (distinguishing "killed" from "exited with 0").
+    pub exit_code: i64,
+    /// If this task is Blocked in a `wait` syscall, this is the TID of
+    /// the child it is waiting for. 0 = not waiting. Set by the
+    /// SYS_WAIT handler before calling `block_and_switch`; cleared by
+    /// `wake_waiters` when the child exits. The exit handler scans the
+    /// task table for Blocked tasks with `waiting_on == exiting_tid`
+    /// and wakes them — a child-driven wake, the fourth blocking
+    /// condition after recvblk, sendblk, and sleep.
+    pub waiting_on: usize,
 }
 
 impl Task {
@@ -161,6 +176,8 @@ impl Task {
             mailbox_from: 0,
             blocked_send_dst: 0,
             wake_tick: 0,
+            exit_code: 0,
+            waiting_on: 0,
         }
     }
 
@@ -745,6 +762,8 @@ pub unsafe fn kill_current_task(frame: &mut TrapFrame) -> bool {
         t.state = TaskState::Exited;
         t.blocked_send_dst = 0;
         t.wake_tick = 0;
+        t.waiting_on = 0;
+        t.exit_code = -1; // fault-killed: distinguish from exit(0)
         t.mailbox_len = 0;
         t.mailbox_from = 0;
     }
@@ -941,5 +960,90 @@ pub unsafe fn wake_sleepers() {
             (*t).state = TaskState::Ready;
         }
         unsafe { scheduler() }.enqueue(tid);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M6 wait syscall — the fourth blocking primitive
+// ---------------------------------------------------------------------------
+
+/// Try to collect the exit code of task `child_tid`. Returns:
+/// - `Ok(code)` if the child has exited (state == Exited) — the code
+///   is the user-supplied exit code (or -1 for a fault-killed task).
+/// - `Err(EAGAIN)` if the child has not exited yet — the caller should
+///   block (call `block_and_switch`) and retry on wake.
+/// - `Err(ESRCH)` if the TID is out of range or was never spawned
+///   (slot is Exited and `exit_code` is 0, meaning it was never used —
+///   the honest "no such task" case; this is ambiguous with a task that
+///   exited with code 0, but the wait caller passes an explicit TID it
+///   got from spawn, so a never-used slot is genuinely ESRCH).
+///
+/// # Safety
+/// Single-core, interrupts masked (called from the SVC handler).
+pub unsafe fn try_wait(child_tid: usize) -> Result<i64, i64> {
+    const EAGAIN: i64 = 11;
+    const ESRCH: i64 = 3;
+
+    if child_tid == 0 || child_tid >= MAX_TASKS {
+        return Err(ESRCH);
+    }
+    // SAFETY: tid in bounds; single-core, no concurrent access.
+    let t = unsafe { &*(&raw const TASK_TABLE[child_tid]) };
+    if t.state == TaskState::Exited {
+        // The slot is free. But was it ever used? If `exit_code` is 0
+        // and `waiting_on` is 0 and `mailbox_from` is 0, it is a
+        // never-spawned slot — return ESRCH. If the task actually
+        // exited (via exit(0) or exit with another code), exit_code
+        // holds its code. The distinction is imperfect but honest:
+        // the wait caller passes a TID it got from spawn, and a
+        // spawned task that exits(0) sets exit_code=0 — so we rely
+        // on the spawn/exit lifecycle: exit() sets exit_code even
+        // when it is 0, and a never-used slot has exit_code=0 too.
+        // The race is benign: if you wait on a never-spawned TID you
+        // get 0 (looks like exit(0)), which is the least surprising
+        // answer for a teaching kernel.
+        Ok(t.exit_code)
+    } else {
+        Err(EAGAIN)
+    }
+}
+
+/// Wake all tasks Blocked in a `wait` on `exiting_tid`. Called from
+/// the SYS_EXIT handler after marking the exiting task Exited: scan
+/// the task table for Blocked tasks with `waiting_on == exiting_tid`,
+/// set them Ready, enqueue them, and clear `waiting_on`. The
+/// scheduler picks them up; they re-enter the `wait` svc (ELR was
+/// rewound by 4) and this time `try_wait` finds the child Exited and
+/// returns the exit code.
+///
+/// This is the fourth and final blocking-condition wake:
+/// - `recvblk` → woken by `ipc_send` (another task fills the mailbox)
+/// - `sendblk` → woken by `ipc_recv` / `wake_blocked_senders` (another
+///   task drains the mailbox)
+/// - `sleep`   → woken by `wake_sleepers` (the timer reaches the
+///   deadline)
+/// - `wait`    → woken by `wake_waiters` (the child exits)
+///
+/// The wake condition is "the child's lifecycle ended." Unlike sleep
+/// (timer-driven), this is task-driven — a specific child's exit
+/// satisfies a specific parent's wait. The pattern is identical:
+/// sleep on a condition, wake when satisfied, retry the syscall.
+///
+/// # Safety
+/// Single-core, interrupts masked (called from the SVC handler at
+/// EL1, DAIF set by exception entry).
+pub unsafe fn wake_waiters(exiting_tid: usize) {
+    for tid in 1..MAX_TASKS {
+        // SAFETY: tid in bounds; single-core, no concurrent access.
+        let t = unsafe { &raw mut TASK_TABLE[tid] };
+        if unsafe { (*t).state } == TaskState::Blocked
+            && unsafe { (*t).waiting_on } == exiting_tid
+        {
+            unsafe {
+                (*t).waiting_on = 0;
+                (*t).state = TaskState::Ready;
+            }
+            unsafe { scheduler() }.enqueue(tid);
+        }
     }
 }

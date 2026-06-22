@@ -548,6 +548,12 @@ pub fn run_command(line: &[u8]) {
             println!(
                 "  faultkill       M6: scheduler-aware fault recovery — task faults, kernel kills it, OS keeps running"
             );
+            println!(
+                "  sleep           M6: timer-driven blocking — task sleeps for N ticks, timer wakes it"
+            );
+            println!(
+                "  wait            M6: task-lifecycle blocking — parent blocks until child exits, gets exit code"
+            );
         }
         "brk" => {
             arch::aarch64::vectors::demo_brk();
@@ -876,6 +882,19 @@ pub fn run_command(line: &[u8]) {
             // task; sleep sleeps on the passage of time. Like `spawn2`,
             // this does not return to this monitor loop.
             arch::aarch64::user::drop_to_el0_sleep();
+        }
+        "wait" => {
+            // M6: wait demo. Spawn a parent (task A) and a child (task B).
+            // Task A writes "A: wait" and calls wait(2) — blocking until
+            // task B exits. Task B writes "B: hi", yields, writes "B:
+            // bye", and exits with code 42. The exit handler stores
+            // exit_code=42 and calls wake_waiters, which wakes A. A
+            // retries the wait svc, finds B Exited, gets 42 in x0,
+            // and writes "A: woke!". This is the fourth blocking
+            // primitive: recvblk/sendblk sleep on IPC, sleep sleeps on
+            // the timer, wait sleeps on a child's exit. Like `spawn2`,
+            // this does not return to this monitor loop.
+            arch::aarch64::user::drop_to_el0_wait();
         }
         other => println!("unknown command {other:?} - try 'help'"),
     }
