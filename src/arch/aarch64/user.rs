@@ -1272,10 +1272,10 @@ const TASK_SLEEP_B_BYTES: [u8; 32] = {
     buf[0] = 0x28; buf[1] = 0x00; buf[2] = 0x80; buf[3] = 0xD2;
     // [0x04] mov x0, #1 = MOVZ x0, #1 = 0xD2800020
     buf[4] = 0x20; buf[5] = 0x00; buf[6] = 0x80; buf[7] = 0xD2;
-    // [0x08] adr x1, +0x0c (target 0x14, offset 12)
-    //   immlo = 12 & 3 = 0, immhi = 12 >> 2 = 3
-    //   = 0x10000000 | (0 << 29) | (3 << 5) | 1 = 0x10000061
-    buf[8] = 0x61; buf[9] = 0x00; buf[10] = 0x00; buf[11] = 0x10;
+    // [0x08] adr x1, +0x10 (target 0x18, offset 16)
+    //   immlo = 16 & 3 = 0, immhi = 16 >> 2 = 4
+    //   = 0x10000000 | (0 << 29) | (4 << 5) | 1 = 0x10000081
+    buf[8] = 0x81; buf[9] = 0x00; buf[10] = 0x00; buf[11] = 0x10;
     // [0x0c] mov x2, #7 = MOVZ x2, #7 = 0xD28000E2
     buf[12] = 0xE2; buf[13] = 0x00; buf[14] = 0x80; buf[15] = 0xD2;
     // [0x10] svc #0 = 0xD4000001
