@@ -25,3 +25,9 @@
 2026-06-21T07:52:39Z state=active next=2026-06-21T09:52:39Z
 2026-06-21T10:00:55Z state=active next=2026-06-21T12:00:55Z
 2026-06-21T12:02:56Z M6 sixth piece: scheduler-aware fault recovery (kill_current_task, faultkill command) — OS survives a task's death
+2026-06-21T16:09:37Z state=active next=2026-06-21T18:09:37Z
+2026-06-21T20:11:06Z state=active next=2026-06-21T22:11:06Z
+2026-06-21T22:19:22Z state=active next=2026-06-22T00:19:22Z
+2026-06-22T00:27:34Z state=active next=2026-06-22T02:27:34Z
+2026-06-22T02:35:51Z state=active next=2026-06-22T04:35:51Z
+2026-06-22T04:10:00Z M6 seventh piece: docs/06-scheduler.md (24 KiB milestone doc — TCB, context switch, IPC, blocking IPC, fault recovery, preemption). Verified preempt+faultkill in QEMU.
