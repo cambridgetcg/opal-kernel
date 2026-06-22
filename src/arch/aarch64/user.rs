@@ -2340,6 +2340,22 @@ pub fn drop_to_el0_wait() {
 extern "C" fn on_el0_return() -> ! {
     // Restore TTBR0 to the empty root (condemn the user space).
     mmu::condemn_low_half();
+    // Mask IRQ at the CPU. The timer may still be armed from a demo
+    // that used it (sleep, preempt). Without masking, the timer IRQ
+    // would fire while the monitor is running — harmless on its own
+    // (the IRQ handler checks preempt_enabled() and current_tid()==0),
+    // but it prevents the next demo from cleanly controlling when IRQs
+    // are first unmasked. Masking here gives each demo a clean slate.
+    unsafe {
+        core::arch::asm!("msr DAIFSet, #2", options(nostack, preserves_flags));
+    }
+    // Disable the virtual timer so it stops firing. The next demo
+    // that needs it will re-arm it explicitly. Without this, a stale
+    // timer fires the moment the next demo unmaskes IRQ, before the
+    // demo's tasks are fully set up — causing a crash.
+    crate::arch::aarch64::timer::disable();
+    // Disable preemption (may still be on from a preempt/sleep demo).
+    crate::sched::preempt_off();
     println!("[kernel] returned from EL0 — user program exited cleanly.");
     println!("[kernel] monitor resumed.");
     print!("> ");
