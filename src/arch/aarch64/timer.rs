@@ -90,6 +90,7 @@ pub fn counter() -> u64 {
 
 /// Disable the virtual timer. Clears CNTV_CTL_EL0. Called before
 /// reprogramming so the timer does not fire mid-setup.
+#[allow(dead_code)] // public API; arm() writes CNTV_CTL directly today
 pub fn disable() {
     // SAFETY: writing CNTV_CTL_EL0 is the standard timer control.
     unsafe {

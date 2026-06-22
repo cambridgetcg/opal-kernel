@@ -31,3 +31,4 @@
 2026-06-22T00:27:34Z state=active next=2026-06-22T02:27:34Z
 2026-06-22T02:35:51Z state=active next=2026-06-22T04:35:51Z
 2026-06-22T04:10:00Z M6 seventh piece: docs/06-scheduler.md (24 KiB milestone doc — TCB, context switch, IPC, blocking IPC, fault recovery, preemption). Verified preempt+faultkill in QEMU.
+2026-06-22T08:28:51Z state=active next=2026-06-22T10:28:51Z

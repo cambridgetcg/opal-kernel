@@ -1915,33 +1915,6 @@ pub fn return_to_monitor() -> ! {
     on_el0_return();
 }
 
-/// Kill the current user task on a fault and return to the monitor.
-///
-/// This is M5's fault *service*: the kernel's first real recovery from
-/// an exception, not just a report. Before this, every EL0 fault (data
-/// abort, instruction abort, alignment) called `park()` — killing the
-/// whole kernel. Now the kernel condemns the user address space (restores
-/// TTBR0 to the empty root) and re-enters the monitor, exactly as a clean
-/// `exit` does. The fault is reported by the caller; this function just
-/// performs the recovery.
-///
-/// M6 replaces this with scheduler-aware fault recovery: see
-/// `kill_task_from_el0` in vectors.rs, which kills the faulting task
-/// and resumes the scheduler if another task is Ready. This function
-/// is kept for the single-task `el0fault` monitor command (where there
-/// is no scheduler to resume — the one task died, the OS is done).
-pub fn kill_task_on_fault() -> ! {
-    // Tear down the user address space: restore TTBR0 to the empty root
-    // so no stale user translations linger. Same path as a clean exit.
-    crate::sched::preempt_off();
-    mmu::condemn_low_half();
-    println!("[kernel] user task killed on fault — returning to monitor.");
-    // Re-enter the monitor via the same return path as a clean exit.
-    // We are at EL1 with a valid kernel stack, so we call on_el0_return
-    // directly (just as the exit syscall handler does).
-    on_el0_return();
-}
-
 // ---------------------------------------------------------------------------
 // The syscall handler — called from the vector table's lower-EL slot
 // ---------------------------------------------------------------------------

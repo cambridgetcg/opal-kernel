@@ -236,11 +236,13 @@ impl Scheduler {
     }
 
     /// How many tasks are waiting.
+    #[allow(dead_code)] // public API for diagnostics; dump_tasks uses SCHEDULER.count directly
     pub fn len(&self) -> usize {
         self.count
     }
 
     /// Is the ready queue empty?
+    #[allow(dead_code)] // public API; scheduler is checked via count in dump_tasks
     pub fn is_empty(&self) -> bool {
         self.count == 0
     }
@@ -405,11 +407,19 @@ pub unsafe fn ipc_send(dst_tid: usize, data: &[u8]) -> Result<(), i64> {
     // scheduler picks it up. When it runs, it retries the recv svc and
     // finds this message. The sender is the alarm clock; the kernel is
     // the intermediary.
+    //
+    // We check `t.state` here (rather than just calling `wake(dst_tid)`
+    // unconditionally) because `wake` returns false for non-Blocked
+    // tasks — but we already know from the mailbox check above that the
+    // task exists and is not Exited. The state check is the remaining
+    // question, and doing it inline avoids a second pointer deref
+    // through the task table. `wake` is the public API for other
+    // callers; here we have the pointer already.
     if t.state == TaskState::Blocked {
-        t.state = TaskState::Ready;
         // SAFETY: t is a raw-pointer deref of TASK_TABLE[dst_tid];
         // SCHEDULER is a separate static. No aliasing conflict.
         // Single-core, DAIF-set exception context.
+        t.state = TaskState::Ready;
         unsafe { scheduler() }.enqueue(dst_tid);
     }
 
@@ -417,13 +427,18 @@ pub unsafe fn ipc_send(dst_tid: usize, data: &[u8]) -> Result<(), i64> {
 }
 
 /// Wake a Blocked task: set it to Ready and enqueue it. Returns true if
-/// the task was Blocked (and is now woken), false otherwise. Currently
-/// called only from `ipc_send` (inlined above), but exposed as a public
-/// API for future blocking primitives (e.g. blocking send, sleep, wait).
+/// the task was Blocked (and is now woken), false otherwise.
+///
+/// Currently `ipc_send` inlines this logic (it already holds a pointer
+/// to the receiver's TCB, so calling `wake` would re-dereference the
+/// task table). This function is the public API for any other code that
+/// needs to wake a task by TID — future blocking primitives (sleep,
+/// wait, futex) will call this.
 ///
 /// # Safety
 /// Single-core, interrupts masked (called from the SVC handler at
 /// EL1, DAIF set by exception entry).
+#[allow(dead_code)] // public API; ipc_send inlines the logic, future callers will use this
 pub unsafe fn wake(tid: usize) -> bool {
     if tid == 0 || tid >= MAX_TASKS {
         return false;

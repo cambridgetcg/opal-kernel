@@ -12,9 +12,9 @@ runs-on: QEMU aarch64 virt board (-machine virt -cpu max -smp 1 -m 512M)
 phase: see knows/needs sections below
 build: see heartbeat
 health: active
-last-commit: 2026-06-22 M6: docs/06-scheduler.md — the kernel learns to share
+last-commit: 2026-06-22 heartbeat: warning cleanup — 9 dead-code warnings → 0
 uncommitted: 0
-freshness: fresh (checked 2026-06-22T04:10Z)
+freshness: fresh (checked 2026-06-22T08:18Z)
 
 ## knows
 
@@ -38,7 +38,7 @@ freshness: fresh (checked 2026-06-22T04:10Z)
 ## needs
 
 - M5: EL0 and syscalls — THIRD PIECE DONE (fault recovery — the kernel survives its first serviced fault: EL0 data/instruction aborts now kill the task, not the kernel). Next: per-task kernel stacks, scheduler integration.
-- M6: scheduler and IPC — SEVENTH PIECE DONE (docs/06-scheduler.md: 24 KiB milestone doc covering TCB, context switch, cooperative/preemptive scheduling, IPC, blocking IPC, fault recovery, per-task address spaces. Verified: preempt, faultkill, ipc demos all boot and produce correct output in QEMU. Next: per-task kernel stacks, multi-core (PSCI CPU_ON).)
+- M6: scheduler and IPC — SEVENTH PIECE DONE (docs/06-scheduler.md: 24 KiB milestone doc covering TCB, context switch, cooperative/preemptive scheduling, IPC, blocking IPC, fault recovery, per-task address spaces. Verified: preempt, faultkill, ipc, blkipc, sendblk demos all boot and produce correct output in QEMU. Dead-code warning cleanup: 9 → 0. Next: per-task kernel stacks, multi-core (PSCI CPU_ON).)
 - honesty pass (2026-06-21): timer.rs doc comment said "non-secure physical timer" while the code uses CNTV_* (virtual timer). Fixed — the artifact now tells the truth about its own state. Also fixed 9 Rust 2024 unsafe-op-in-unsafe-fn warnings in user.rs. Build: 19 warnings → 10 (remaining are dead-code API surface).
 - M7: Apple Silicon bring-up via m1n1 — EL2 entry, FDT-driven console discovery, AIC driver, timers-over-FIQ
 - QEMU virt machine with -cpu max (for 16 KiB granule; cortex-a72 doesn't support it)

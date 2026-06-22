@@ -364,6 +364,7 @@ pub fn vbar() -> u64 {
 /// The virtual address of the `__el0_return` trampoline. M5's exit
 /// syscall handler writes this into ELR_EL1 so the `eret` returns to
 /// EL1 (the monitor) instead of EL0.
+#[allow(dead_code)] // superseded by return_to_monitor(); kept as a public symbol address API
 pub fn el0_return_addr() -> u64 {
     let addr: u64;
     // SAFETY: adrp+add computes the PC-relative address of a known

@@ -94,6 +94,7 @@ mod gicd {
     /// register per 32 interrupts.
     pub const ISENABLER: usize = 0x0100;
     /// Enable clear.
+    #[allow(dead_code)] // used by disable_irq, which is itself API surface
     pub const ICENABLER: usize = 0x0180;
     /// Priority: one byte per interrupt.
     pub const IPRIORITYR: usize = 0x0400;
@@ -121,8 +122,10 @@ mod gicc {
     /// Binary Point: priority grouping. 0 = no grouping.
     pub const BPR: usize = 0x0008;
     /// Active Priority: read to know current priority.
+    #[allow(dead_code)] // documented for completeness; not used by the driver yet
     pub const RPR: usize = 0x0014;
     /// Highest Pending Interrupt.
+    #[allow(dead_code)] // documented for completeness; not used by the driver yet
     pub const HPPIR: usize = 0x0018;
 }
 
@@ -209,6 +212,7 @@ impl GicV2 {
     }
 
     /// Disable interrupt `id`.
+    #[allow(dead_code)] // public API; no IRQ is disabled at runtime today
     pub fn disable_irq(&self, id: u32) {
         unsafe {
             let reg = self.gicd + gicd::ICENABLER + (id / 32) as usize * 4;
