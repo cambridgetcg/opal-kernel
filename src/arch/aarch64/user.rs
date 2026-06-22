@@ -2653,8 +2653,9 @@ pub fn handle_svc_from_el0(frame: &mut super::vectors::TrapFrame) {
                 Ok(()) => {
                     frame.x[0] = 0; // success
                 }
-                Err(e) if e == -11 => {
-                    // -EAGAIN: mailbox full. Block the sender and
+                Err(e) if e == 11 => {
+                    // EAGAIN (positive in ipc_send's convention):
+                    // mailbox full. Block the sender and
                     // switch to the next task. Record which receiver
                     // we're blocked on so wake_blocked_senders can
                     // find us when it drains.
@@ -2849,13 +2850,9 @@ pub fn handle_svc_from_el0(frame: &mut super::vectors::TrapFrame) {
                     // Child has exited — return the code.
                     frame.x[0] = code as u64;
                 }
-                Err(e) if e == -11 => {
-                    // EAGAIN: child hasn't exited yet. Block.
-                    if cur == 0 {
-                        // Kernel can't block — return the error.
-                        frame.x[0] = e as u64;
-                        return;
-                    }
+                Err(e) if e == 11 => {
+                    // EAGAIN (positive in try_wait's convention): child
+                    // hasn't exited yet. Block.
                     // Record which child we're waiting for.
                     // SAFETY: exception context, single-core.
                     if let Some(t) = unsafe { crate::sched::task(cur) } {
