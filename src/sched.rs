@@ -82,8 +82,19 @@ pub enum TaskState {
 /// yield takes, just from a different frame.
 ///
 /// `ttbr0_pa` is the physical address of the task's user page-table
-/// root. Context switch writes this to TTBR0_EL1, giving each task its
-/// own address space. The kernel's TTBR1 is shared and untouched.
+/// root. Context switch writes this to `TTBR0_EL1`, giving each task its
+/// own address space. The kernel's `TTBR1` is shared and untouched.
+///
+/// `kstack_top` is the virtual address of the top of this task's
+/// per-task kernel stack — the value `SP_EL1` should hold when this
+/// task is running. When the task traps via `svc`, the vector stub
+/// pushes the exception frame on this stack; when the task is switched
+/// out, `save_and_switch` defers the SP switch to `__vectors_restore`
+/// via the `PENDING_KSTACK_SP` global. Zero means "use the boot stack"
+/// (the kernel itself, TID 0, or a single-task M5-style demo). This is
+/// the M6 per-task kernel stack: each task gets its own stack so a
+/// stack overflow in one task's syscall handler does not corrupt
+/// another's.
 ///
 /// `mailbox` is the task's IPC inbox — a fixed-size kernel buffer where
 /// messages sent to this task land. The `send` syscall copies into it;
@@ -100,6 +111,12 @@ pub struct Task {
     /// Zero means "no user space" (a kernel-only task, if we ever
     /// make one).
     pub ttbr0_pa: u64,
+    /// The VMA of the top of this task's per-task kernel stack
+    /// (for SP_EL1). Zero means "use the boot stack" — the kernel
+    /// itself (TID 0) or a single-task M5-style demo. Context switch
+    /// defers the SP swap to `__vectors_restore` via
+    /// `PENDING_KSTACK_SP`.
+    pub kstack_top: u64,
     /// Where this task is in its lifecycle.
     pub state: TaskState,
     /// A tiny, human-readable name for the task — set at creation,
@@ -169,6 +186,7 @@ impl Task {
         Task {
             saved: TrapFrame::empty(),
             ttbr0_pa: 0,
+            kstack_top: 0,
             state: TaskState::Exited,
             name: [0; 8],
             mailbox: [0; 32],
@@ -356,15 +374,27 @@ pub unsafe fn set_current_tid(tid: usize) {
 }
 
 /// Spawn a new user task: allocate a slot, set its name, user page-table
-/// root, and initial saved register state (entry point, SP, SPSR for EL0).
-/// The task starts in the Ready state and is enqueued.
+/// root, per-task kernel stack, and initial saved register state (entry
+/// point, SP, SPSR for EL0). The task starts in the Ready state and is
+/// enqueued.
+///
+/// `kstack_top` is the VMA of the top of the task's per-task kernel
+/// stack. Zero means "use the boot stack" (the single-task M5 path).
+/// Context switch will defer SP_EL1 to this value via
+/// `PENDING_KSTACK_SP` in `__vectors_restore`.
 ///
 /// Returns the TID, or None if the table is full.
 ///
 /// # Safety
 /// Single-core, interrupts masked (called from the monitor before
 /// dropping to EL0).
-pub unsafe fn spawn(name: &[u8], ttbr0_pa: u64, entry: u64, sp: u64) -> Option<usize> {
+pub unsafe fn spawn(
+    name: &[u8],
+    ttbr0_pa: u64,
+    kstack_top: u64,
+    entry: u64,
+    sp: u64,
+) -> Option<usize> {
     let tid = unsafe { alloc_task()? };
     // SAFETY: tid just allocated, in bounds. alloc_task left the slot
     // in the Exited state; we set it to Ready below. We can't use
@@ -378,6 +408,7 @@ pub unsafe fn spawn(name: &[u8], ttbr0_pa: u64, entry: u64, sp: u64) -> Option<u
     // Same value as user.rs's drop_to_el0_with.
     t.saved.spsr = 0x000;
     t.ttbr0_pa = ttbr0_pa;
+    t.kstack_top = kstack_top;
     t.state = TaskState::Ready;
     t.set_name(name);
     unsafe { scheduler() }.enqueue(tid);
@@ -562,6 +593,62 @@ pub unsafe fn wake_blocked_senders(recv_tid: usize) {
 }
 
 // ---------------------------------------------------------------------------
+// M6 per-task kernel stacks — the deferred SP switch
+// ---------------------------------------------------------------------------
+
+/// The kernel-stack SP to install on the next `__vectors_restore`. Zero
+/// means "no switch pending — leave SP alone." Set by [`save_and_switch`]
+/// and its siblings ([`block_and_switch`], [`kill_current_task`]) when
+/// they switch to a task whose `kstack_top` differs from the current
+/// `SP_EL1`. The assembly epilogue in vectors.rs reads this global
+/// *after* all Rust call frames are popped, then does `mov sp, x0` to
+/// switch to the new task's kernel stack before `eret`.
+///
+/// **Why a global, not a register?** The context switch functions are
+/// ordinary Rust functions with call frames on the *current* task's
+/// kernel stack. If they switched SP themselves, they would corrupt
+/// their own frames — the very frames holding the `frame` reference
+/// they're writing. Deferring the switch to assembly, after all Rust
+/// frames are popped, avoids this. The global is the handoff: Rust
+/// sets it, assembly applies it. Only one context switch can be in
+/// flight at a time (single-core, DAIF-set exception handlers), so the
+/// single global is safe.
+///
+/// `#[unsafe(no_mangle)]` so the `__vectors_restore` assembly can
+/// reference it by its exact name via `adrp + add :lo12:`.
+#[unsafe(no_mangle)]
+static mut PENDING_KSTACK_SP: u64 = 0;
+
+/// A 16-byte scratch area in .bss used by `__vectors_restore` to save
+/// the user's x0 and x1 across the per-task kernel-stack switch. The
+/// assembly reads the user's x0/x1 from the exception frame, stores
+/// them here (TTBR1 space — accessible regardless of which SP is
+/// active), pops the frame, switches SP if `PENDING_KSTACK_SP` is set,
+/// then reloads x0/x1 from here. This is necessary because the SP
+/// switch and the `PENDING_KSTACK_SP` check need scratch registers, and
+/// x0/x1 are the only ones available after x2..x30 are restored.
+///
+/// `#[unsafe(no_mangle)]` so the assembly can reference it by name.
+#[unsafe(no_mangle)]
+static mut SAVED_GP: [u64; 2] = [0; 2];
+
+/// Record the next task's kernel-stack SP so `__vectors_restore` will
+/// switch to it. Called by the three context-switch paths
+/// ([`save_and_switch`], [`block_and_switch`], [`kill_current_task`])
+/// after they've loaded the next task's frame. If `next_kstack_top` is
+/// zero (the next task has no per-task stack), the pending SP is set to
+/// zero — the boot stack stays in use (the assembly checks for zero and
+/// skips the switch).
+///
+/// # Safety
+/// Single-core, DAIF-set exception context. The caller has already
+/// saved the current task's frame and is about to return through
+/// `__vectors_restore`.
+unsafe fn set_pending_kstack_sp(next_kstack_top: u64) {
+    unsafe { core::ptr::write_volatile(&raw mut PENDING_KSTACK_SP, next_kstack_top) }
+}
+
+// ---------------------------------------------------------------------------
 // M6 context switch — the heart of the scheduler
 // ---------------------------------------------------------------------------
 
@@ -646,6 +733,12 @@ pub unsafe fn save_and_switch(frame: &mut TrapFrame) -> bool {
         crate::arch::aarch64::mmu::set_user_ttbr0(next_task.ttbr0_pa);
     }
 
+    // Defer the kernel-stack switch: the assembly epilogue will set
+    // SP_EL1 to the next task's kstack_top after all Rust frames are
+    // popped. This lets each task have its own kernel stack without
+    // corrupting the frames we're currently using.
+    unsafe { set_pending_kstack_sp(next_task.kstack_top) };
+
     // Remember who is running now.
     unsafe { set_current_tid(next) };
 
@@ -719,6 +812,7 @@ pub unsafe fn block_and_switch(frame: &mut TrapFrame) -> bool {
     if next_task.ttbr0_pa != 0 {
         crate::arch::aarch64::mmu::set_user_ttbr0(next_task.ttbr0_pa);
     }
+    unsafe { set_pending_kstack_sp(next_task.kstack_top) };
     unsafe { set_current_tid(next) };
     true
 }
@@ -786,6 +880,7 @@ pub unsafe fn kill_current_task(frame: &mut TrapFrame) -> bool {
     if next_task.ttbr0_pa != 0 {
         crate::arch::aarch64::mmu::set_user_ttbr0(next_task.ttbr0_pa);
     }
+    unsafe { set_pending_kstack_sp(next_task.kstack_top) };
     unsafe { set_current_tid(next) };
     true
 }
@@ -801,10 +896,11 @@ pub fn dump_tasks() {
             continue;
         }
         println!(
-            "  TID {tid}: {:8}  state={:?}  ttbr0={:#x}  mbox={}b from={}",
+            "  TID {tid}: {:8}  state={:?}  ttbr0={:#x}  kstack={:#x}  mbox={}b from={}",
             t.name_str(),
             t.state,
             t.ttbr0_pa,
+            t.kstack_top,
             t.mailbox_len,
             t.mailbox_from,
         );
@@ -846,7 +942,10 @@ const _: () = {
     // The scheduler ring buffer must be correctly sized.
     assert!(MAX_TASKS > 0);
     // A Task must be a reasonable size (no accidental bloat).
-    assert!(core::mem::size_of::<Task>() < 400);
+    // 288 (TrapFrame) + 8 (ttbr0_pa) + 8 (kstack_top) + 1 (state) +
+    // padding + 8 (name) + 32 (mailbox) + 5 usizes = ~365 bytes.
+    // The actual size with padding is ~376 bytes.
+    assert!(core::mem::size_of::<Task>() < 480);
 };
 
 // ---------------------------------------------------------------------------

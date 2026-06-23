@@ -238,6 +238,48 @@ static mut TASK_MEM_B: UserTaskMem = UserTaskMem {
     stack: UserStackPage([0; mmu::GRANULE]),
 };
 
+// ---------------------------------------------------------------------------
+// M6: per-task kernel stacks
+// ---------------------------------------------------------------------------
+//
+// Each task gets its own kernel stack — the value SP_EL1 holds while
+// that task's syscall/fault handler is running. This isolates tasks:
+// a stack overflow in one task's handler can't corrupt another's. The
+// stacks are statically allocated in .bss, 16 KiB each (one granule),
+// 16-byte aligned (AAPCS64). Two stacks = 32 KiB — small for 512 MiB.
+//
+// The context switch doesn't switch SP itself (it's running on the
+// current stack). Instead, `save_and_switch` sets PENDING_KSTACK_SP,
+// and the `__vectors_restore` assembly epilogue switches SP *after*
+// all Rust call frames are popped, just before `eret`. The next
+// exception the new task takes will push its frame on this stack.
+//
+// The kernel itself (TID 0) uses the boot stack from linker.ld;
+// tasks with kstack_top == 0 also use the boot stack (the M5 single-
+// task path, and any demo that hasn't been updated yet).
+
+/// Per-task kernel stack A: 16 KiB, 16-byte aligned.
+#[repr(C, align(16))]
+struct KernelStack([u8; mmu::GRANULE]);
+static mut KSTACK_A: KernelStack = KernelStack([0; mmu::GRANULE]);
+static mut KSTACK_B: KernelStack = KernelStack([0; mmu::GRANULE]);
+
+/// Get the top-of-stack VMA for a given task slot (0 or 1). The "top"
+/// is the end of the array (stacks grow down). Returns a higher-half
+/// VMA — these statics live in .bss, which is mapped via TTBR1, so the
+/// address is accessible regardless of which TTBR0 is active.
+///
+/// # Safety
+/// `slot` must be 0 or 1. Single-core, no concurrent access.
+unsafe fn kstack_top(slot: usize) -> u64 {
+    let base: *const u8 = match slot {
+        0 => unsafe { &raw const KSTACK_A.0 as *const u8 },
+        1 => unsafe { &raw const KSTACK_B.0 as *const u8 },
+        _ => unreachable!("only 2 per-task kernel stacks exist"),
+    };
+    base as u64 + mmu::GRANULE as u64
+}
+
 /// Get the UserTaskMem for a given task slot (0 or 1). Returns a raw
 /// pointer so the caller can build the page tables and copy the program.
 ///
@@ -1716,10 +1758,10 @@ pub fn drop_to_el0_scheduled() {
     // Task B: TID 2, the "task B!" program.
     // SAFETY: single-core, interrupts masked (monitor context).
     let tid_a = unsafe {
-        crate::sched::spawn(b"A", ttbr0_a, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+        crate::sched::spawn(b"A", ttbr0_a, unsafe { kstack_top(0) }, USER_CODE_VA as u64, USER_STACK_TOP as u64)
     };
     let tid_b = unsafe {
-        crate::sched::spawn(b"B", ttbr0_b, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+        crate::sched::spawn(b"B", ttbr0_b, unsafe { kstack_top(1) }, USER_CODE_VA as u64, USER_STACK_TOP as u64)
     };
 
     match (tid_a, tid_b) {
@@ -1799,10 +1841,10 @@ pub fn drop_to_el0_preempt() {
     // ---- 2. Spawn both tasks ----
     // SAFETY: single-core, interrupts masked (monitor context).
     let tid_a = unsafe {
-        crate::sched::spawn(b"preA", ttbr0_a, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+        crate::sched::spawn(b"preA", ttbr0_a, unsafe { kstack_top(0) }, USER_CODE_VA as u64, USER_STACK_TOP as u64)
     };
     let tid_b = unsafe {
-        crate::sched::spawn(b"preB", ttbr0_b, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+        crate::sched::spawn(b"preB", ttbr0_b, unsafe { kstack_top(1) }, USER_CODE_VA as u64, USER_STACK_TOP as u64)
     };
 
     match (tid_a, tid_b) {
@@ -1899,9 +1941,9 @@ pub fn drop_to_el0_ipc() {
     // Task A (sender): TID 1. Task B (receiver): TID 2.
     // SAFETY: single-core, interrupts masked (monitor context).
     let tid_a =
-        unsafe { crate::sched::spawn(b"ipcA", ttbr0_a, USER_CODE_VA as u64, USER_STACK_TOP as u64) };
+        unsafe { crate::sched::spawn(b"ipcA", ttbr0_a, unsafe { kstack_top(0) }, USER_CODE_VA as u64, USER_STACK_TOP as u64) };
     let tid_b =
-        unsafe { crate::sched::spawn(b"ipcB", ttbr0_b, USER_CODE_VA as u64, USER_STACK_TOP as u64) };
+        unsafe { crate::sched::spawn(b"ipcB", ttbr0_b, unsafe { kstack_top(1) }, USER_CODE_VA as u64, USER_STACK_TOP as u64) };
 
     match (tid_a, tid_b) {
         (Some(a), Some(b)) => {
@@ -1973,10 +2015,10 @@ pub fn drop_to_el0_blkipc() {
     // Task A (sender): TID 1. Task B (receiver): TID 2.
     // SAFETY: single-core, interrupts masked (monitor context).
     let tid_a = unsafe {
-        crate::sched::spawn(b"blkA", ttbr0_a, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+        crate::sched::spawn(b"blkA", ttbr0_a, unsafe { kstack_top(0) }, USER_CODE_VA as u64, USER_STACK_TOP as u64)
     };
     let tid_b = unsafe {
-        crate::sched::spawn(b"blkB", ttbr0_b, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+        crate::sched::spawn(b"blkB", ttbr0_b, unsafe { kstack_top(1) }, USER_CODE_VA as u64, USER_STACK_TOP as u64)
     };
 
     match (tid_a, tid_b) {
@@ -2047,10 +2089,10 @@ pub fn drop_to_el0_sendblk() {
     // Task A (sender): TID 1. Task B (receiver): TID 2.
     // SAFETY: single-core, interrupts masked (monitor context).
     let tid_a = unsafe {
-        crate::sched::spawn(b"sdkA", ttbr0_a, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+        crate::sched::spawn(b"sdkA", ttbr0_a, unsafe { kstack_top(0) }, USER_CODE_VA as u64, USER_STACK_TOP as u64)
     };
     let tid_b = unsafe {
-        crate::sched::spawn(b"sdkB", ttbr0_b, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+        crate::sched::spawn(b"sdkB", ttbr0_b, unsafe { kstack_top(1) }, USER_CODE_VA as u64, USER_STACK_TOP as u64)
     };
 
     match (tid_a, tid_b) {
@@ -2115,10 +2157,10 @@ pub fn drop_to_el0_faultkill() {
     // Task A (faulting): TID 1. Task B (survivor): TID 2.
     // SAFETY: single-core, interrupts masked (monitor context).
     let tid_a = unsafe {
-        crate::sched::spawn(b"ftkA", ttbr0_a, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+        crate::sched::spawn(b"ftkA", ttbr0_a, unsafe { kstack_top(0) }, USER_CODE_VA as u64, USER_STACK_TOP as u64)
     };
     let tid_b = unsafe {
-        crate::sched::spawn(b"ftkB", ttbr0_b, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+        crate::sched::spawn(b"ftkB", ttbr0_b, unsafe { kstack_top(1) }, USER_CODE_VA as u64, USER_STACK_TOP as u64)
     };
 
     match (tid_a, tid_b) {
@@ -2193,10 +2235,10 @@ pub fn drop_to_el0_sleep() {
     // Task A (sleeper): TID 1. Task B (runner): TID 2.
     // SAFETY: single-core, interrupts masked (monitor context).
     let tid_a = unsafe {
-        crate::sched::spawn(b"slpA", ttbr0_a, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+        crate::sched::spawn(b"slpA", ttbr0_a, unsafe { kstack_top(0) }, USER_CODE_VA as u64, USER_STACK_TOP as u64)
     };
     let tid_b = unsafe {
-        crate::sched::spawn(b"slpB", ttbr0_b, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+        crate::sched::spawn(b"slpB", ttbr0_b, unsafe { kstack_top(1) }, USER_CODE_VA as u64, USER_STACK_TOP as u64)
     };
 
     match (tid_a, tid_b) {
@@ -2290,10 +2332,10 @@ pub fn drop_to_el0_wait() {
     // Task A (parent/waiter): TID 1. Task B (child): TID 2.
     // SAFETY: single-core, interrupts masked (monitor context).
     let tid_a = unsafe {
-        crate::sched::spawn(b"waiA", ttbr0_a, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+        crate::sched::spawn(b"waiA", ttbr0_a, unsafe { kstack_top(0) }, USER_CODE_VA as u64, USER_STACK_TOP as u64)
     };
     let tid_b = unsafe {
-        crate::sched::spawn(b"waiB", ttbr0_b, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+        crate::sched::spawn(b"waiB", ttbr0_b, unsafe { kstack_top(1) }, USER_CODE_VA as u64, USER_STACK_TOP as u64)
     };
 
     match (tid_a, tid_b) {

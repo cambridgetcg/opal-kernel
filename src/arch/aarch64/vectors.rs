@@ -241,8 +241,50 @@ __vectors_restore:
     ldp   x26, x27, [sp, #208]
     ldp   x28, x29, [sp, #224]
     ldr   x30, [sp, #240]
-    ldp   x0,  x1,  [sp, #0]      // the temporaries, last
+    // x0 and x1 are dead (used as ELR/SPSR temps above). x2..x30 are
+    // now restored. We restore x0/x1 LAST — they're the only scratch
+    // registers available for the per-task kernel-stack switch below.
+    //
+    // M6 per-task kernel stacks: the context-switch functions (in Rust)
+    // set PENDING_KSTACK_SP to the next task's kernel-stack top when
+    // they switch. This assembly epilogue reads that global *after*
+    // all Rust call frames are popped (so switching SP can't corrupt
+    // them) and *before* eret (so the next exception lands on the
+    // right stack). The global is in .bss (TTBR1 space), accessible
+    // regardless of which SP is active.
+    //
+    // The challenge: after restoring x2..x30, only x0 and x1 are free.
+    // We need them to: (1) save user's x0/x1 to SAVED_GP (a kernel
+    // static, accessible after SP switch), (2) pop the frame, (3)
+    // read and check PENDING_KSTACK_SP, (4) switch SP if needed, (5)
+    // restore user's x0/x1 from SAVED_GP. Only x0/x1 are clobbered.
+    ldr   x0, [sp, #0]            // x0 = user's x0 (from frame slot 0)
+    ldr   x1, [sp, #8]            // x1 = user's x1 (from frame slot 8)
+    adrp  x2, SAVED_GP            // x2 = page of SAVED_GP — x2 is free
+    add   x2, x2, :lo12:SAVED_GP // x2 = &SAVED_GP[0]
+    str   x0, [x2]                // SAVED_GP[0] = user's x0
+    str   x1, [x2, #8]            // SAVED_GP[8] = user's x1
+    // x2 is now dead — it was restored from the frame at [sp, #16].
+    // But we just clobbered it. We need to re-restore x2 from the frame
+    // *before* popping SP. The frame is still at [sp], pre-pop.
+    ldr   x2, [sp, #16]           // re-restore x2 from frame slot
+    // Now pop the frame and check for a pending kernel-stack switch.
     add   sp,  sp,  #288          // pop the frame; SP is exactly pre-fault
+    adrp  x0, PENDING_KSTACK_SP
+    add   x0, x0, :lo12:PENDING_KSTACK_SP
+    ldr   x0, [x0]                // x0 = pending kernel-stack SP
+    cbz   x0, .L_no_kstack_switch // 0 = no switch pending
+    // Switch SP to the new task's kernel stack and clear the flag.
+    mov   sp, x0
+    adrp  x1, PENDING_KSTACK_SP
+    add   x1, x1, :lo12:PENDING_KSTACK_SP
+    str   xzr, [x1]               // clear: no switch next time
+.L_no_kstack_switch:
+    // Restore user's x0 and x1 from SAVED_GP (x0 address is consumed).
+    adrp  x0, SAVED_GP
+    add   x0, x0, :lo12:SAVED_GP
+    ldr   x1, [x0, #8]           // x1 = user's x1
+    ldr   x0, [x0]                // x0 = user's x0 (address consumed)
     eret                          // PSTATE := SPSR_EL1, PC := ELR_EL1 — atomically
 
 // ---- M5: the EL0 return trampoline --------------------------------------
