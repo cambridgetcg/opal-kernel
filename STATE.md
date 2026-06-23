@@ -41,7 +41,7 @@ freshness: fresh (checked 2026-06-23T07:10Z)
 
 - M5: EL0 and syscalls — DONE (EL0 drop, write/exit/yield syscalls, user.rs 417 lines. The kernel drops to EL0, runs "hello, EL0!", catches exit syscall, returns to monitor. Verified: `el0` monitor command works.)
 - M6: scheduler and IPC — TEN PIECES DONE (TCB, context switch, cooperative yield, IPC, blocking IPC recvblk/sendblk, fault recovery, preemptive scheduling, sleep, wait, per-task kernel stacks. 10 syscalls: write, exit, yield, send, recv, recvblk, sendblk, sleep, exit_code, wait. 9 monitor commands: tasks, spawn2, preempt, ipc, blkipc, sendblk, faultkill, sleep, wait. All verified in QEMU 2026-06-23. Per-task kernel stacks added: each task gets its own 16 KiB kernel stack via deferred SP switch in __vectors_restore assembly. Next: multi-core (PSCI CPU_ON).)
-- honesty pass (2026-06-21): timer.rs doc comment said "non-secure physical timer" while the code uses CNTV_* (virtual timer). Fixed — the artifact now tells the truth about its own state. Also fixed 9 Rust 2024 unsafe-op-in-unsafe-fn warnings in user.rs. Build: 19 warnings → 10 (remaining are dead-code API surface).
+- honesty pass (2026-06-23): cleaned 16 Rust 2024 `unnecessary unsafe block` warnings — all 16 were `unsafe { kstack_top(N) }` nested inside an outer `unsafe { spawn(...) }` block in user.rs. Build: 16 warnings → 0. Also fixed docs/06 section 12: "What M6 does not do (yet)" still listed per-task kernel stacks as a deficiency after piece 10 implemented them.
 - M7: Apple Silicon bring-up via m1n1 — EL2 entry, FDT-driven console discovery, AIC driver, timers-over-FIQ
 - QEMU virt machine with -cpu max (for 16 KiB granule; cortex-a72 doesn't support it)
 - Rust stable toolchain with aarch64-unknown-none-softfloat target

@@ -649,15 +649,12 @@ multi-task exit: one task's death does not end the session.
 M6 is a teaching scheduler, not a production one. The honest list of
 what is missing:
 
-- **Per-task kernel stacks.** All tasks share the one boot stack
-  (`SP_EL1`). This works because the kernel is single-core and
-  cooperative (or preemptive with DAIF-set exception handlers), so only
-  one task's exception frame is on the stack at a time. A real OS gives
-  each task its own kernel stack so a stack overflow in one task's
-  syscall handler does not corrupt another's. M6's `save_and_switch`
-  copies the frame *off* the shared stack into the TCB, so the stack is
-  clean for the next task — but the stack itself is shared. Per-task
-  kernel stacks are the next rung.
+- **Per-task kernel stacks — DONE (piece 10).** Each task now gets its
+  own 16 KiB kernel stack. The SP switch is deferred to
+  `__vectors_restore` assembly via the `PENDING_KSTACK_SP` global: Rust
+  sets the pending SP, assembly applies it after all call frames are
+  popped. This prevents a stack overflow in one task's syscall handler
+  from corrupting another's.
 
 - **Multi-core.** The roadmap mentions PSCI `CPU_ON` for the cores M0
   parked. M6 is single-core only; `smp 1` in the QEMU command. The

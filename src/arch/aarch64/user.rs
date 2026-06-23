@@ -1758,10 +1758,10 @@ pub fn drop_to_el0_scheduled() {
     // Task B: TID 2, the "task B!" program.
     // SAFETY: single-core, interrupts masked (monitor context).
     let tid_a = unsafe {
-        crate::sched::spawn(b"A", ttbr0_a, unsafe { kstack_top(0) }, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+        crate::sched::spawn(b"A", ttbr0_a, kstack_top(0), USER_CODE_VA as u64, USER_STACK_TOP as u64)
     };
     let tid_b = unsafe {
-        crate::sched::spawn(b"B", ttbr0_b, unsafe { kstack_top(1) }, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+        crate::sched::spawn(b"B", ttbr0_b, kstack_top(1), USER_CODE_VA as u64, USER_STACK_TOP as u64)
     };
 
     match (tid_a, tid_b) {
@@ -1841,10 +1841,10 @@ pub fn drop_to_el0_preempt() {
     // ---- 2. Spawn both tasks ----
     // SAFETY: single-core, interrupts masked (monitor context).
     let tid_a = unsafe {
-        crate::sched::spawn(b"preA", ttbr0_a, unsafe { kstack_top(0) }, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+        crate::sched::spawn(b"preA", ttbr0_a, kstack_top(0), USER_CODE_VA as u64, USER_STACK_TOP as u64)
     };
     let tid_b = unsafe {
-        crate::sched::spawn(b"preB", ttbr0_b, unsafe { kstack_top(1) }, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+        crate::sched::spawn(b"preB", ttbr0_b, kstack_top(1), USER_CODE_VA as u64, USER_STACK_TOP as u64)
     };
 
     match (tid_a, tid_b) {
@@ -1941,9 +1941,9 @@ pub fn drop_to_el0_ipc() {
     // Task A (sender): TID 1. Task B (receiver): TID 2.
     // SAFETY: single-core, interrupts masked (monitor context).
     let tid_a =
-        unsafe { crate::sched::spawn(b"ipcA", ttbr0_a, unsafe { kstack_top(0) }, USER_CODE_VA as u64, USER_STACK_TOP as u64) };
+        unsafe { crate::sched::spawn(b"ipcA", ttbr0_a, kstack_top(0), USER_CODE_VA as u64, USER_STACK_TOP as u64) };
     let tid_b =
-        unsafe { crate::sched::spawn(b"ipcB", ttbr0_b, unsafe { kstack_top(1) }, USER_CODE_VA as u64, USER_STACK_TOP as u64) };
+        unsafe { crate::sched::spawn(b"ipcB", ttbr0_b, kstack_top(1), USER_CODE_VA as u64, USER_STACK_TOP as u64) };
 
     match (tid_a, tid_b) {
         (Some(a), Some(b)) => {
@@ -2015,10 +2015,10 @@ pub fn drop_to_el0_blkipc() {
     // Task A (sender): TID 1. Task B (receiver): TID 2.
     // SAFETY: single-core, interrupts masked (monitor context).
     let tid_a = unsafe {
-        crate::sched::spawn(b"blkA", ttbr0_a, unsafe { kstack_top(0) }, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+        crate::sched::spawn(b"blkA", ttbr0_a, kstack_top(0), USER_CODE_VA as u64, USER_STACK_TOP as u64)
     };
     let tid_b = unsafe {
-        crate::sched::spawn(b"blkB", ttbr0_b, unsafe { kstack_top(1) }, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+        crate::sched::spawn(b"blkB", ttbr0_b, kstack_top(1), USER_CODE_VA as u64, USER_STACK_TOP as u64)
     };
 
     match (tid_a, tid_b) {
@@ -2089,10 +2089,10 @@ pub fn drop_to_el0_sendblk() {
     // Task A (sender): TID 1. Task B (receiver): TID 2.
     // SAFETY: single-core, interrupts masked (monitor context).
     let tid_a = unsafe {
-        crate::sched::spawn(b"sdkA", ttbr0_a, unsafe { kstack_top(0) }, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+        crate::sched::spawn(b"sdkA", ttbr0_a, kstack_top(0), USER_CODE_VA as u64, USER_STACK_TOP as u64)
     };
     let tid_b = unsafe {
-        crate::sched::spawn(b"sdkB", ttbr0_b, unsafe { kstack_top(1) }, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+        crate::sched::spawn(b"sdkB", ttbr0_b, kstack_top(1), USER_CODE_VA as u64, USER_STACK_TOP as u64)
     };
 
     match (tid_a, tid_b) {
@@ -2157,10 +2157,10 @@ pub fn drop_to_el0_faultkill() {
     // Task A (faulting): TID 1. Task B (survivor): TID 2.
     // SAFETY: single-core, interrupts masked (monitor context).
     let tid_a = unsafe {
-        crate::sched::spawn(b"ftkA", ttbr0_a, unsafe { kstack_top(0) }, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+        crate::sched::spawn(b"ftkA", ttbr0_a, kstack_top(0), USER_CODE_VA as u64, USER_STACK_TOP as u64)
     };
     let tid_b = unsafe {
-        crate::sched::spawn(b"ftkB", ttbr0_b, unsafe { kstack_top(1) }, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+        crate::sched::spawn(b"ftkB", ttbr0_b, kstack_top(1), USER_CODE_VA as u64, USER_STACK_TOP as u64)
     };
 
     match (tid_a, tid_b) {
@@ -2235,10 +2235,10 @@ pub fn drop_to_el0_sleep() {
     // Task A (sleeper): TID 1. Task B (runner): TID 2.
     // SAFETY: single-core, interrupts masked (monitor context).
     let tid_a = unsafe {
-        crate::sched::spawn(b"slpA", ttbr0_a, unsafe { kstack_top(0) }, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+        crate::sched::spawn(b"slpA", ttbr0_a, kstack_top(0), USER_CODE_VA as u64, USER_STACK_TOP as u64)
     };
     let tid_b = unsafe {
-        crate::sched::spawn(b"slpB", ttbr0_b, unsafe { kstack_top(1) }, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+        crate::sched::spawn(b"slpB", ttbr0_b, kstack_top(1), USER_CODE_VA as u64, USER_STACK_TOP as u64)
     };
 
     match (tid_a, tid_b) {
@@ -2332,10 +2332,10 @@ pub fn drop_to_el0_wait() {
     // Task A (parent/waiter): TID 1. Task B (child): TID 2.
     // SAFETY: single-core, interrupts masked (monitor context).
     let tid_a = unsafe {
-        crate::sched::spawn(b"waiA", ttbr0_a, unsafe { kstack_top(0) }, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+        crate::sched::spawn(b"waiA", ttbr0_a, kstack_top(0), USER_CODE_VA as u64, USER_STACK_TOP as u64)
     };
     let tid_b = unsafe {
-        crate::sched::spawn(b"waiB", ttbr0_b, unsafe { kstack_top(1) }, USER_CODE_VA as u64, USER_STACK_TOP as u64)
+        crate::sched::spawn(b"waiB", ttbr0_b, kstack_top(1), USER_CODE_VA as u64, USER_STACK_TOP as u64)
     };
 
     match (tid_a, tid_b) {
