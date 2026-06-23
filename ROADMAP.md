@@ -93,13 +93,26 @@ Difficulty: **spike.** The EL1↔EL0 boundary concentrates everything sharp:
 exception returns, address-space switching, the first "untrusted memory"
 handling.
 
-## M6 — scheduler and IPC
+## M6 — scheduler and IPC ✅
 
 Cooperative round-robin first, then preemptive off the M3 timer tick.
 Context switch (callee-saved registers + `TTBR0` + per-task kernel stack),
 a few tasks, and a minimal message-passing IPC primitive. Multi-core can
 start here too (PSCI `CPU_ON` for the cores M0 parked) — or be deferred;
 single-core scheduling is plenty educational.
+
+Ten pieces, one heartbeat beat each: TCB, context switch (`save_and_switch`
+— the same `eret` path M5 built, a different frame), cooperative `yield`,
+IPC (`send`/`recv` via per-task mailboxes), blocking IPC (`recvblk`/
+`sendblk` — the `Blocked` state), scheduler-aware fault recovery
+(`kill_current_task`), preemptive scheduling (timer IRQ calls
+`save_and_switch`), `sleep(ticks)` (timer-driven blocking), `wait(tid)`
+(task-lifecycle blocking), per-task kernel stacks (deferred SP switch in
+`__vectors_restore` assembly). All verified in QEMU 2026-06-23.
+
+Multi-core (PSCI `CPU_ON`) is the one roadmap item deferred — M6 is
+single-core only, and the scheduler's `unsafe fn scheduler()` is safe
+under that invariant. The full story is docs/06-scheduler.md.
 
 Difficulty: moderate-hard. Conceptually clean, but the first preemption
 bugs are heisenbugs by nature.

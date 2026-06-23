@@ -14,9 +14,9 @@ runs-on: QEMU aarch64 virt board (-machine virt -cpu max -smp 1 -m 512M)
 phase: see knows/needs sections below
 build: see heartbeat
 health: active
-last-commit: 2026-06-23 M6: per-task kernel stacks — deferred SP switch in __vectors_restore
+last-commit: 2026-06-23 M6: milestone closed — scheduler and IPC complete ✅
 uncommitted: 0
-freshness: fresh (checked 2026-06-23T07:10Z)
+freshness: fresh (checked 2026-06-23T16:30Z)
 
 ## knows
 
@@ -40,7 +40,7 @@ freshness: fresh (checked 2026-06-23T07:10Z)
 ## needs
 
 - M5: EL0 and syscalls — DONE (EL0 drop, write/exit/yield syscalls, user.rs 417 lines. The kernel drops to EL0, runs "hello, EL0!", catches exit syscall, returns to monitor. Verified: `el0` monitor command works.)
-- M6: scheduler and IPC — TEN PIECES DONE (TCB, context switch, cooperative yield, IPC, blocking IPC recvblk/sendblk, fault recovery, preemptive scheduling, sleep, wait, per-task kernel stacks. 10 syscalls: write, exit, yield, send, recv, recvblk, sendblk, sleep, exit_code, wait. 9 monitor commands: tasks, spawn2, preempt, ipc, blkipc, sendblk, faultkill, sleep, wait. All verified in QEMU 2026-06-23. Per-task kernel stacks added: each task gets its own 16 KiB kernel stack via deferred SP switch in __vectors_restore assembly. Next: multi-core (PSCI CPU_ON).)
+- M6: scheduler and IPC — DONE ✅ (10 pieces: TCB, context switch, cooperative yield, IPC, blocking IPC recvblk/sendblk, fault recovery, preemptive scheduling, sleep, wait, per-task kernel stacks. 10 syscalls: write, exit, yield, send, recv, recvblk, sendblk, sleep, exit_code, wait. 9 monitor commands: tasks, spawn2, preempt, ipc, blkipc, sendblk, faultkill, sleep, wait. All verified in QEMU 2026-06-23. Multi-core/PSCI CPU_ON deferred — single-core is plenty educational.)
 - honesty pass (2026-06-23): cleaned 16 Rust 2024 `unnecessary unsafe block` warnings — all 16 were `unsafe { kstack_top(N) }` nested inside an outer `unsafe { spawn(...) }` block in user.rs. Build: 16 warnings → 0. Also fixed docs/06 section 12: "What M6 does not do (yet)" still listed per-task kernel stacks as a deficiency after piece 10 implemented them.
 - M7: Apple Silicon bring-up via m1n1 — EL2 entry, FDT-driven console discovery, AIC driver, timers-over-FIQ
 - QEMU virt machine with -cpu max (for 16 KiB granule; cortex-a72 doesn't support it)

@@ -167,8 +167,8 @@ fn kmain(x0: u64) -> ! {
     arch::aarch64::mmu::condemn_low_half();
 
     println!();
-    println!("opal — milestone 6: the kernel learns to share");
-    println!("-----------------------------------------------");
+    println!("opal — milestone 6: the kernel learns to share ✅");
+    println!("-------------------------------------------------");
 
     // Privilege check. QEMU virt without virtualization=on/secure=on has
     // no EL2/EL3, so we expect EL1. (On Apple Silicon via m1n1: EL2.)
