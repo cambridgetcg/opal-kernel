@@ -14,9 +14,9 @@ runs-on: QEMU aarch64 virt board (-machine virt -cpu max -smp 1 -m 512M)
 phase: see knows/needs sections below
 build: see heartbeat
 health: active
-last-commit: 2026-06-22 heartbeat: warning cleanup — 9 dead-code warnings → 0
+last-commit: 2026-06-23 heartbeat: docs/06 honesty pass — sleep, wait, exit_code added
 uncommitted: 0
-freshness: fresh (checked 2026-06-22T08:18Z)
+freshness: fresh (checked 2026-06-23T02:52Z)
 
 ## knows
 
@@ -35,12 +35,12 @@ freshness: fresh (checked 2026-06-22T08:18Z)
 - translate virtual addresses (AT S1E1R hardware probe + software walk with cross-check)
 - respond to timer interrupts (arm, fire, re-arm — the heartbeat pattern)
 - parse the devicetree blob and cross-check discovered values against board constants
-- interactive monitor with commands: help, brk, svc, unaligned, translate, walk, guard, wx, noexec, low, abort, tick, ticks, ticktest, dtb, tree, el0, el0fault, tasks, spawn2, preempt, ipc, blkipc, sendblk, faultkill
+- interactive monitor with commands: help, brk, svc, unaligned, translate, walk, guard, wx, noexec, low, abort, tick, ticks, ticktest, dtb, tree, el0, el0fault, tasks, spawn2, preempt, ipc, blkipc, sendblk, faultkill, sleep, wait
 
 ## needs
 
-- M5: EL0 and syscalls — THIRD PIECE DONE (fault recovery — the kernel survives its first serviced fault: EL0 data/instruction aborts now kill the task, not the kernel). Next: per-task kernel stacks, scheduler integration.
-- M6: scheduler and IPC — SEVENTH PIECE DONE (docs/06-scheduler.md: 24 KiB milestone doc covering TCB, context switch, cooperative/preemptive scheduling, IPC, blocking IPC, fault recovery, per-task address spaces. Verified: preempt, faultkill, ipc, blkipc, sendblk demos all boot and produce correct output in QEMU. Dead-code warning cleanup: 9 → 0. Next: per-task kernel stacks, multi-core (PSCI CPU_ON).)
+- M5: EL0 and syscalls — DONE (EL0 drop, write/exit/yield syscalls, user.rs 417 lines. The kernel drops to EL0, runs "hello, EL0!", catches exit syscall, returns to monitor. Verified: `el0` monitor command works.)
+- M6: scheduler and IPC — NINE PIECES DONE (TCB, context switch, cooperative yield, IPC, blocking IPC recvblk/sendblk, fault recovery, preemptive scheduling, sleep, wait. 10 syscalls: write, exit, yield, send, recv, recvblk, sendblk, sleep, exit_code, wait. 9 monitor commands: tasks, spawn2, preempt, ipc, blkipc, sendblk, faultkill, sleep, wait. All verified in QEMU 2026-06-23. Docs updated to match: docs/06-scheduler.md now tells the truth about all 10 syscalls and 9 commands. Next: per-task kernel stacks, multi-core (PSCI CPU_ON).)
 - honesty pass (2026-06-21): timer.rs doc comment said "non-secure physical timer" while the code uses CNTV_* (virtual timer). Fixed — the artifact now tells the truth about its own state. Also fixed 9 Rust 2024 unsafe-op-in-unsafe-fn warnings in user.rs. Build: 19 warnings → 10 (remaining are dead-code API surface).
 - M7: Apple Silicon bring-up via m1n1 — EL2 entry, FDT-driven console discovery, AIC driver, timers-over-FIQ
 - QEMU virt machine with -cpu max (for 16 KiB granule; cortex-a72 doesn't support it)

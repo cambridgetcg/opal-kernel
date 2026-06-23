@@ -37,6 +37,8 @@ in the order the heartbeat built them:
 5. **Blocking IPC** — `recvblk` and `sendblk`: the Blocked state
 6. **Fault recovery** — the OS survives a task's death
 7. **Preemptive scheduling** — the timer takes the CPU away
+8. **Sleep** — `sleep(ticks)`: timer-driven blocking, the timer as the satisfier
+9. **Wait** — `wait(tid)`: task-lifecycle blocking, a child's exit as the satisfier
 
 Each piece was one heartbeat beat — one file, one feature, tested in
 QEMU, committed. The rhythm is the same as the timer interrupt M3 built:
@@ -64,13 +66,16 @@ pause a task and resume it later:
 #[repr(C)]
 pub struct Task {
     pub saved: TrapFrame,       // 288 bytes — the register file at last svc
-    pub ttbr0_pa: u64,          // PA of this task's user page-table root
-    pub state: TaskState,       // Ready, Running, Blocked, or Exited
-    pub name: [u8; 8],          // human-readable name for diagnostics
-    pub mailbox: [u8; 32],      // IPC inbox — one message at a time
-    pub mailbox_len: usize,     // 0 = empty, >0 = message waiting
-    pub mailbox_from: usize,    // sender's TID
+    pub ttbr0_pa: u64,           // PA of this task's user page-table root
+    pub state: TaskState,        // Ready, Running, Blocked, or Exited
+    pub name: [u8; 8],           // human-readable name for diagnostics
+    pub mailbox: [u8; 32],       // IPC inbox — one message at a time
+    pub mailbox_len: usize,      // 0 = empty, >0 = message waiting
+    pub mailbox_from: usize,     // sender's TID
     pub blocked_send_dst: usize, // TID we're blocked sending to (0 = not)
+    pub wake_tick: u64,          // tick deadline for sleep (0 = not sleeping)
+    pub exit_code: i64,          // exit code for wait() (0 = not exited)
+    pub waiting_on: usize,       // TID we're waiting for in wait() (0 = not)
 }
 ```
 
@@ -106,9 +111,10 @@ Exited  ──spawn──▶  Ready  ──dispatch──▶  Running
                    Blocked ──wake──▶ Ready
 ```
 
-The `Blocked` state is M6's IPC half: a task sleeping on a condition
-(mailbox empty for `recvblk`, mailbox full for `sendblk`), waiting for
-another task to wake it. Before M6's IPC, the state machine was just
+The `Blocked` state is M6's IPC and timer half: a task sleeping on a
+condition — mailbox empty for `recvblk`, mailbox full for `sendblk`,
+timer deadline for `sleep`, child exit for `wait` — waiting for another
+task or the timer to wake it. Before M6's IPC, the state machine was just
 `Ready → Running → Exited`.
 
 ---
@@ -303,6 +309,9 @@ The syscall ABI:
 | `recv`   | 5 | x0=buf, x1=buf_len | x0=bytes, x1=sender_tid |
 | `recvblk`| 6 | x0=buf, x1=buf_len | x0=bytes, x1=sender_tid |
 | `sendblk`| 7 | x0=dst_tid, x1=buf, x2=len | x0=0 / -errno |
+| `sleep`  | 8 | x0=ticks | x0=0 on wake |
+| `exit_code` | 9 | x0=code | does not return |
+| `wait`   | 10 | x0=child_tid | x0=exit_code / -ESRCH |
 
 Non-blocking `send` returns `-EAGAIN` if the mailbox is full; the sender
 can `yield` and retry. Non-blocking `recv` returns `-EAGAIN` if empty.
@@ -497,7 +506,109 @@ distinguishes voluntary from involuntary switches — printed by
 
 ---
 
-## 10. The exit path: returning to the monitor
+## 10. Sleep and wait: the timer and lifecycle blocking primitives
+
+Preemption proves the timer can take the CPU away. Sleep and wait prove
+the timer and task lifecycle can *put a task to sleep* — the Blocked state's
+third and fourth conditions.
+
+### Sleep (SYS_SLEEP, x8=8)
+
+`sleep(ticks)` blocks the calling task for `ticks` timer ticks. The handler
+sets the TCB's `wake_tick` deadline to `now + ticks`, sets `x0=0` (the
+return value) *before* blocking, and calls `block_and_switch`. Unlike
+`recvblk`/`sendblk`, sleep does **not** rewind ELR — there is no condition
+to re-check on wake. The timer is the satisfier, and when it fires, the
+sleep is simply done. The frame (with `x0=0`, ELR pointing past the svc)
+is saved into the TCB; when `wake_sleepers` wakes the task, the scheduler
+restores this frame and `eret` resumes after the svc.
+
+```rust
+SYS_SLEEP => {
+    let ticks = frame.x[0];
+    let now = crate::arch::aarch64::timer::ticks();
+    if let Some(t) = unsafe { crate::sched::task(cur) } {
+        t.wake_tick = now + ticks;
+    }
+    frame.x[0] = 0;  // return value set before blocking
+    unsafe { crate::sched::block_and_switch(frame) };
+}
+```
+
+The timer IRQ handler's `wake_sleepers` scans the task table for Blocked
+tasks whose `wake_tick` has elapsed, sets them Ready, and enqueues them:
+
+```rust
+pub unsafe fn wake_sleepers() {
+    let now = crate::arch::aarch64::timer::ticks();
+    for tid in 1..MAX_TASKS {
+        let t = unsafe { &raw mut TASK_TABLE[tid] };
+        let wt = unsafe { (*t).wake_tick };
+        if wt == 0 || wt > now { continue; }
+        if unsafe { (*t).state } != TaskState::Blocked {
+            unsafe { (*t).wake_tick = 0 };
+            continue;
+        }
+        unsafe { (*t).wake_tick = 0; (*t).state = TaskState::Ready; }
+        unsafe { scheduler() }.enqueue(tid);
+    }
+}
+```
+
+The `sleep` monitor command demonstrates this: task A calls `sleep(3)`,
+task B runs while A sleeps, and when 3 ticks elapse the timer wakes A.
+
+### Wait (SYS_WAIT, x8=10)
+
+`wait(child_tid)` blocks the calling task until task `child_tid` exits,
+then returns its exit code. If the child has already exited, `try_wait`
+returns the code immediately. If not, the handler sets `waiting_on =
+child_tid`, rewinds ELR by 4 (the retry-on-wake trick), and calls
+`block_and_switch`. When the child calls `exit(code)`, the exit handler
+stores `exit_code` in the child's TCB and calls `wake_waiters`, which
+scans for Blocked tasks with `waiting_on == exiting_tid`, wakes them,
+and the parent re-enters the `wait` svc — this time `try_wait` finds
+the child Exited and returns the code.
+
+```rust
+SYS_WAIT => {
+    match unsafe { crate::sched::try_wait(child_tid) } {
+        Ok(code) => { frame.x[0] = code as u64; }
+        Err(EAGAIN) => {
+            if let Some(t) = unsafe { crate::sched::task(cur) } {
+                t.waiting_on = child_tid;
+            }
+            frame.elr = frame.elr.wrapping_sub(4);  // retry on wake
+            unsafe { crate::sched::block_and_switch(frame) };
+        }
+        Err(e) => { frame.x[0] = e as u64; }
+    }
+}
+```
+
+`exit(code)` (SYS_EXIT_CODE, x8=9) is the companion: it stores `x0` in
+the TCB's `exit_code` field, wakes any waiting parents via
+`wake_waiters`, then switches to the next task or returns to the
+monitor. The original `exit` (x8=2) and `exit_code` (x8=9) share the
+same handler — the only difference is whether the program intended `x0`
+as a code.
+
+The four blocking conditions form a complete set:
+
+| | condition | satisfier | wake function |
+|---|---|---|---|
+| **recvblk** | mailbox empty | another task sends | `ipc_send` (inline) |
+| **sendblk** | mailbox full | receiver drains | `wake_blocked_senders` |
+| **sleep** | tick deadline | timer reaches deadline | `wake_sleepers` |
+| **wait** | child alive | child exits | `wake_waiters` |
+
+All four use the same `block_and_switch` → Blocked → wake → Ready →
+enqueue → resume path. The only difference is who pulls the trigger:
+another task (IPC), the timer (sleep), or a child's lifecycle (wait).
+
+---
+
+## 11. The exit path: returning to the monitor
 
 When the last task calls `exit`, `save_and_switch` returns `false` —
 there is no other task to run. The `exit` handler disables preemption
@@ -533,7 +644,7 @@ multi-task exit: one task's death does not end the session.
 
 ---
 
-## 11. What M6 does not do (yet)
+## 12. What M6 does not do (yet)
 
 M6 is a teaching scheduler, not a production one. The honest list of
 what is missing:
@@ -569,7 +680,7 @@ what is missing:
 
 ---
 
-## 12. The monitor commands
+## 13. The monitor commands
 
 M6 added several monitor commands, each demonstrating one piece:
 
@@ -582,6 +693,8 @@ M6 added several monitor commands, each demonstrating one piece:
 | `blkipc`    | blocking `recvblk` — B sleeps, A's `send` wakes it |
 | `sendblk`   | blocking `sendblk` — A sleeps on full mailbox, B's `recv` wakes it |
 | `faultkill` | scheduler-aware fault recovery — A faults, B survives |
+| `sleep`     | timer-driven blocking — A sleeps for N ticks, timer wakes it |
+| `wait`      | task-lifecycle blocking — A waits for B to exit, gets exit code |
 
 Each is a one-shot demo: spawn tasks, drop to EL0, run until the last
 task exits, return to the monitor. They prove their piece and get out
@@ -589,7 +702,7 @@ of the way.
 
 ---
 
-## 13. The principle
+## 14. The principle
 
 M6's deepest idea is that context switch is not new machinery — it is
 the *same* `eret` path M5 built for a single syscall return, just with
@@ -599,12 +712,12 @@ copy: save the current frame into the TCB, load the next TCB's frame
 onto the stack, `eret`. The CPU never knows a switch happened.
 
 This is why M6 could be built one beat at a time: each piece (TCB,
-switch, cooperative yield, IPC, blocking IPC, fault recovery, preemption)
-plugs into the same return path. The scheduler does not invent a new
-mechanism for the timer to drive; it reuses the one the yield syscall
-already exercises. The timer IRQ handler calls the same `save_and_switch`
-the yield handler does — the only difference is *who pulled the
-trigger*.
+switch, cooperative yield, IPC, blocking IPC, fault recovery, preemption,
+sleep, wait) plugs into the same return path. The scheduler does not
+invent a new mechanism for the timer to drive; it reuses the one the
+yield syscall already exercises. The timer IRQ handler calls the same
+`save_and_switch` the yield handler does — the only difference is *who
+pulled the trigger*.
 
 The timer re-arms itself. Each beat determines the next. The heartbeat
 that built M6 is the meta-layer of the same idea: arm, fire, re-arm.
