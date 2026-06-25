@@ -86,7 +86,9 @@ _start:
     // x0 may carry a devicetree pointer (m1n1 / Linux protocol; QEMU ELF
     // boot leaves 0). It must survive two function calls before reaching
     // _start_rust, and AAPCS64 says x19 is callee-saved — Rust will give
-    // it back exactly as the calls found it.
+    // it back exactly as the calls found it. Stash it early: the EL2 drop
+    // below uses eret, and x19 survives eret (it's a general register,
+    // not banked across EL).
     mov   x19, x0
 
     // ---- 3. KERNEL_BASE, twice, compared, then parked somewhere safe ------
@@ -101,11 +103,87 @@ _start:
     // that boots because the register allocator happened not to pick x3
     // is a kernel one rustc upgrade away from a silent hang. Callee-saved
     // x21 is the same AAPCS64 logic that parks the DTB pointer in x19.
+    //
+    // Computed before the EL2 drop so the drop can use x21 to find
+    // __vectors' physical address for VBAR_EL2. x21 survives eret.
     movz  x3, #0xFFFF, lsl #48    // KERNEL_BASE, the local belief
     ldr   x4, =__kernel_va_base   // KERNEL_BASE, the linker's truth
     cmp   x3, x4
     b.ne  .L_halt                 // disagree? nothing can be trusted; park
     mov   x21, x3                 // x21 = KERNEL_BASE, for the whole climb
+
+    // ---- 3b. Drop from EL2 to EL1 if we entered at EL2 -------------------
+    // QEMU's virt machine without virtualization extensions boots us at
+    // EL1. m1n1 on Apple Silicon boots us at EL2 (Apple implements no
+    // EL3; iBoot's last act is to drop to EL2). Every EL1 system register
+    // this stub touches below — VBAR_EL1, SCTLR_EL1, TTBR1_EL1 — traps
+    // to EL2 if we try it from EL2. So before anything else, detect the
+    // exception level and, if it's 2, configure the minimal EL2 state
+    // that lets EL1 run the kernel, then eret down to EL1.
+    //
+    // What we configure at EL2 (and why):
+    //
+    // - VBAR_EL2: point at our own exception vectors at their physical
+    //   address (x21 = KERNEL_BASE is already computed; pool + subtract
+    //   gives the PA). An EL2 trap during the drop would otherwise vector
+    //   into nowhere. This is a safety net — kmain re-points VBAR_EL1
+    //   once it runs at EL1.
+    //
+    // - HCR_EL2: RW=1 (EL1 is AArch64, not AArch32), and we clear
+    //   everything else so IRQ/FIQ/Abort are NOT trapped to EL2 — they
+    //   go to EL1 where M1's vector table catches them. The simplest
+    //   correct HCR for a guest that IS the kernel.
+    //
+    // - CNTHCTL_EL2: EL2 controls whether EL1 can use the virtual timer.
+    //   Bit 0 (EVNTI) = 1 lets EL1 access CNTV_CTL_EL0 / CNTV_CVAL_EL0
+    //   without trapping. Without this, M3's timer — the heartbeat —
+    //   would trap to EL2 on every arm/rearm. (QEMU starts at EL1 so
+    //   CNTHCTL was never our problem; on Apple it is.)
+    //
+    // - CNTVOFF_EL2: set to 0 so the virtual timer count equals the
+    //   physical count — same assumption M3's timer code makes today.
+    //
+    // - SPSR_EL2: the EL1 return state: EL1h (SP_EL1, not SP_EL0),
+    //   IRQ+FIQ masked — matching QEMU's EL1 reset. DAIF [9:6] = 0b1111,
+    //   mode [4:0] = 0b00101 (EL1h). SPSR_EL2 = 0x3C5.
+    //
+    // - ELR_EL2: where eret returns to — the .L_el1_entry label below,
+    //   at its physical address (adr is PC-relative, MMU-off safe).
+    //
+    // After eret: EL1, MMU off, caches off, x0/x19/x21 intact — the same
+    // state QEMU hands us natively. The rest of the stub is unchanged.
+    mrs   x1, CurrentEL
+    lsr   x1, x1, #2
+    and   x1, x1, #3
+    cmp   x1, #2
+    b.ne  .L_el1_entry            // already at EL1 (QEMU) — skip the drop
+
+    // We are at EL2. Configure the minimum EL2 state and eret to EL1.
+    ldr   x9, =__vectors
+    sub   x9, x9, x21             // __vectors PA (x21 = KERNEL_BASE)
+    msr   VBAR_EL2, x9
+
+    movz  x9, #0x8000, lsl #16    // HCR_EL2: RW bit (31) = 1, rest 0
+    movk  x9, #0x0000, lsl #0     //   (0x8000_0000: AArch64 EL1, no trapping)
+    msr   HCR_EL2, x9
+
+    mov   x9, #1                  // CNTHCTL_EL2: EVNTI=1 (EL1 can use CNTV)
+    msr   CNTHCTL_EL2, x9
+
+    msr   CNTVOFF_EL2, xzr        // virtual offset = 0 (vcount == pcount)
+
+    movz  x9, #0x3C5              // SPSR_EL2: DAIF=0b1111 | EL1h=0b0101
+    msr   SPSR_EL2, x9
+
+    adr   x9, .L_el1_entry        // ELR_EL2: PA of the EL1 entry label
+    msr   ELR_EL2, x9
+
+    eret                          // → EL1, PC = .L_el1_entry, x0/x19/x21 intact
+
+.L_el1_entry:
+    // Now at EL1 (whether we came from EL2 or started here). The rest of
+    // the stub runs exactly as it did before M7 — the EL2 drop is a no-op
+    // on QEMU, and a one-time stair-step on Apple Silicon.
 
     // ---- 4. Give ourselves a stack (at its physical address) -------------
     // __stack_top is a high VMA now; the machine is not. Pool + subtract.
@@ -253,7 +331,7 @@ _start:
 /// Must only be reached from `_start` above — it assumes the environment
 /// that stub created.
 #[unsafe(no_mangle)] // edition 2024: no_mangle is an unsafe attribute,
-// because colliding symbol names break linkage soundness
+                     // because colliding symbol names break linkage soundness
 pub unsafe extern "C" fn _start_rust(x0: u64) -> ! {
     crate::kmain(x0)
 }
