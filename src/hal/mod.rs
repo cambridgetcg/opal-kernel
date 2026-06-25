@@ -15,3 +15,4 @@
 
 pub mod gicv2;
 pub mod pl011;
+pub mod s5l_uart;
