@@ -2465,6 +2465,32 @@ pub fn return_to_monitor() -> ! {
 /// - Returns: the stub restores (possibly modified) registers and
 ///   erets. For write, eret goes back to EL0. For exit, eret goes
 ///   to the trampoline at EL1.
+
+/// Validate that a user-supplied buffer address range [buf_va, buf_va+len)
+/// falls within the user address space (the low half, below KERNEL_BASE).
+/// This prevents a malicious user program from passing a kernel-space
+/// virtual address that the kernel would dereference through TTBR1,
+/// reading or writing kernel memory.
+///
+/// Returns true if the range is within the user's low-half VA space
+/// and does not overflow.
+fn is_valid_user_range(buf_va: usize, len: usize) -> bool {
+    // The user address space is the low half: VAs with bit 47 clear,
+    // i.e. below KERNEL_BASE. Any address >= KERNEL_BASE is kernel
+    // space (TTBR1) and must be rejected.
+    if buf_va >= mmu::KERNEL_BASE {
+        return false;
+    }
+    // Check for overflow in buf_va + len.
+    if len == 0 {
+        return true;
+    }
+    match buf_va.checked_add(len) {
+        Some(end) => end <= mmu::KERNEL_BASE,
+        None => false,
+    }
+}
+
 pub fn handle_svc_from_el0(frame: &mut super::vectors::TrapFrame) {
     let nr = frame.x[8];
     match nr {
@@ -2478,6 +2504,13 @@ pub fn handle_svc_from_el0(frame: &mut super::vectors::TrapFrame) {
             }
             if len > 256 {
                 frame.x[0] = (-7i64) as u64; // -E2BIG
+                return;
+            }
+            // Validate the user buffer is in the user address space,
+            // not kernel space — prevents kernel memory reads via a
+            // forged buf_va.
+            if !is_valid_user_range(buf_va, len) {
+                frame.x[0] = (-14i64) as u64; // -EFAULT
                 return;
             }
             let mut bytes_written = 0u64;
@@ -2544,7 +2577,13 @@ pub fn handle_svc_from_el0(frame: &mut super::vectors::TrapFrame) {
             }
             let len = len.min(crate::sched::MSG_MAX);
 
-            // Read the user buffer byte-by-byte through TTBR0. We are
+            // Validate the user buffer is in user space.
+            if !is_valid_user_range(buf_va, len) {
+                frame.x[0] = (-14i64) as u64; // -EFAULT
+                return;
+            }
+
+            // Read the user buffer byte-by-byte through TTBR0.
             // at EL1; the user VA is valid in the user's address space.
             // SAFETY: buf_va is a user VA mapped in the user tables.
             let mut msg = [0u8; crate::sched::MSG_MAX];
@@ -2576,6 +2615,13 @@ pub fn handle_svc_from_el0(frame: &mut super::vectors::TrapFrame) {
                 return;
             }
             let buf_len = buf_len.min(crate::sched::MSG_MAX);
+
+            // Validate the user buffer is in user space (kernel writes
+            // to it — must not write to kernel memory).
+            if !is_valid_user_range(buf_va, buf_len) {
+                frame.x[0] = (-14i64) as u64; // -EFAULT
+                return;
+            }
 
             let mut msg = [0u8; crate::sched::MSG_MAX];
             // SAFETY: exception context, single-core, DAIF set.
@@ -2620,6 +2666,12 @@ pub fn handle_svc_from_el0(frame: &mut super::vectors::TrapFrame) {
                 return;
             }
             let buf_len = buf_len.min(crate::sched::MSG_MAX);
+
+            // Validate the user buffer is in user space.
+            if !is_valid_user_range(buf_va, buf_len) {
+                frame.x[0] = (-14i64) as u64; // -EFAULT
+                return;
+            }
 
             let mut msg = [0u8; crate::sched::MSG_MAX];
             // SAFETY: exception context, single-core, DAIF set.
@@ -2686,6 +2738,12 @@ pub fn handle_svc_from_el0(frame: &mut super::vectors::TrapFrame) {
                 return;
             }
             let len = len.min(crate::sched::MSG_MAX);
+
+            // Validate the user buffer is in user space.
+            if !is_valid_user_range(buf_va, len) {
+                frame.x[0] = (-14i64) as u64; // -EFAULT
+                return;
+            }
 
             // Read the user buffer into a kernel-local copy. We must
             // read it *before* blocking, because the user VA is in the
@@ -2800,8 +2858,11 @@ pub fn handle_svc_from_el0(frame: &mut super::vectors::TrapFrame) {
             }
 
             // Set the wake deadline: current tick count + ticks.
+            // Use checked_add to prevent overflow: a huge `ticks` value
+            // could make the deadline wrap to a small number, causing the
+            // task to wake immediately instead of sleeping.
             let now = crate::arch::aarch64::timer::ticks();
-            let deadline = now + ticks;
+            let deadline = now.checked_add(ticks).unwrap_or(u64::MAX);
             // SAFETY: exception context, single-core, DAIF set.
             if let Some(t) = unsafe { crate::sched::task(cur) } {
                 t.wake_tick = deadline;

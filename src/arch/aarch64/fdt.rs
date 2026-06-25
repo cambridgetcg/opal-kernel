@@ -170,7 +170,11 @@ pub struct ReserveEntry {
 /// `base` must be a valid readable virtual address for at least
 /// `totalsize` bytes. The caller (`Fdtr::new`) validates this once.
 unsafe fn read_be_u32(base: usize, offset: usize, totalsize: usize) -> Option<u32> {
-    if offset + 4 > totalsize {
+    // Use checked_add to prevent overflow: a malicious FDT could set
+    // offset to a value near usize::MAX so that offset + 4 wraps to a
+    // small number, bypassing the bounds check and causing an OOB read.
+    let end = offset.checked_add(4)?;
+    if end > totalsize {
         return None;
     }
     // SAFETY: bounds-checked above; `base` is a valid readable VA for
@@ -187,7 +191,9 @@ unsafe fn read_be_u32(base: usize, offset: usize, totalsize: usize) -> Option<u3
 /// Same contract as [`read_be_u32`].
 #[allow(dead_code)]
 unsafe fn read_be_u64(base: usize, offset: usize, totalsize: usize) -> Option<u64> {
-    if offset + 8 > totalsize {
+    // Use checked_add to prevent overflow (same rationale as read_be_u32).
+    let end = offset.checked_add(8)?;
+    if end > totalsize {
         return None;
     }
     // SAFETY: bounds-checked above; `base` is a valid readable VA.
@@ -333,8 +339,13 @@ impl Fdtr {
         };
 
         // Sanity: structure and string blocks must be within the blob.
-        let struct_end = header.off_dt_struct as usize + header.size_dt_struct as usize;
-        let strings_end = header.off_dt_strings as usize + header.size_dt_strings as usize;
+        // Use checked_add to prevent overflow: a crafted FDT could set
+        // off_dt_struct and size_dt_struct so their sum wraps to a small
+        // value, bypassing the bounds check.
+        let struct_end = (header.off_dt_struct as usize)
+            .checked_add(header.size_dt_struct as usize)?;
+        let strings_end = (header.off_dt_strings as usize)
+            .checked_add(header.size_dt_strings as usize)?;
         if struct_end > totalsize || strings_end > totalsize {
             return None;
         }
@@ -395,7 +406,9 @@ impl Fdtr {
     /// offset `nameoff` (relative to the blob start, i.e. already
     /// including `off_dt_strings`). Property names live here.
     fn string_at(&self, nameoff: u32) -> Option<&str> {
-        let off = self.header.off_dt_strings as usize + nameoff as usize;
+        // Use checked_add to prevent overflow: a malicious nameoff could
+        // make off_dt_strings + nameoff wrap to a small value.
+        let off = (self.header.off_dt_strings as usize).checked_add(nameoff as usize)?;
         let strings_end =
             self.header.off_dt_strings as usize + self.header.size_dt_strings as usize;
         // Use the string block's own bounds for the string scan, not
@@ -411,7 +424,11 @@ impl Fdtr {
     /// byte offset `off`. Returns a `&[u8]` borrowed from the blob.
     fn struct_bytes(&self, off: usize, len: usize) -> Option<&[u8]> {
         let ts = self.header.totalsize as usize;
-        if off + len > ts || off > ts {
+        // Use checked_add to prevent overflow: a crafted FDT property
+        // with a huge `len` could make `off + len` wrap to a small value,
+        // passing the check and yielding an out-of-bounds slice.
+        let end = off.checked_add(len)?;
+        if end > ts || off > ts {
             return None;
         }
         // SAFETY: `base` is a valid readable VA for `totalsize` bytes
@@ -515,11 +532,13 @@ impl Fdtr {
         let struct_end = self.struct_end();
 
         loop {
-            if off + 4 > struct_end {
+            // Use checked_add to prevent overflow in the walking offset.
+            let off_end = off.checked_add(4)?;
+            if off_end > struct_end {
                 return None;
             }
             let token = self.struct_u32(off)?;
-            off += 4;
+            off = off.checked_add(4)?;
 
             match token {
                 FDT_PROP => {
@@ -527,8 +546,8 @@ impl Fdtr {
                     // (The token itself is the first u32; the 12-byte count
                     // in the task description includes the token.)
                     let len = self.struct_u32(off)? as usize;
-                    let nameoff = self.struct_u32(off + 4)?;
-                    off += 8; // skip len + nameoff
+                    let nameoff = self.struct_u32(off.checked_add(4)?)?;
+                    off = off.checked_add(8)?; // skip len + nameoff
 
                     // Look up the property name in the string block.
                     let pname = self.string_at(nameoff)?;
@@ -539,8 +558,8 @@ impl Fdtr {
                     }
 
                     // Advance past the data, padded to 4 bytes.
-                    let data_padded = (len + 3) & !3;
-                    off += data_padded;
+                    let data_padded = (len.checked_add(3)? ) & !3;
+                    off = off.checked_add(data_padded)?;
                 }
                 FDT_NOP => {
                     // No-op token, just skip.
@@ -634,24 +653,26 @@ impl Fdtr {
         let name_off = node.offset + 4;
         let name = self.struct_cstr(name_off)?;
         let name_padded = (name.len() + 1 + 3) & !3;
-        let mut off = name_off + name_padded;
+        let mut off = name_off.checked_add(name_padded)?;
 
         let struct_end = self.struct_end();
 
         loop {
-            if off + 4 > struct_end {
+            let off_end = off.checked_add(4)?;
+            if off_end > struct_end {
                 return None;
             }
             let token = self.struct_u32(off)?;
             match token {
                 FDT_PROP => {
                     // Skip the property header + data.
-                    let len = self.struct_u32(off + 4)? as usize;
-                    let data_padded = (len + 3) & !3;
-                    off += 4 + 8 + data_padded; // token + header + data
+                    let len = self.struct_u32(off.checked_add(4)?)? as usize;
+                    let data_padded = (len.checked_add(3)?) & !3;
+                    // token (4) + header (8) + data
+                    off = off.checked_add(4)?.checked_add(8)?.checked_add(data_padded)?;
                 }
                 FDT_NOP => {
-                    off += 4;
+                    off = off.checked_add(4)?;
                 }
                 FDT_BEGIN_NODE => {
                     return Some(off);
@@ -940,7 +961,7 @@ impl<'a> Iterator for NodeIter<'a> {
                     // Skip past the node name (null-terminated, 4-aligned).
                     let name = self.fdt.struct_cstr(self.offset)?;
                     let name_padded = (name.len() + 1 + 3) & !3;
-                    self.offset += name_padded;
+                    self.offset = self.offset.checked_add(name_padded)?;
 
                     if self.depth == 0 {
                         // Direct child — yield it and descend into its
