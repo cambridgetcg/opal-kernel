@@ -469,6 +469,107 @@ fn parse_hex(s: &str) -> Option<u64> {
     u64::from_str_radix(s, 16).ok()
 }
 
+/// M7 bridge: discover the console UART from the FDT and write to it at
+/// the discovered address.
+///
+/// Walks the devicetree looking for a node whose `compatible` property
+/// contains `"arm,pl011"` — not by hardcoded path, but by what the node
+/// *is*. This is how `board/apple.rs` will find its s5l UART (by
+/// `"apple,s5l-uart"` compatibility) when the path and address are both
+/// unknown. Once found, reads the `reg` property for the physical base,
+/// maps it through `phys_to_virt`, and writes a message directly to the
+/// PL011 at that virtual address — proving the FDT address is real, not
+/// just a cross-check against a compiled constant.
+fn fdt_console_write(fdt: &arch::aarch64::fdt::Fdtr) {
+    // Walk every node in the tree looking for a PL011 by compatible
+    // string. On QEMU's virt board this finds `/pl011`; on Apple Silicon
+    // the path is different and unknown ahead of time — compatible
+    // matching is the only portable way.
+    let root = match fdt.root() {
+        Some(r) => r,
+        None => {
+            println!("fdtcons: no root node");
+            return;
+        }
+    };
+
+    let mut found_uart: Option<u64> = None;
+    let mut found_name: &str = "";
+
+    for node in fdt.children(&root) {
+        let compat = fdt.compatible(&node);
+        if compat.contains("arm,pl011") {
+            found_name = fdt.full_name(&node);
+            if let Some(reg) = fdt.prop(&node, "reg") {
+                if reg.len() >= 8 {
+                    found_uart = Some(u64::from_be_bytes(reg[0..8].try_into().unwrap()));
+                }
+            }
+            break;
+        }
+    }
+
+    let pa = match found_uart {
+        Some(pa) => pa,
+        None => {
+            println!("fdtcons: no node with compatible \"arm,pl011\" found");
+            return;
+        }
+    };
+
+    let va = arch::aarch64::mmu::phys_to_virt(pa as usize);
+
+    println!(
+        "fdtcons: found \"{found_name}\" — PA {pa:#x}, VA {va:#x}",
+    );
+
+    // Write directly to the PL011 at the FDT-discovered virtual address.
+    // The PL011 register layout: DR at +0x00, FR at +0x18, FR.TXFF = bit 5.
+    // This mirrors exactly what Pl011<BASE>::write_byte does internally,
+    // but with a runtime address instead of a const generic.
+    let msg = b"hello from the FDT-discovered console!\n";
+    let dr: usize = va;
+    let fr: usize = va + 0x18;
+    const FR_TXFF: u32 = 1 << 5;
+
+    for &b in msg {
+        // Spin until the TX FIFO has room.
+        loop {
+            let flags = unsafe {
+                core::ptr::with_exposed_provenance::<u32>(fr).read_volatile()
+            };
+            if flags & FR_TXFF == 0 {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        // Translate \n to CRLF for the serial terminal.
+        if b == b'\n' {
+            unsafe {
+                core::ptr::with_exposed_provenance_mut::<u32>(dr)
+                    .write_volatile(b'\r' as u32);
+            }
+            // Wait again for the CR to clear the FIFO.
+            loop {
+                let flags = unsafe {
+                    core::ptr::with_exposed_provenance::<u32>(fr).read_volatile()
+                };
+                if flags & FR_TXFF == 0 {
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+        }
+        unsafe {
+            core::ptr::with_exposed_provenance_mut::<u32>(dr)
+                .write_volatile(b as u32);
+        }
+    }
+
+    println!();
+    println!("fdtcons: wrote {} bytes to the FDT-discovered console address.", msg.len());
+}
+
 /// The monitor's command table, M2 edition. Three groups, and the
 /// grouping is the lesson:
 ///
@@ -527,6 +628,10 @@ pub fn run_command(line: &[u8]) {
                 "  dtb             show parsed devicetree: header, /memory, /intc, /pl011, /timer"
             );
             println!("  tree            dump the full devicetree tree (nodes, properties, values)");
+            println!("  --- M7: FDT-driven discovery ---");
+            println!(
+                "  fdtcons         discover the UART from the FDT (by compatible), write to it at the discovered address"
+            );
             println!("  --- M5: EL0 and syscalls ---");
             println!("  el0             drop to EL0, run the user program (syscalls: write, yield, exit)");
             println!("  el0fault        drop to EL0, run a program that faults — test fault recovery");
@@ -770,6 +875,29 @@ pub fn run_command(line: &[u8]) {
                 println!("=== devicetree dump ({} bytes) ===", fdt.totalsize());
                 fdt.dump();
                 println!("=== end ===");
+            } else {
+                println!("FDT magic found but header invalid");
+            }
+        }
+        "fdtcons" => {
+            // M7 bridge: discover the console from the FDT and write to
+            // it at the discovered address. Until now the FDT was a
+            // diagnostic — the kernel read the UART base and cross-
+            // checked it, but the console always used the compiled-in
+            // constant. This command proves the FDT address is real by
+            // writing directly to the PL011 at the runtime-discovered
+            // physical address (mapped through phys_to_virt, the same
+            // higher-half alias the compiled console uses).
+            //
+            // On Apple Silicon the UART base genuinely varies per SoC,
+            // and the FDT is the only way to find it. This is the first
+            // step of M7's FDT-driven discovery, tested on QEMU where
+            // we know the answer.
+            let ram_base = board::virt::RAM_BASE as u64;
+            if !fdt_at(ram_base) {
+                println!("no FDT at RAM base ({ram_base:#x})");
+            } else if let Some(fdt) = arch::aarch64::fdt::Fdtr::new(ram_base as usize) {
+                fdt_console_write(&fdt);
             } else {
                 println!("FDT magic found but header invalid");
             }
