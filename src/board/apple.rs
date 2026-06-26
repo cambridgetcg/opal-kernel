@@ -111,7 +111,7 @@ pub fn init() {
     // piece.
     //
     // When AIC lands, this is where we'd call:
-    //   let aic = crate::hal::aic::Aic::new(aic_base);
+    //   let mut aic = crate::hal::aic::Aic::new(aic_base);
     //   aic.init();
     //   aic.unmask_irq(AIC_TIMER_IRQ);
 }

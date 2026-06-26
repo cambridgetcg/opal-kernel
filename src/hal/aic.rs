@@ -142,9 +142,13 @@ pub fn event_num(event: u32) -> u32 {
 // -----------------------------------------------------------------------
 // The driver
 // -----------------------------------------------------------------------
-
-/// An AIC v1 at a given MMIO base. Like `GicV2`, zero-sized: the base
-/// lives in the type, so "creating" one is free and possible anywhere.
+/// An AIC v1 at a given MMIO base. Unlike `GicV2` (which is zero-sized
+/// via const generics), `Aic` carries its base as a runtime field because
+/// the address is FDT-discovered and differs per SoC. It also caches
+/// `nr_irq`, read once from `AIC_INFO` during [`init`](Self::init), so
+/// that [`unmask_irq`](Self::unmask_irq) and [`mask_irq`](Self::mask_irq)
+/// do not re-read the register on every call — under m1n1 each MMIO
+/// access is a hypervisor trap tunneled over USB.
 ///
 /// The base address is **FDT-discovered** (it differs per SoC), so in
 /// practice this is constructed at boot after the FDT parser finds the
@@ -152,14 +156,21 @@ pub fn event_num(event: u32) -> u32 {
 #[derive(Clone, Copy)]
 pub struct Aic {
     base: usize,
+    /// Cached `AIC_INFO` NR_IRQ (bits [15:0]). Zero until [`init`](Self::init)
+    /// reads it from hardware; all bit-bank offset arithmetic derives from
+    /// this value. Calling [`unmask_irq`](Self::unmask_irq) or
+    /// [`mask_irq`](Self::mask_irq) before `init` is a bug — `nr_irq` would
+    /// be 0 and the computed offsets wrong.
+    nr_irq: u32,
 }
 
 impl Aic {
     /// Construct an AIC at the given physical base address.
     /// The caller is responsible for mapping this to a virtual address
     /// before any MMIO access (the kernel's `phys_to_virt` helper).
+    /// `nr_irq` is left as 0 until [`init`](Self::init) reads it.
     pub const fn new(base: usize) -> Self {
-        Self { base }
+        Self { base, nr_irq: 0 }
     }
 
     #[inline]
@@ -182,17 +193,56 @@ impl Aic {
     /// Read `AIC_INFO` and extract `NR_IRQ` (bits [15:0]).
     /// This is the number of hardware IRQs the controller supports on
     /// this SoC. The M1 reports ~896; the cap is 1024.
+    ///
+    /// This is a live MMIO read. After [`init`](Self::init) caches the
+    /// value, prefer [`cached_nr_irq`](Self::cached_nr_irq) to avoid
+    /// the extra register access (under m1n1, a hypervisor trap).
     pub fn nr_irq(&self) -> u32 {
         unsafe { self.read32(info::INFO) & info::NR_IRQ }
+    }
+
+    /// Return the cached NR_IRQ, read once during [`init`](Self::init).
+    /// Zero before `init` has run.
+    pub fn cached_nr_irq(&self) -> u32 {
+        self.nr_irq
+    }
+
+    // --- Bit-bank offset arithmetic (private, one source of truth) ---
+
+    /// Number of u32 bit-banks needed to cover `nr_irq` bits.
+    /// `ceil(nr_irq / 32)` — the AIC packs 32 IRQs per bank register.
+    #[inline]
+    fn num_banks(nr_irq: usize) -> usize {
+        (nr_irq + 31) / 32
+    }
+
+    /// Offset of the `MASK_SET` bit-bank array from the AIC base.
+    ///
+    /// Layout after `TARGET_CPU` (u32 × nr_irq):
+    /// `SW_SET`, `SW_CLR`, `MASK_SET`, `MASK_CLR`, `HW_STATE` —
+    /// each `num_banks` × u32. `MASK_SET` is the third array.
+    #[inline]
+    fn mask_set_off(nr_irq: usize) -> usize {
+        let nb = Self::num_banks(nr_irq);
+        target::TARGET_CPU + nr_irq * 4 + nb * 4 * 2 // skip SW_SET, SW_CLR
+    }
+
+    /// Offset of the `MASK_CLR` bit-bank array — one array past `MASK_SET`.
+    #[inline]
+    fn mask_clr_off(nr_irq: usize) -> usize {
+        Self::mask_set_off(nr_irq) + Self::num_banks(nr_irq) * 4
     }
 
     // --- Init ---
 
     /// Bring the AIC online. Mirrors the Linux init sequence:
     ///
-    /// 1. Mask all IRQs (write `MASK_SET` to all-ones for every bit-bank).
-    /// 2. Clear all software-triggered IRQs (write `SW_CLR` to all-ones).
-    /// 3. Target all IRQs at CPU 0 (write 1 to each `TARGET_CPU` slot).
+    /// 1. Read `AIC_INFO` and cache `NR_IRQ` (all offset arithmetic
+    ///    derives from this value; `unmask_irq`/`mask_irq` use the cache
+    ///    to avoid re-reading the register on every call).
+    /// 2. Mask all IRQs (write `MASK_SET` to all-ones for every bit-bank).
+    /// 3. Clear all software-triggered IRQs (write `SW_CLR` to all-ones).
+    /// 4. Target all IRQs at CPU 0 (write 1 to each `TARGET_CPU` slot).
     ///
     /// This deliberately starts with everything masked: the caller then
     /// enables specific IRQs with `unmask_irq`. Starting unmasked would
@@ -202,17 +252,18 @@ impl Aic {
     /// (that's AICv2's `AIC2_CONFIG_ENABLE`). The controller is live
     /// as soon as MMIO is reachable. We read `CONFIG` for the banner
     /// but do not write it on v1.
-    pub fn init(&self) {
-        let nr = self.nr_irq() as usize;
-        let num_banks = (nr + 31) / 32; // ceil(nr / 32)
+    pub fn init(&mut self) {
+        // Read NR_IRQ once and cache it. The field is `&mut self` here
+        // because this is the only point that writes it; everywhere else
+        // uses `&self` against the cached value.
+        self.nr_irq = unsafe { self.read32(info::INFO) & info::NR_IRQ };
+        let nr = self.nr_irq as usize;
+        let num_banks = Self::num_banks(nr);
 
-        // Compute the bit-bank offsets. After TARGET_CPU (u32 × nr_irq),
-        // the layout is: SW_SET, SW_CLR, MASK_SET, MASK_CLR, HW_STATE —
-        // each num_banks × u32.
+        // Compute the bit-bank offsets via the shared helpers.
         let sw_set = target::TARGET_CPU + nr * 4;
         let sw_clr = sw_set + num_banks * 4;
-        let mask_set = sw_clr + num_banks * 4;
-        // mask_clr and hw_state follow but are not needed for init.
+        let mask_set = Self::mask_set_off(nr);
 
         unsafe {
             // 1. Mask all IRQs.
@@ -235,16 +286,12 @@ impl Aic {
     /// Unmask (enable) interrupt `irq`. Writes the corresponding bit in
     /// `MASK_CLR`. On AIC, reading the event register auto-masks the
     /// delivered IRQ; this is how you re-enable it after handling.
+    ///
+    /// Uses the cached `nr_irq` — no `AIC_INFO` read here.
     pub fn unmask_irq(&self, irq: u32) {
         let bank = (irq / 32) as usize;
         let bit = 1u32 << (irq % 32);
-        // MASK_CLR offset = TARGET_CPU + nr_irq*4 + num_banks*4 (SW_SET)
-        //                                 + num_banks*4 (SW_CLR)
-        //                                 + num_banks*4 (MASK_SET)
-        let nr = self.nr_irq() as usize;
-        let num_banks = (nr + 31) / 32;
-        let mask_clr =
-            target::TARGET_CPU + nr * 4 + num_banks * 4 * 3; // skip SET,CLR,MASK_SET
+        let mask_clr = Self::mask_clr_off(self.nr_irq as usize);
         unsafe {
             self.write32(mask_clr + bank * 4, bit);
         }
@@ -252,13 +299,12 @@ impl Aic {
 
     /// Mask (disable) interrupt `irq`. Writes the corresponding bit in
     /// `MASK_SET`.
+    ///
+    /// Uses the cached `nr_irq` — no `AIC_INFO` read here.
     pub fn mask_irq(&self, irq: u32) {
         let bank = (irq / 32) as usize;
         let bit = 1u32 << (irq % 32);
-        let nr = self.nr_irq() as usize;
-        let num_banks = (nr + 31) / 32;
-        let mask_set =
-            target::TARGET_CPU + nr * 4 + num_banks * 4 * 2; // skip SET,CLR
+        let mask_set = Self::mask_set_off(self.nr_irq as usize);
         unsafe {
             self.write32(mask_set + bank * 4, bit);
         }
