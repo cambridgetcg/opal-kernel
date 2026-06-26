@@ -1,4 +1,4 @@
-//! Opal — milestone 6: the kernel learns to share.
+//! Opal — milestone 7: Apple Silicon bring-up (in progress).
 //!
 //! This file is still most of the "operating system": print macros backed
 //! by a lock, the banner (which now reads the MMU's registers back as
@@ -167,8 +167,8 @@ fn kmain(x0: u64) -> ! {
     arch::aarch64::mmu::condemn_low_half();
 
     println!();
-    println!("opal — milestone 6: the kernel learns to share ✅");
-    println!("-------------------------------------------------");
+    println!("opal — milestone 7: Apple Silicon bring-up ⚙️");
+    println!("--------------------------------------------------");
 
     // Privilege check. QEMU virt without virtualization=on/secure=on has
     // no EL2/EL3, so we expect EL1. (On Apple Silicon via m1n1: EL2.)

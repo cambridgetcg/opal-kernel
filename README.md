@@ -17,13 +17,15 @@ granule precisely so we could rehearse for Apple's IOMMUs). See
 [docs/02-hal-and-apple-silicon.md](docs/02-hal-and-apple-silicon.md)
 for the full story of how the two boards relate.
 
-**Current state: Milestone 4 — "reads the handoff."** Everything from M3
-still holds — the kernel ticks, catches faults, maps its own world. M4
-adds a minimal in-tree FDT (Flattened Devicetree) parser: the kernel now
-reads QEMU's DTB at boot and discovers /memory, /intc, /pl011, /timer
-from the machine's own description, cross-checking each against the
-hardcoded board constants. From here on, those constants are fallbacks,
-not truths. New monitor commands `dtb` and `tree` dump the parsed tree.
+**Current state: Milestone 7 — Apple Silicon bring-up (in progress).**
+M0–M6 are complete: the kernel boots, catches faults, maps virtual memory
+with 16 KiB granules, handles interrupts, parses the devicetree, drops to
+EL0 with syscalls, and runs a preemptive scheduler with IPC. M7 has begun
+— the boot stub now detects and handles EL2 entry (m1n1's starting EL),
+discovers the console from FDT by compatible string, and ships an s5l UART
+driver for Apple Silicon. Remaining: `board/apple.rs`, AIC interrupt
+controller, framebuffer console, and timers-over-FIQ. See
+[ROADMAP.md](ROADMAP.md) for the milestone ladder.
 
 ## Sisters
 
@@ -55,8 +57,8 @@ cargo run                # that's it
 kernel. You should see:
 
 ```
-opal — milestone 4: reads the handoff
---------------------------------------
+opal — milestone 7: Apple Silicon bring-up ⚙️
+--------------------------------------------------
 current EL : EL1
 mmu        : on — SCTLR_EL1 = 0x30d5199d (M, C, I — read back, not assumed)
 granule    : 16 KiB, 48-bit VA — TCR_EL1 = 0x57510b510 (TG0=16K, TG1=16K: different encodings, both checked)
@@ -142,7 +144,8 @@ src/
       mod.rs                CurrentEL reader, DAIF helpers, here(), park()
   hal/
     mod.rs                  what "HAL" means here: drivers, not trait soup
-    pl011.rs                polled PL011 UART driver (the only driver so far)
+    pl011.rs                polled PL011 UART driver (QEMU virt's console)
+    s5l_uart.rs             Samsung-style s5l UART driver (Apple Silicon's console)
   board/
     mod.rs                  boards know addresses; drivers know devices
     virt.rs                 QEMU virt board: physical addresses, the console's
