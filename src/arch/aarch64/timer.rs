@@ -165,6 +165,30 @@ pub fn on_tick() {
     TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
 
+/// Read the virtual timer's control register.
+pub fn ctl() -> u64 {
+    let val: u64;
+    // SAFETY: reading CNTV_CTL_EL0 is side-effect-free and always legal.
+    unsafe {
+        core::arch::asm!(
+            "mrs {val}, CNTV_CTL_EL0",
+            val = out(reg) val,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    val
+}
+
+/// Did the virtual timer fire? On Apple Silicon the architectural timer
+/// arrives as FIQ (not IRQ through the GIC), so the FIQ handler needs to
+/// check this bit directly — there is no interrupt ID to acknowledge.
+/// CNTV_CTL_EL0 bit 1 (ISTATUS) is read-only: 1 = the counter has
+/// reached the compare value and the interrupt condition is met. Writing
+/// a new CVAL (via `rearm`) clears it.
+pub fn fired() -> bool {
+    ctl() & (1 << 1) != 0
+}
+
 /// How many ticks have elapsed since the timer was started.
 pub fn ticks() -> u64 {
     TICKS.load(core::sync::atomic::Ordering::Relaxed)

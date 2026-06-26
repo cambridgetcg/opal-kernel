@@ -1048,16 +1048,61 @@ fn handle_irq(frame: &mut TrapFrame, kind: Kind, source: Source) {
 /// (docs/02 §3, item 6). Folding FIQ into IRQ today would be a refactor
 /// M7 pays for at the worst time. Keeping the split costs one vector
 /// entry and this stub.
-fn handle_fiq(frame: &TrapFrame, kind: Kind, source: Source) -> ! {
+///
+/// ## What FIQ looks like on Apple Silicon
+///
+/// Unlike the GIC path (where `handle_irq` acknowledges an interrupt ID
+/// from the controller, dispatches on it, then signals EOI), the Apple
+/// timer arrives as a *direct* FIQ — there is no interrupt controller
+/// in the path. The handler must:
+///
+/// 1. Check `CNTV_CTL_EL0.ISTATUS` (bit 1): did the virtual timer fire?
+///    If so, service the tick: bump the counter, rearm the comparator.
+/// 2. On future hardware, check AIC registers for device FIQs.
+/// 3. Return — `eret` resumes the interrupted code.
+///
+/// On QEMU this handler is never entered (the GIC routes the timer to
+/// IRQ, not FIQ). But the structure is here, verified by the build, and
+/// the first Apple boot fills in the AIC branch.
+fn handle_fiq(frame: &mut TrapFrame, kind: Kind, source: Source) {
+    let _ = (kind, source);
+
+    // Check whether the virtual timer fired. On Apple Silicon the
+    // architectural timer arrives as FIQ; on QEMU the GIC delivers it
+    // as IRQ, so this branch is dormant — but structurally correct.
+    if crate::arch::aarch64::timer::fired() {
+        crate::arch::aarch64::timer::on_tick();
+        let period = crate::arch::aarch64::timer::TICK_PERIOD
+            .load(core::sync::atomic::Ordering::Relaxed);
+        if period > 0 {
+            crate::arch::aarch64::timer::rearm(period);
+        }
+
+        // M6: wake sleeping tasks and preempt, same as the IRQ path.
+        // SAFETY: FIQ handler, DAIF set, single-core.
+        unsafe { crate::sched::wake_sleepers() };
+        if crate::sched::preempt_enabled() && crate::sched::current_tid() != 0 {
+            if unsafe { crate::sched::save_and_switch(frame) } {
+                crate::sched::bump_preempts();
+            }
+        }
+        return;
+    }
+
+    // Unknown FIQ source. On QEMU this is the only path (nothing fires
+    // FIQ at all). Report and recover — a spurious FIQ is worth a line,
+    // not a kernel panic. On real Apple hardware an unknown FIQ likely
+    // means an AIC interrupt we haven't learned about yet; future M7
+    // work adds the AIC dispatch here.
     report(
         frame,
         kind,
         source,
         format_args!(
-            "FIQ — nothing routes to FIQ on QEMU; on Apple Silicon this is the timer (M7)"
+            "FIQ — not the virtual timer; on QEMU nothing routes to FIQ at all. \
+             On Apple Silicon this is the timer or an AIC device interrupt (M7)."
         ),
     );
-    die()
 }
 
 // ---------------------------------------------------------------------------
