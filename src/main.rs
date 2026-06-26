@@ -275,6 +275,19 @@ fn kmain(x0: u64) -> ! {
                 fdt.boot_cpuid()
             );
 
+            // M7: runtime board selection. The root node's `compatible`
+            // string declares what this machine is. We read it and select
+            // the board module — today this is a diagnostic (kmain still
+            // uses board::virt for everything), but the selection is the
+            // bridge: once the Apple board's console wiring is complete,
+            // this is where the fork happens.
+            let board_kind = board::which(Some(&fdt));
+            let root_compat = fdt.root().map(|n| fdt.compatible(&n)).unwrap_or("");
+            println!(
+                "board     : {:?} (root compatible: \"{}\")",
+                board_kind, root_compat
+            );
+
             // /memory — the machine's RAM, as QEMU declares it. Cross-
             // check against board::virt's hardcoded RAM_BASE/RAM_SIZE.
             if let Some(mem) = fdt.find("/memory") {
