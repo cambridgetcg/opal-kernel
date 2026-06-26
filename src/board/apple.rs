@@ -95,7 +95,7 @@ pub type Console = crate::hal::s5l_uart::S5lUart<0x0>; // placeholder;
 /// the UART node. What remains is:
 ///
 /// 1. Discover the s5l UART base from the FDT and call `set_uart_base`.
-/// 2. Initialize the AIC interrupt controller (future `hal/aic.rs`).
+/// 2. Initialize the AIC interrupt controller (`hal::aic::Aic`).
 /// 3. Enable the architectural timer on the FIQ line (the FIQ handler
 ///    in `vectors.rs` already checks `CNTV_CTL_EL0.ISTATUS`).
 ///
@@ -111,9 +111,9 @@ pub fn init() {
     // piece.
     //
     // When AIC lands, this is where we'd call:
-    //   let aic = Aic::new(aic_base, aic_size);
+    //   let aic = crate::hal::aic::Aic::new(aic_base);
     //   aic.init();
-    //   aic.enable_irq(AIC_TIMER_IRQ);
+    //   aic.unmask_irq(AIC_TIMER_IRQ);
 }
 
 /// RAM base on Apple Silicon. Unlike QEMU's fixed 0x4000_0000, Apple's
