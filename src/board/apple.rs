@@ -24,16 +24,19 @@
 //!   lines). This board's `init()` discovers the AIC base from the FDT
 //!   (via `find_by_compatible("apple,aic")`), constructs an `Aic`,
 //!   initializes it (masks all IRQs, targets CPU 0, caches NR_IRQ), and
-//!   stores it in a static for the FIQ handler to use. The driver is
-//!   not yet connected to the FIQ vector's dispatch loop — that wiring
-//!   is the remaining M7 piece — but the controller is brought online.
+//!   stores it in a static for the FIQ handler to use. The FIQ handler
+//!   in `vectors.rs` now reads `AIC_EVENT` when the timer didn't fire,
+//!   dispatches by type (IRQ/IPI/FIQ), and re-unmasks device IRQs —
+//!   the dispatch wiring is complete (dormant on QEMU, live on Apple).
 //!
 //! ## What this board does NOT know (yet)
 //!
-//! - **AIC → handler dispatch.** The AIC is initialized and its event
-//!   register is readable, but the FIQ/IRQ vector does not yet call
-//!   `aic.event()` to dispatch device interrupts to handlers. Today
-//!   only the timer FIQ (which bypasses AIC entirely) is serviced.
+//! - **AIC MMIO virtual address mapping.** Today the `Aic` is
+//!   constructed with a physical address; on real hardware this must
+//!   be mapped to a higher-half virtual address via `phys_to_virt`
+//!   before any MMIO access. On QEMU this function is never called,
+//!   so the mapping gap doesn't bite yet — but it will on the first
+//!   real boot.
 //! - **Framebuffer.** m1n1 republishes iBoot's framebuffer as a
 //!   simple-framebuffer FDT node; a text console blitting into it is a
 //!   future M7 piece (`hal/fb.rs`).
@@ -145,15 +148,17 @@ pub fn aic_base() -> usize {
 ///
 /// What this function does NOT do yet:
 ///
-/// - **Wire AIC into the FIQ vector.** The FIQ handler in `vectors.rs`
-///   currently services only the architectural timer (which bypasses
-///   AIC — it arrives on the FIQ line directly). Connecting
-///   `aic.event()` dispatch to device IRQ handlers is the next M7 piece.
 /// - **Map the AIC's MMIO region.** Today the `Aic` is constructed with
 ///   a physical address; on real hardware this must be mapped to a
 ///   higher-half virtual address via `phys_to_virt` before any MMIO
 ///   access. On QEMU this function is never called, so the mapping
 ///   gap doesn't bite yet — but it will on the first real boot.
+///
+/// The AIC event dispatch in the FIQ vector (`vectors.rs::handle_fiq`)
+/// is now wired: when the timer didn't fire and the AIC base is
+/// non-zero, the handler reads `AIC_EVENT` and dispatches by type.
+/// That path is dormant on QEMU (this function is never called) but
+/// structurally complete for the first Apple boot.
 ///
 /// On QEMU this function is never called — `kmain` selects
 /// `board::virt` based on the FDT's `/compatible` or the known RAM base.
