@@ -532,10 +532,10 @@ extern "C" fn exception_dispatch(frame: &mut TrapFrame, kind: u64, source: u64) 
             );
             die()
         }
-        // M5: a synchronous exception from EL0 — this is a syscall (svc)
+        // M5/M6: a synchronous exception from EL0 — this is a syscall (svc)
         // or a user fault (data/instruction abort). The SVC case is the
         // whole point of M5; faults are serviced by killing the task (M6
-        // gives them a real handler; for now we report and park).
+        // gave them a real handler — kill_task_from_el0, verified).
         (Kind::Synchronous, Source::LowerAArch64) => handle_sync_from_el0(frame, kind, source),
         // IRQ/FIQ/SError from EL0: same handlers as the kernel's own —
         // the source doesn't change what the GIC or the timer need.
@@ -597,9 +597,10 @@ const EC_BRK64: u64 = 0x3c; // brk from AArch64
 /// Two recover (brk, svc); the rest are fatal. M2 changed their *texture*
 /// — the page-table fault families are reachable now (and demonstrable:
 /// the monitor's `guard`/`wx`/`noexec`/`low` commands produce one each),
-/// and the worst overflows became preventable — but it services none of
-/// them: the first fault with a fix is M5's, where the answer can be
-/// "kill the offending task" instead of "park the kernel".
+/// and the worst overflows became preventable. M5/M6 extended fault
+/// handling to EL0: user-space faults are now serviced (the task is
+/// killed, the kernel survives). Kernel-space faults remain fatal —
+/// `die()` is still the honest answer when the kernel itself faults.
 fn handle_sync(frame: &mut TrapFrame, kind: Kind, source: Source) {
     let ec = (frame.esr >> 26) & 0x3f; // exception class: bits [31:26]
     let iss = frame.esr & 0x01ff_ffff; // instruction-specific syndrome: bits [24:0]
@@ -643,8 +644,8 @@ fn handle_sync(frame: &mut TrapFrame, kind: Kind, source: Source) {
             );
             println!("  verdict : recovered — and note: nothing to fix. For svc, ELR already");
             println!("            points past the instruction (a call, not an accident), so");
-            println!("            eret resumes there unadjusted. M5 turns this report into a");
-            println!("            real system-call dispatcher.");
+            println!("            eret resumes there unadjusted. M5 turned this report into");
+            println!("            a real system-call dispatcher (see handle_sync_from_el0).");
             println!();
         }
         EC_DABT_SAME_EL => {
@@ -1238,12 +1239,14 @@ fn report(frame: &TrapFrame, kind: Kind, source: Source, cause: fmt::Arguments<'
     );
 }
 
-/// The standard fatal ending. With no tasks and no demand paging,
-/// "report and park" is still the honest maximum. M2 raised the *quality*
-/// of the reports (fault families that name the failing walk level) and
-/// made the worst faults preventable (the guard, W^X) — but the first
-/// fault we can actually *service* arrives with M5, where killing the
-/// offending task beats parking the kernel.
+/// The standard fatal ending. With no demand paging and no kernel-space
+/// fault recovery, "report and park" is still the honest maximum for
+/// kernel-level faults. M2 raised the *quality* of the reports (fault
+/// families that name the failing walk level) and made the worst faults
+/// preventable (the guard, W^X). M5/M6 added user-space fault recovery
+/// (kill_task_from_el0 — the task dies, the kernel lives). But a fault
+/// in the kernel itself still means the kernel is broken; parking is
+/// the truthful response until (if ever) kernel fault recovery arrives.
 fn die() -> ! {
     println!("  verdict : FATAL — the kernel cannot repair this yet; parking core 0.");
     println!("            (QEMU is still alive, just idle: Ctrl-A X to leave.)");
