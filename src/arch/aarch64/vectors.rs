@@ -1089,11 +1089,93 @@ fn handle_fiq(frame: &mut TrapFrame, kind: Kind, source: Source) {
         return;
     }
 
-    // Unknown FIQ source. On QEMU this is the only path (nothing fires
-    // FIQ at all). Report and recover — a spurious FIQ is worth a line,
-    // not a kernel panic. On real Apple hardware an unknown FIQ likely
-    // means an AIC interrupt we haven't learned about yet; future M7
-    // work adds the AIC dispatch here.
+    // The timer didn't fire. On Apple Silicon, a FIQ can also be an
+    // AIC event — the AIC delivers device IRQs and IPIs on the FIQ
+    // line (the timer is the one exception: it arrives directly, not
+    // through AIC). On QEMU nothing routes to FIQ at all, so the AIC
+    // base is zero (board::apple::init is never called) and this
+    // branch is dormant.
+    let aic_base = crate::board::apple::aic_base();
+    if aic_base != 0 {
+        // SAFETY: constructing an Aic from the cached base is safe —
+        // Aic::new is const and stores the field; the MMIO reads in
+        // event() are volatile reads from a mapped device region. We
+        // are in a FIQ handler with DAIF set, single-core, so there is
+        // no re-entrancy on the AIC registers.
+        let aic = crate::hal::aic::Aic::new(aic_base);
+        let ev = aic.event();
+        if ev != 0 {
+            let et = crate::hal::aic::event_type(ev);
+            let num = crate::hal::aic::event_num(ev);
+            match et {
+                crate::hal::aic::EVENT_TYPE_IRQ => {
+                    // Device IRQ. AIC's event read auto-masks the IRQ;
+                    // after handling, re-enable it. Today there are
+                    // no device drivers registered — this is the
+                    // dispatch point they will plug into. Report so
+                    // the first Apple boot shows the event arrived.
+                    report(
+                        frame,
+                        kind,
+                        source,
+                        format_args!(
+                            "FIQ — AIC device IRQ {num}; no handler registered \
+                             (M7 dispatch point). Re-unmasking."
+                        ),
+                    );
+                    aic.unmask_irq(num);
+                    return;
+                }
+                crate::hal::aic::EVENT_TYPE_IPI => {
+                    // Inter-processor interrupt. On AIC v1, IPIs use a
+                    // separate ack/mask path. For a single-core
+                    // teaching kernel this is structurally present
+                    // but dormant — SMP (PSCI CPU_ON) is M6-deferred.
+                    report(
+                        frame,
+                        kind,
+                        source,
+                        format_args!(
+                            "FIQ — AIC IPI {num}; single-core kernel, no IPI \
+                             handlers yet (SMP deferred from M6)."
+                        ),
+                    );
+                    return;
+                }
+                crate::hal::aic::EVENT_TYPE_FIQ => {
+                    // AIC can also route certain sources as FIQ-type
+                    // events. On M1 the architectural timer bypasses
+                    // AIC, so this is for other FIQ sources. Report
+                    // and continue — the timer path above already
+                    // handled the common case.
+                    report(
+                        frame,
+                        kind,
+                        source,
+                        format_args!(
+                            "FIQ — AIC FIQ-type event {num}; no handler (M7)."
+                        ),
+                    );
+                    return;
+                }
+                _ => {
+                    report(
+                        frame,
+                        kind,
+                        source,
+                        format_args!(
+                            "FIQ — AIC event {ev:#x}: unknown type {et}, num {num}."
+                        ),
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
+    // No timer, no AIC event. On QEMU this is the only path (nothing
+    // fires FIQ at all). Report and recover — a spurious FIQ is worth
+    // a line, not a kernel panic.
     report(
         frame,
         kind,
