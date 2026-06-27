@@ -27,10 +27,12 @@ pub mod virt;
 
 // `apple` — the Apple Silicon board (M7). Compiled but not active on
 // QEMU; `kmain` selects `board::virt` for the QEMU virt machine. The
-// Apple board's `init()` is a skeleton: the s5l UART driver is complete
-// (`hal/s5l_uart.rs`), the EL2→EL1 boot stub drop is in `boot.rs`, and
-// the FIQ handler checks the virtual timer. Remaining: AIC driver,
-// framebuffer console. See docs/02-hal-and-apple-silicon.md §3.
+// Apple board's `init()` discovers the AIC from the FDT and brings it
+// online (masks all IRQs, targets CPU 0, caches NR_IRQ). The s5l UART
+// driver is complete (`hal/s5l_uart.rs`), the EL2→EL1 boot stub drop is
+// in `boot.rs`, and the FIQ handler checks the virtual timer. Remaining:
+// AIC→handler dispatch wiring, framebuffer console. See
+// docs/02-hal-and-apple-silicon.md §3.
 #[allow(dead_code)]
 pub mod apple;
 

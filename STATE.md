@@ -14,8 +14,8 @@ runs-on: QEMU aarch64 virt board (-machine virt -cpu max -smp 1 -m 512M)
 phase: see knows/needs sections below
 build: see heartbeat
 health: active
-last-commit: 4977ed9 M7: s5l UART driver — Samsung-style serial port for Apple Silicon
-uncommitted: 7
+last-commit: b088eaf M7: AIC driver — cache nr_irq, factor bit-bank offsets, fix stale doc
+uncommitted: 5
 freshness: fresh (checked 2026-06-23T16:30Z)
 
 ## knows
@@ -42,7 +42,7 @@ freshness: fresh (checked 2026-06-23T16:30Z)
 - M5: EL0 and syscalls — DONE (EL0 drop, write/exit/yield syscalls, user.rs 417 lines. The kernel drops to EL0, runs "hello, EL0!", catches exit syscall, returns to monitor. Verified: `el0` monitor command works.)
 - M6: scheduler and IPC — DONE ✅ (10 pieces: TCB, context switch, cooperative yield, IPC, blocking IPC recvblk/sendblk, fault recovery, preemptive scheduling, sleep, wait, per-task kernel stacks. 10 syscalls: write, exit, yield, send, recv, recvblk, sendblk, sleep, exit_code, wait. 9 monitor commands: tasks, spawn2, preempt, ipc, blkipc, sendblk, faultkill, sleep, wait. All verified in QEMU 2026-06-23. Multi-core/PSCI CPU_ON deferred — single-core is plenty educational.)
 - honesty pass (2026-06-23): cleaned 16 Rust 2024 `unnecessary unsafe block` warnings — all 16 were `unsafe { kstack_top(N) }` nested inside an outer `unsafe { spawn(...) }` block in user.rs. Build: 16 warnings → 0. Also fixed docs/06 section 12: "What M6 does not do (yet)" still listed per-task kernel stacks as a deficiency after piece 10 implemented them.
-- M7: Apple Silicon bring-up via m1n1 — IN PROGRESS (EL2→EL1 drop in boot stub ✅, FDT-driven console discovery via compatible ✅, s5l UART driver 139 lines ✅, security audit: integer overflow fix in FDT parser + user VA validation in syscall handler ✅, FIQ handler upgraded from fatal `-> !` to recoverable timer-aware handler ✅, board/apple.rs skeleton with s5l UART instantiation + init scaffolding ✅. Remaining: AIC interrupt controller driver, framebuffer text console, runtime FDT-based board selection, timers-over-FIQ on real hardware)
+- M7: Apple Silicon bring-up via m1n1 — IN PROGRESS (EL2→EL1 drop in boot stub ✅, FDT-driven console discovery via compatible ✅, s5l UART driver 139 lines ✅, security audit: integer overflow fix in FDT parser + user VA validation in syscall handler ✅, FIQ handler upgraded from fatal `-> !` to recoverable timer-aware handler ✅, board/apple.rs skeleton with s5l UART instantiation + init scaffolding ✅, AIC interrupt controller driver 341 lines ✅, FDT find_by_compatible tree-wide search ✅, board/apple.rs init() now discovers AIC from FDT and brings it online ✅, runtime board selection via root compatible ✅. Remaining: AIC→handler dispatch wiring in FIQ vector, framebuffer text console, AIC MMIO virtual address mapping, timers-over-FIQ on real hardware)
 - QEMU virt machine with -cpu max (for 16 KiB granule; cortex-a72 doesn't support it)
 - Rust stable toolchain with aarch64-unknown-none-softfloat target
 

@@ -729,6 +729,39 @@ impl Fdtr {
         Some(node)
     }
 
+    /// Find the first node whose `compatible` property contains `substr`.
+    ///
+    /// Unlike [`find`](Self::find) (which walks by path), this is a
+    /// tree-wide search: it visits every node recursively and checks each
+    /// one's `compatible` string for a substring match. This is how
+    /// `board/apple.rs` discovers the AIC node — the devicetree does not
+    /// guarantee a fixed path for interrupt controllers, but it *does*
+    /// guarantee `compatible = "apple,aic"`. The FDT is small (a few KiB),
+    /// so a full traversal is cheaper than building a lookup table.
+    ///
+    /// Returns the first matching node in pre-order, or `None` if no node
+    /// has a matching `compatible`.
+    pub fn find_by_compatible(&self, substr: &str) -> Option<Node> {
+        self.find_by_compatible_in(&self.root()?, substr)
+    }
+
+    /// Recursive helper for [`find_by_compatible`](Self::find_by_compatible):
+    /// search the subtree rooted at `node`, returning the first descendant
+    /// (including `node` itself) whose `compatible` contains `substr`.
+    fn find_by_compatible_in(&self, node: &Node, substr: &str) -> Option<Node> {
+        // Check this node first (pre-order).
+        if self.compatible(node).contains(substr) {
+            return Some(*node);
+        }
+        // Then recurse into children.
+        for child in self.children(node) {
+            if let Some(found) = self.find_by_compatible_in(&child, substr) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
     // --- Full tree dump (for the `tree` monitor command) ----------------
 
     /// Print the entire devicetree: every node, every property, every

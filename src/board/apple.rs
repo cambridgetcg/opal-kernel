@@ -20,12 +20,20 @@
 //!   (M1) or AICv2 (M1 Pro/Max+). The FIQ handler in `vectors.rs` checks
 //!   `CNTV_CTL_EL0.ISTATUS` and services the timer; the AIC dispatch is
 //!   the next piece of M7 work.
+//! - **The AIC interrupt controller driver exists** (`hal/aic.rs`, 341
+//!   lines). This board's `init()` discovers the AIC base from the FDT
+//!   (via `find_by_compatible("apple,aic")`), constructs an `Aic`,
+//!   initializes it (masks all IRQs, targets CPU 0, caches NR_IRQ), and
+//!   stores it in a static for the FIQ handler to use. The driver is
+//!   not yet connected to the FIQ vector's dispatch loop — that wiring
+//!   is the remaining M7 piece — but the controller is brought online.
 //!
 //! ## What this board does NOT know (yet)
 //!
-//! - **AIC register layout.** The Apple Interrupt Controller is a
-//!   proprietary design (documented by the Asahi Linux project); its
-//!   driver will live in `hal/aic.rs` and be instantiated here.
+//! - **AIC → handler dispatch.** The AIC is initialized and its event
+//!   register is readable, but the FIQ/IRQ vector does not yet call
+//!   `aic.event()` to dispatch device interrupts to handlers. Today
+//!   only the timer FIQ (which bypasses AIC entirely) is serviced.
 //! - **Framebuffer.** m1n1 republishes iBoot's framebuffer as a
 //!   simple-framebuffer FDT node; a text console blitting into it is a
 //!   future M7 piece (`hal/fb.rs`).
@@ -47,7 +55,9 @@
 //! See docs/02-hal-and-apple-silicon.md §3 for the full spec this file
 //! is drawn from.
 
+use crate::arch::aarch64::fdt::Fdtr;
 use crate::arch::aarch64::mmu;
+use crate::hal::aic::Aic;
 
 // ---------------------------------------------------------------------------
 // The console — s5l UART, FDT-discovered base
@@ -88,32 +98,102 @@ pub fn set_uart_base(pa: usize) {
 /// bridging the runtime base is the next refinement.
 pub type Console = crate::hal::s5l_uart::S5lUart<0x0>; // placeholder;
 
+// ---------------------------------------------------------------------------
+// The interrupt controller — AIC, FDT-discovered base
+// ---------------------------------------------------------------------------
+
+/// The AIC instance, initialized during `init()` and stored for the
+/// FIQ/IRQ dispatch loop to read events from. `None` until `init`
+/// discovers the AIC node in the FDT and brings the controller online.
+///
+/// Under m1n1, each MMIO access is a hypervisor trap tunneled over USB,
+/// so the `Aic` caches `NR_IRQ` (read once during `init`) to avoid
+/// re-reading `AIC_INFO` on every `unmask_irq` / `mask_irq` call.
+static AIC: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Return the AIC base address (physical), or 0 if not yet initialized.
+/// The FIQ dispatch loop will use this to construct an `Aic` reference
+/// and call `event()`. Today this is a diagnostic — the FIQ handler
+/// services only the timer, not AIC device IRQs.
+#[allow(dead_code)]
+pub fn aic_base() -> usize {
+    AIC.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+// ---------------------------------------------------------------------------
+// Board init
+// ---------------------------------------------------------------------------
+
 /// Bring the Apple board up.
 ///
-/// Today this is a skeleton: the boot stub has already dropped to EL1
-/// (the EL2→EL1 drop is in `boot.rs`), and the FDT parser (M4) can find
-/// the UART node. What remains is:
+/// Called by `kmain` when `board::which` returns [`BoardKind::Apple`].
+/// At this point the boot stub has already dropped to EL1 (the EL2→EL1
+/// drop is in `boot.rs`), and the FDT parser (M4) is available.
 ///
-/// 1. Discover the s5l UART base from the FDT and call `set_uart_base`.
-/// 2. Initialize the AIC interrupt controller (`hal::aic::Aic`).
-/// 3. Enable the architectural timer on the FIQ line (the FIQ handler
-///    in `vectors.rs` already checks `CNTV_CTL_EL0.ISTATUS`).
+/// What this function does today:
+///
+/// 1. **Discovers the AIC** from the FDT by `compatible = "apple,aic"`,
+///    reads its `reg` property (two u64 cells: base + size), and
+///    constructs an [`Aic`] at that physical address.
+/// 2. **Initializes the AIC**: masks all IRQs, clears software-triggered
+///    IRQs, targets all IRQs at CPU 0, caches `NR_IRQ` from `AIC_INFO`.
+///    The controller starts with everything masked — specific IRQs are
+///    enabled later by whichever driver asks for them.
+/// 3. **Stores the AIC base** in a static so the FIQ dispatch loop can
+///    find it when it needs to read `AIC_EVENT`.
+///
+/// What this function does NOT do yet:
+///
+/// - **Wire AIC into the FIQ vector.** The FIQ handler in `vectors.rs`
+///   currently services only the architectural timer (which bypasses
+///   AIC — it arrives on the FIQ line directly). Connecting
+///   `aic.event()` dispatch to device IRQ handlers is the next M7 piece.
+/// - **Map the AIC's MMIO region.** Today the `Aic` is constructed with
+///   a physical address; on real hardware this must be mapped to a
+///   higher-half virtual address via `phys_to_virt` before any MMIO
+///   access. On QEMU this function is never called, so the mapping
+///   gap doesn't bite yet — but it will on the first real boot.
 ///
 /// On QEMU this function is never called — `kmain` selects
 /// `board::virt` based on the FDT's `/compatible` or the known RAM base.
-/// It exists so the compile-time question "does the Apple board module
-/// build?" is answered before the first real boot.
-pub fn init() {
+#[allow(dead_code)]
+pub fn init(fdt: Option<&Fdtr>) {
     // The timer will fire on FIQ. The boot stub already configured
     // CNTHCTL_EL2.EVNTI=1 (at EL2) so EL1 can access CNTV_CTL/CVAL.
     // The FIQ handler in vectors.rs checks CNTV_CTL_EL0.ISTATUS and
-    // services the tick. Nothing to do here yet — AIC init is the next
-    // piece.
-    //
-    // When AIC lands, this is where we'd call:
-    //   let mut aic = crate::hal::aic::Aic::new(aic_base);
-    //   aic.init();
-    //   aic.unmask_irq(AIC_TIMER_IRQ);
+    // services the tick.
+
+    // Discover and initialize the AIC interrupt controller.
+    if let Some(fdt) = fdt {
+        if let Some(aic_node) = fdt.find_by_compatible("apple,aic") {
+            // The `reg` property is an array of u32 cells. On Apple
+            // devicetrees the root has #address-cells=2 and #size-cells=2,
+            // so `reg` is: base_hi, base_lo, size_hi, size_lo — four u32s
+            // forming two u64s. We read the first two cells as the base
+            // address (high 32 bits, low 32 bits).
+            let mut cells = fdt.prop_cells(&aic_node, "reg");
+            let base_hi = cells.next().unwrap_or(0) as u64;
+            let base_lo = cells.next().unwrap_or(0) as u64;
+            let aic_base = ((base_hi << 32) | base_lo) as usize;
+
+            // TODO: map aic_base to a virtual address via phys_to_virt.
+            // Today we store the physical address; the AIC driver's
+            // read32/write32 will use it directly. On real hardware this
+            // must be a virtual address in the kernel's higher-half mapping.
+            let mut aic = Aic::new(aic_base);
+            aic.init();
+
+            // Store the base so the FIQ dispatch loop can find the AIC.
+            // The Aic struct is Copy and carries only (base, nr_irq);
+            // we store the base and let the handler reconstruct an &Aic
+            // from it, since static references in no_std are awkward.
+            AIC.store(aic_base, core::sync::atomic::Ordering::Relaxed);
+
+            // Diagnostic: the banner will print NR_IRQ and WHOAMI once
+            // the console is wired. For now, the AIC is online but silent.
+        }
+    }
 }
 
 /// RAM base on Apple Silicon. Unlike QEMU's fixed 0x4000_0000, Apple's
