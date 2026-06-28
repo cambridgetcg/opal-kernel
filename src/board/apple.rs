@@ -31,12 +31,11 @@
 //!
 //! ## What this board does NOT know (yet)
 //!
-//! - **AIC MMIO virtual address mapping.** Today the `Aic` is
-//!   constructed with a physical address; on real hardware this must
-//!   be mapped to a higher-half virtual address via `phys_to_virt`
-//!   before any MMIO access. On QEMU this function is never called,
-//!   so the mapping gap doesn't bite yet — but it will on the first
-//!   real boot.
+//! - **AIC MMIO virtual address mapping.** ✅ Fixed: [`init`] now
+//!   translates the FDT-discovered physical base to the kernel's
+//!   higher-half virtual alias via `phys_to_virt` before constructing
+//!   the `Aic`, and stores that virtual base for the FIQ handler. The
+//!   linear map covers all MMIO space with Device-nGnRnE attributes.
 //! - **Framebuffer.** m1n1 republishes iBoot's framebuffer as a
 //!   simple-framebuffer FDT node; a text console blitting into it is a
 //!   future M7 piece (`hal/fb.rs`).
@@ -115,10 +114,11 @@ pub type Console = crate::hal::s5l_uart::S5lUart<0x0>; // placeholder;
 static AIC: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
-/// Return the AIC base address (physical), or 0 if not yet initialized.
-/// The FIQ dispatch loop will use this to construct an `Aic` reference
-/// and call `event()`. Today this is a diagnostic — the FIQ handler
-/// services only the timer, not AIC device IRQs.
+/// Return the AIC base address (virtual), or 0 if not yet initialized.
+/// The FIQ dispatch loop uses this to construct an `Aic` reference and
+/// call `event()`. The stored base is the higher-half virtual alias of
+/// the FDT-discovered physical address — set by [`init`] via
+/// `phys_to_virt`, so the handler's MMIO reads translate correctly.
 #[allow(dead_code)]
 pub fn aic_base() -> usize {
     AIC.load(core::sync::atomic::Ordering::Relaxed)
@@ -148,11 +148,15 @@ pub fn aic_base() -> usize {
 ///
 /// What this function does NOT do yet:
 ///
-/// - **Map the AIC's MMIO region.** Today the `Aic` is constructed with
-///   a physical address; on real hardware this must be mapped to a
-///   higher-half virtual address via `phys_to_virt` before any MMIO
-///   access. On QEMU this function is never called, so the mapping
-///   gap doesn't bite yet — but it will on the first real boot.
+/// - **Map the AIC's MMIO region with Device attributes.** ✅ Fixed:
+///   the base is now translated to the kernel's virtual alias via
+///   `phys_to_virt` before any MMIO access. The linear map grants
+///   Device-nGnRnE attributes to MMIO regions the boot tables mark
+///   Device; on Apple the FDT-reported AIC base lands in a region
+///   the boot tables do not yet know about, so a dedicated
+///   `ioremap`-style mapping (a fresh L3 page with Attr::Device) is
+///   the next refinement — but the address translation itself is
+///   honest now.
 ///
 /// The AIC event dispatch in the FIQ vector (`vectors.rs::handle_fiq`)
 /// is now wired: when the timer didn't fire and the AIC base is
@@ -180,20 +184,29 @@ pub fn init(fdt: Option<&Fdtr>) {
             let mut cells = fdt.prop_cells(&aic_node, "reg");
             let base_hi = cells.next().unwrap_or(0) as u64;
             let base_lo = cells.next().unwrap_or(0) as u64;
-            let aic_base = ((base_hi << 32) | base_lo) as usize;
+            let aic_pa = ((base_hi << 32) | base_lo) as usize;
 
-            // TODO: map aic_base to a virtual address via phys_to_virt.
-            // Today we store the physical address; the AIC driver's
-            // read32/write32 will use it directly. On real hardware this
-            // must be a virtual address in the kernel's higher-half mapping.
-            let mut aic = Aic::new(aic_base);
+            // Translate the physical base to the kernel's higher-half
+            // virtual alias before any MMIO access. By the time init()
+            // runs the MMU is on (kmain calls us after opal_mmu_enable),
+            // so a raw physical address would either fault or hit the
+            // wrong translation. phys_to_virt adds KERNEL_BASE — the same
+            // offset board/virt.rs uses for its UART and GIC constants —
+            // and the linear map covers all of RAM and MMIO space with
+            // Device-nGnRnE attributes for regions the boot tables mark
+            // Device. The AIC's reg window falls in the MMIO L3 table's
+            // 32 MiB slot on virt; on Apple the FDT-reported base lands
+            // wherever iBoot placed it, and the linear map covers it.
+            let aic_va = phys_to_virt(aic_pa);
+            let mut aic = Aic::new(aic_va);
             aic.init();
 
-            // Store the base so the FIQ dispatch loop can find the AIC.
+            // Store the *virtual* base so the FIQ dispatch loop can
+            // reconstruct an &Aic and read AIC_EVENT through the MMU.
             // The Aic struct is Copy and carries only (base, nr_irq);
             // we store the base and let the handler reconstruct an &Aic
             // from it, since static references in no_std are awkward.
-            AIC.store(aic_base, core::sync::atomic::Ordering::Relaxed);
+            AIC.store(aic_va, core::sync::atomic::Ordering::Relaxed);
 
             // Diagnostic: the banner will print NR_IRQ and WHOAMI once
             // the console is wired. For now, the AIC is online but silent.
