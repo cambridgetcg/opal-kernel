@@ -53,8 +53,48 @@ use core::arch::global_asm;
 global_asm!(
     r#"
 .section .text.boot, "ax"       // "ax" = allocatable + executable
-.global _start
 
+    // ---- 0. arm64 Image header (64 bytes) --------------------------------
+    // The Linux arm64 "Image" boot protocol requires a 64-byte header at
+    // the very start of the binary. m1n1 (and any arm64 bootloader) reads
+    // the magic at offset 0x38 to identify the format, then uses
+    // text_offset / image_size / flags to place the kernel in RAM.
+    //
+    // On QEMU ELF boot: ENTRY(_image_start) = the load PA, so QEMU jumps
+    // here, executes the `b _start` (a 0x40-byte forward branch), and lands
+    // at the real boot code — costing one branch instruction, nothing else.
+    // On m1n1 Image boot: m1n1 loads the flat binary, validates the magic,
+    // and jumps to offset 0, where the same `b _start` fires.
+    //
+    // Header layout (Linux Documentation/arm64/booting.rst):
+    //
+    //   0x00  code0        b _start (branch to real entry, 0x40 ahead)
+    //   0x04  code1        0 (unused)
+    //   0x08  text_offset  u64 = 0 (header IS the start of text; PIC)
+    //   0x10  image_size   u64 = __image_size_bytes (linker-computed)
+    //   0x18  flags        u64 = 0xA (LE | 16K pages | any placement)
+    //   0x20  res2/res3/res4  3 × u64 = 0
+    //   0x38  magic        u32 = 0x644d5241 ("ARM\x64", little-endian)
+    //   0x3c  res5         u32 = 0
+    //
+    // flags encoding (arch/arm64/include/asm/image.h):
+    //   bit 0    : 0 = LE, 1 = BE          → 0 (we are LE)
+    //   bits 1-2 : 0 = 4K, 1 = 16K, 2 = 64K → 1 (Opal is 16K since M2)
+    //   bit 3    : 0 = 2MB aligned, 1 = any  → 1 (PIC, load anywhere)
+    //   = 0b1010 = 0xA
+    .global _image_start
+_image_start:
+    b       _start                  // code0: branch to real entry (0x40 ahead)
+    .zero   4                        // code1: unused
+    .quad   0                        // text_offset: 0 (header is the text start)
+    .quad   __image_size_bytes        // image_size (linker-computed, incl. bss)
+    .quad   0xA                      // flags: LE | 16K pages | any placement
+    .zero   24                       // res2, res3, res4 (3 × u64)
+    .word   0x644d5241               // magic: "ARM\x64" (LE u32)
+    .word   0                        // res5
+    // 64 bytes of header done. _start follows at offset 0x40.
+
+.global _start
 _start:
     // ---- 1. Park every core except core 0 -------------------------------
     // We boot with -smp 1 today, but this stub should survive the day we

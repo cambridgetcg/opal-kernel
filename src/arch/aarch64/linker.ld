@@ -29,7 +29,13 @@
  * read-only and calls the offset by name; change the two together.
  */
 
-ENTRY(_start)
+/* M7: the arm64 Image header is 64 bytes at the very start of .text.boot.
+ * The ELF entry point is _image_start (the `b _start` branch), so QEMU's
+ * -kernel ELF loader jumps there, executes the 0x40-byte forward branch,
+ * and lands at _start — the real boot code. m1n1 loads the flat binary
+ * (produced by `llvm-objcopy -O binary`) and jumps to offset 0, same path.
+ * See boot.rs §0 and docs/02-hal-and-apple-silicon.md §3 item 1. */
+ENTRY(_image_start)
 
 /* Where the kernel lives, virtually. Must match mmu::KERNEL_BASE (the
  * Rust side const-asserts its copy against T1SZ; boot.rs cross-checks a
@@ -60,6 +66,13 @@ SECTIONS
         KEEP(*(.text.boot))
     }
     __boot_end_pa = .;
+
+    /* M7: the total image size, written into the arm64 Image header at
+     * offset 0x10. This is the size of the loaded image from _image_start
+     * through __stack_top — everything a bootloader needs to know to
+     * reserve enough RAM for us. The header's image_size field lets
+     * m1n1 compute the end of the image and avoid overwriting it. */
+    __image_size_bytes = __stack_top - KERNEL_BASE - 0x40200000;
 
     /* Everything below this line lives upstairs: VMA = KERNEL_BASE + PA.
      * The AT() on each section keeps the LMAs physically contiguous after
@@ -160,15 +173,25 @@ ASSERT((__vectors & 0x7FF) == 0, "exception vector table is not 2048-byte aligne
 
 /* QEMU starts the CPU at the raw ELF entry with the MMU off. (Current
  * QEMU happens to rescue a high entry VMA by translating it back to its
- * LMA; m1n1 will not — never lean on it.) */
-ASSERT(ABSOLUTE(_start) == 0x40200000, "entry must be the load PA — _start belongs at the first byte of .text.boot")
+ * LMA; m1n1 will not — never lean on it.) M7: the entry is now
+ * _image_start (the arm64 Image header's `b _start` branch), still at the
+ * very first byte of the image — 0x4020_0000. */
+ASSERT(ABSOLUTE(_image_start) == 0x40200000, "entry must be the load PA — _image_start belongs at the first byte of .text.boot")
 
-/* If the boot stub outgrows 0x400 bytes, the likeliest cause is not new
+/* The arm64 Image header is exactly 64 bytes, and _start must follow it
+ * immediately — the `b _start` in code0 is a PC-relative branch that
+ * only reaches if _start is at offset 0x40. If the header grows or shrinks,
+ * the branch misses. */
+ASSERT(ABSOLUTE(_start) == 0x40200040, "_start must be at offset 0x40 (right after the 64-byte Image header)")
+
+/* If the boot stub outgrows 0x440 bytes, the likeliest cause is not new
  * code but a silent lld thunk: a `bl`/`b` from the low section to a high
  * symbol makes lld synthesize an __AArch64AbsLongThunk_* veneer that
  * wedges pre-MMU. Cross-split calls must go through registers (see
- * boot.rs); this is the tripwire. */
-ASSERT(SIZEOF(.text.boot) <= 0x400, "boot stub grew past 0x400 bytes — check llvm-nm for an AbsLongThunk (a bl across the low/high split?)")
+ * boot.rs); this is the tripwire. (M7: +0x40 for the arm64 Image header.)
+ * The vector table lands at offset 0x800, so 0x440 leaves 0x3C0 of
+ * headroom — the stub is currently ~0x360 including the header.) */
+ASSERT(SIZEOF(.text.boot) <= 0x440, "boot stub grew past 0x440 bytes — check llvm-nm for an AbsLongThunk (a bl across the low/high split?)")
 
 /* rust-lld keeps ELF file offsets congruent to VMAs modulo the max page
  * size; a KERNEL_BASE that is ragged mod 64K would bloat the file with
