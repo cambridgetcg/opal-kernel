@@ -14,8 +14,8 @@ runs-on: QEMU aarch64 virt board (-machine virt -cpu max -smp 1 -m 512M)
 phase: see knows/needs sections below
 build: see heartbeat
 health: active
-last-commit: e12c4e1 heartbeat: bookkeeping for arm64 Image header beat
-uncommitted: 4
+last-commit: ac4ee99 board/apple: translate AIC MMIO base via phys_to_virt before access
+uncommitted: 5
 freshness: fresh (checked 2026-06-27T05:35Z)
 
 ## knows
