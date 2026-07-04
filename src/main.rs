@@ -261,14 +261,30 @@ fn kmain(x0: u64) -> ! {
         );
     }
 
-    // M4: parse the devicetree for real. The FDT at RAM base is the one
-    // QEMU actually placed; if it's there, walk it and cross-check what
-    // the machine says about itself against the constants we compiled
-    // with. From here on, those constants are *fallbacks*, not truths —
-    // the FDT is the honest source. On Apple Silicon (M7) the UART base
+    // M4: parse the devicetree for real. The FDT is the honest source for
+    // every address the kernel uses — on Apple Silicon (M7) the UART base
     // genuinely differs per SoC, and the FDT is the only way to know.
-    if fdt_at(ram_base) {
-        if let Some(fdt) = arch::aarch64::fdt::Fdtr::new(ram_base as usize) {
+    //
+    // Where is the FDT? Two conventions, both honest:
+    //
+    // - **Linux boot protocol / m1n1 / QEMU Image boot**: x0 holds the
+    //   physical address of the FDT. This is the path that will be live on
+    //   Apple Silicon — m1n1 emits a standard arm64 Linux handoff.
+    // - **QEMU ELF boot (the daily dev path)**: x0 is 0 (QEMU sets no
+    //   registers for non-Linux ELF payloads); the DTB sits at the start
+    //   of RAM (0x4000_0000), placed there by QEMU's arm_load_dtb.
+    //
+    // We prefer x0 (the protocol path) when it points at a valid FDT, and
+    // fall back to RAM base (the QEMU-ELF path) otherwise. This is the
+    // bridge: the same code that parses QEMU's ELF-boot DTB today will
+    // parse m1n1's handoff tomorrow, with no special case for "Apple."
+    let fdt_pa = if fdt_at(x0) {
+        x0
+    } else {
+        ram_base
+    };
+    if fdt_at(fdt_pa) {
+        if let Some(fdt) = arch::aarch64::fdt::Fdtr::new(fdt_pa as usize) {
             println!(
                 "dtree     : parsed — {} bytes, boot CPU {}",
                 fdt.totalsize(),
