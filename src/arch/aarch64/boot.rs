@@ -131,6 +131,20 @@ _start:
     // not banked across EL).
     mov   x19, x0
 
+    // ---- 2b. Discover our own load address -------------------------------
+    // The arm64 Image header claims "any placement" (flags bit 3 = 1), but
+    // the rest of this stub still assumes PA 0x4020_0000. This `adr`
+    // captures where we *actually* landed — the foundation for genuine PIC
+    // boot. `adr` is PC-relative: the assembler encodes the link-time offset
+    // from here to _image_start, and at run time the result is the *actual*
+    // address of _image_start, wherever the loader placed us. On QEMU it
+    // reads 0x4020_0000 (matching the link address); on Apple Silicon via
+    // m1n1 it reads wherever m1n1 chose. Stashed in x22 (callee-saved,
+    // survives the two `blr`s and the `eret`) and passed to _start_rust as
+    // the second argument, so kmain can report the kernel's own placement
+    // honestly — and compute the relocation delta the full PIC fix will need.
+    adr   x22, _image_start     // x22 = actual PA of image start (load PA)
+
     // ---- 3. KERNEL_BASE, twice, compared, then parked somewhere safe ------
     // The VA<->PA offset is the one number this whole file leans on, so we
     // materialize it two independent ways — an immediate built here, and
@@ -338,8 +352,12 @@ _start:
     // An absolute branch: `br` through the pooled high address — the only
     // instruction that can cross the 4 GiB adrp horizon. x0 carries the
     // loader's DTB pointer out of x19, per the AAPCS64 the next function
-    // expects. From the fetch after this one, the kernel lives upstairs.
+    // expects. x1 carries the load PA from x22 — the kernel's own physical
+    // placement, discovered by `adr` at step 2b — so kmain can report it
+    // and compute the relocation delta the full PIC fix will lean on.
+    // From the fetch after this one, the kernel lives upstairs.
     mov   x0, x19
+    mov   x1, x22
     ldr   x9, =_start_rust
     br    x9
 
@@ -367,11 +385,17 @@ _start:
 /// `x0` is whatever was in register x0 at kernel entry: 0 under QEMU's
 /// ELF boot, a physical FDT pointer under m1n1 / the Linux boot protocol.
 ///
+/// `x1` is the kernel's own load physical address, discovered by `adr
+/// _image_start` in the boot stub (step 2b). On QEMU it matches the link
+/// address 0x4020_0000; on Apple Silicon via m1n1 it is wherever m1n1
+/// placed the image. kmain reports this honestly — the foundation for
+/// genuine position-independent boot.
+///
 /// # Safety
 /// Must only be reached from `_start` above — it assumes the environment
 /// that stub created.
 #[unsafe(no_mangle)] // edition 2024: no_mangle is an unsafe attribute,
                      // because colliding symbol names break linkage soundness
-pub unsafe extern "C" fn _start_rust(x0: u64) -> ! {
-    crate::kmain(x0)
+pub unsafe extern "C" fn _start_rust(x0: u64, load_pa: u64) -> ! {
+    crate::kmain(x0, load_pa)
 }

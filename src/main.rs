@@ -145,11 +145,12 @@ fn fdt_at(addr: u64) -> bool {
 // ---------------------------------------------------------------------------
 
 /// First kernel function. Called by `_start_rust` with `x0` exactly as
-/// the bootloader left it.
+/// the bootloader left it, and `load_pa` — the kernel's own physical load
+/// address, discovered by `adr _image_start` in the boot stub.
 ///
 /// Returns `!`: there is nothing to return *to*. The call stack below us
 /// is three frames of assembly ending in a parking loop.
-fn kmain(x0: u64) -> ! {
+fn kmain(x0: u64, load_pa: u64) -> ! {
     // Catching faults is the first ability worth having: install the
     // vector table before printing anything, so that even a banner-era
     // bug gets a report instead of M0's silent hang. (The boot stub
@@ -240,6 +241,24 @@ fn kmain(x0: u64) -> ! {
     // non-Linux ELF payloads, so here we expect 0 — and we report whatever
     // we actually find rather than what folklore says we should find.
     println!("x0 at entry: {x0:#x}");
+
+    // M7: where did the loader actually place us? The boot stub captures
+    // this with `adr _image_start` (step 2b) — PC-relative, so it reads
+    // the *actual* load PA, not the link address. On QEMU it matches
+    // 0x4020_0000; on Apple Silicon via m1n1 it is wherever m1n1 chose.
+    // The Image header claims "any placement" (flags bit 3 = 1); this line
+    // is the honest report of whether that claim is true yet. When
+    // load_pa != link_pa, the kernel knows it is displaced — the
+    // foundation for the full PIC fix (relocating the literal pools,
+    // adjusting the table builder's image_base).
+    const LINK_PA: u64 = 0x4020_0000;
+    let placement = if load_pa == LINK_PA {
+        "matches link address (0x4020_0000) — PIC not yet exercised"
+    } else {
+        "DISPLACED from link address — PIC boot required (not yet implemented)"
+    };
+    println!("load PA   : {load_pa:#x} — {placement}");
+
     if fdt_at(x0) {
         println!("fdt at x0  : yes — magic {FDT_MAGIC:#x} found (Linux-protocol style handoff)");
     } else {
