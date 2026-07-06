@@ -483,12 +483,21 @@ type LowConsole = crate::hal::pl011::Pl011<UART0_BASE>;
 /// Fills [`TABLES`] from linker symbols and board constants, and returns
 /// the root's physical address for [`opal_mmu_enable`] / TTBR0 / TTBR1.
 ///
+/// `delta` is the relocation delta (load_pa - link_pa), passed from the
+/// boot stub (x0 = x23). On QEMU it is 0; on Apple Silicon via m1n1 it
+/// is wherever m1n1 placed the image minus 0x4020_0000. Every linker
+/// symbol read here is a link-time PA (adrp's displacement cancels at
+/// run time only if we're running at the link address — which we may
+/// not be); adding `delta` turns it into the actual PA the table must
+/// map. The kernel's *virtual* addresses stay at their link-time VMAs:
+/// the high world is position-fixed, only the physical bytes move.
+///
 /// # Safety
 /// Call exactly once, from the boot stub (step 6), at a low PC, with the
 /// MMU off and `.bss` already zeroed (the zeroing is what makes every
 /// descriptor we *don't* write INVALID).
 #[unsafe(no_mangle)] // boot.rs reaches this symbol through a literal pool
-pub unsafe extern "C" fn opal_build_tables() -> u64 {
+pub unsafe extern "C" fn opal_build_tables(delta: u64) -> u64 {
     // ---- 0. The -cpu max receipt -----------------------------------------
     // .cargo/config.toml promised the 16 KiB granule; ID_AA64MMFR0_EL1 is
     // where the CPU itself answers. TGran16 (bits [23:20]) is 0b0000 when
@@ -516,8 +525,14 @@ pub unsafe extern "C" fn opal_build_tables() -> u64 {
     }
 
     // ---- 1. Where the kernel's pieces are --------------------------------
-    // Linker symbols, read at a low PC: physical addresses (contract
-    // rule 3). The W^X boundaries are 16 KiB-aligned by linker.ld ASSERTs.
+    // Linker symbols, read at a low PC: at the *actual* load address,
+    // `adrp`/`adr` yield the *actual* PA (load_pa + offset), not the
+    // link-time PA. The attribute comparisons below use `pa` in the
+    // link-time PA coordinate (the VA-derived PA: VA - KERNEL_BASE).
+    // To compare in the same space, subtract `delta` from each symbol,
+    // recovering the link-time PA. (When delta=0 this is a no-op.)
+    //
+    // The W^X boundaries are 16 KiB-aligned by linker.ld ASSERTs.
     unsafe extern "C" {
         static __text_end: u8;
         static __rodata_end: u8;
@@ -531,11 +546,12 @@ pub unsafe extern "C" fn opal_build_tables() -> u64 {
     // exposed, the same discipline as every MMIO access in hal/pl011.rs.
     // (Taking a symbol's address is safe; only reading *through* an
     // extern static would need unsafe, and we never do.)
-    let text_end = (&raw const __text_end).expose_provenance();
-    let rodata_end = (&raw const __rodata_end).expose_provenance();
-    let guard_bottom = (&raw const __stack_guard_bottom).expose_provenance();
-    let stack_bottom = (&raw const __stack_bottom).expose_provenance();
-    let stack_top = (&raw const __stack_top).expose_provenance();
+    let d = delta as usize;
+    let text_end = (&raw const __text_end).expose_provenance() - d;
+    let rodata_end = (&raw const __rodata_end).expose_provenance() - d;
+    let guard_bottom = (&raw const __stack_guard_bottom).expose_provenance() - d;
+    let stack_bottom = (&raw const __stack_bottom).expose_provenance() - d;
+    let stack_top = (&raw const __stack_top).expose_provenance() - d;
 
     // The kernel image must fit the one L3-refined 32 MiB; linker.ld
     // ASSERTs the same thing at link time with better error messages.
@@ -546,9 +562,16 @@ pub unsafe extern "C" fn opal_build_tables() -> u64 {
 
     // ---- 2. Leaves first: the kernel's 32 MiB, 16 KiB at a time ----------
     // 2048 pages over [0x4000_0000, 0x4200_0000), each picked by where it
-    // falls in the linker's layout. Raw-pointer writes (contract rule 2);
-    // the cursor arithmetic cannot overflow (2048 * 16 KiB added to a
-    // 30-bit base).
+    // falls in the linker's layout. `pa` is the VA-derived PA (what
+    // VA - KERNEL_BASE gives): the *link-time* coordinate the attribute
+    // boundaries live in. The descriptor's output PA is `pa` for the
+    // linear-mapped regions (DTB window, rest of RAM) and `pa + delta`
+    // for the kernel image pages — the actual physical bytes the loader
+    // placed. When delta=0 both are `pa` and the map is the identity
+    // linear map the original M2 builder produced.
+    //
+    // Raw-pointer writes (contract rule 2); the cursor arithmetic
+    // cannot overflow (2048 * 16 KiB added to a 30-bit base).
     // SAFETY (this and every `&raw` projection into TABLES below): single
     // core, MMU off, exactly one caller (the boot stub) — no aliasing
     // reader exists yet except the hardware walker, which only starts
@@ -556,17 +579,25 @@ pub unsafe extern "C" fn opal_build_tables() -> u64 {
     let l3k = unsafe { &raw mut TABLES.l3_kernel.0 } as *mut u64;
     let mut i = 0usize;
     while i < 2048 {
-        let pa = image_base + (i << 14);
+        let pa = image_base + (i << 14); // link-time PA (VA-derived)
+        // Kernel image pages: the actual bytes are at load_pa + offset,
+        // which is pa + delta in the link-time coordinate. DTB window
+        // and free RAM pages: identity linear (PA = pa).
+        let out_pa = if pa >= text_start && pa < stack_top {
+            pa + d
+        } else {
+            pa
+        };
         let desc = if pa < text_start {
             // The DTB window: QEMU's devicetree, read-only — corrupting
             // the boot evidence should take effort. (M4 reads it for real.)
-            page_desc(pa as u64, Attr::Ro)
+            page_desc(out_pa as u64, Attr::Ro)
         } else if pa < text_end {
-            page_desc(pa as u64, Attr::TextRx)
+            page_desc(out_pa as u64, Attr::TextRx)
         } else if pa < rodata_end {
-            page_desc(pa as u64, Attr::Ro)
+            page_desc(out_pa as u64, Attr::Ro)
         } else if pa < guard_bottom {
-            page_desc(pa as u64, Attr::Rw)
+            page_desc(out_pa as u64, Attr::Rw)
         } else if pa < stack_bottom {
             // THE GUARD: the 16 KiB below the stack stays exactly as the
             // boot stub left it — an all-zero, INVALID descriptor. Not a
@@ -576,7 +607,7 @@ pub unsafe extern "C" fn opal_build_tables() -> u64 {
             continue;
         } else {
             // Stack, then everything to the end of the 32 MiB: plain RAM.
-            page_desc(pa as u64, Attr::Rw)
+            page_desc(out_pa as u64, Attr::Rw)
         };
         unsafe { l3k.add(i).write(desc) };
         i += 1;

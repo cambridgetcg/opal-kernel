@@ -259,6 +259,17 @@ fn kmain(x0: u64, load_pa: u64) -> ! {
     };
     println!("load PA   : {load_pa:#x} — {placement}");
 
+    // M7: the relocation delta, computed honestly. When the loader placed
+    // us at the link address, delta is 0 and every `add xN, xN, x23` in
+    // the boot stub was a no-op. When displaced, delta is what the boot
+    // stub added to every literal-pool address and what the table builder
+    // added to every kernel-image page's output PA — the difference
+    // between mapping the real bytes and mapping the link-time ghosts.
+    let delta = load_pa.wrapping_sub(LINK_PA);
+    if delta != 0 {
+        println!("reloc delta: {delta:#x} — boot stub relocated {delta:#x} bytes from link PA");
+    }
+
     if fdt_at(x0) {
         println!("fdt at x0  : yes — magic {FDT_MAGIC:#x} found (Linux-protocol style handoff)");
     } else {

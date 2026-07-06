@@ -145,6 +145,30 @@ _start:
     // honestly — and compute the relocation delta the full PIC fix will need.
     adr   x22, _image_start     // x22 = actual PA of image start (load PA)
 
+    // ---- 2c. Compute the relocation delta --------------------------------
+    // The literal pools below contain link-time VMA = KERNEL_BASE + link_PA
+    // + offset (for high symbols) or just link_PA + offset (for .text.boot
+    // symbols like _image_start itself). `sub xN, xN, x21` converts a high
+    // VMA to link_PA + offset — the link PA, not the load PA. The delta
+    // between them is what every absolute address in this stub needs added
+    // to land on the real bytes when the loader placed us elsewhere.
+    //
+    // _image_start's VMA is 0x4020_0000 (.text.boot has VMA = LMA, a low
+    // address — no KERNEL_BASE). So `ldr x23, =_image_start` yields the
+    // link PA directly, no KERNEL_BASE subtraction needed. x22 already
+    // holds the actual load PA from `adr` above. delta = load_pa - link_pa.
+    //
+    // On QEMU delta is 0 (load PA == link PA) — every `add xN, xN, x23`
+    // below is a no-op, and the boot is identical to before. On Apple
+    // Silicon via m1n1, delta is wherever m1n1 chose minus 0x4020_0000,
+    // and these adds are the difference between mapping the real bytes
+    // and mapping the link-time ghosts of them.
+    //
+    // x23 is callee-saved (x19–x30), so it survives the two `blr`s into
+    // Rust and the `eret` (a general register, not banked across EL).
+    ldr   x23, =_image_start     // x23 = link PA (0x4020_0000)
+    sub   x23, x22, x23          // x23 = delta = load_pa - link_pa
+
     // ---- 3. KERNEL_BASE, twice, compared, then parked somewhere safe ------
     // The VA<->PA offset is the one number this whole file leans on, so we
     // materialize it two independent ways — an immediate built here, and
@@ -214,7 +238,8 @@ _start:
 
     // We are at EL2. Configure the minimum EL2 state and eret to EL1.
     ldr   x9, =__vectors
-    sub   x9, x9, x21             // __vectors PA (x21 = KERNEL_BASE)
+    sub   x9, x9, x21             // __vectors link PA
+    add   x9, x9, x23             // __vectors actual PA (relocated)
     msr   VBAR_EL2, x9
 
     movz  x9, #0x8000, lsl #16    // HCR_EL2: RW bit (31) = 1, rest 0
@@ -240,9 +265,11 @@ _start:
     // on QEMU, and a one-time stair-step on Apple Silicon.
 
     // ---- 4. Give ourselves a stack (at its physical address) -------------
-    // __stack_top is a high VMA now; the machine is not. Pool + subtract.
+    // __stack_top is a high VMA now; the machine is not. Pool + subtract
+    // + relocate: sub turns VMA into link PA, add adjusts for actual load.
     ldr   x1, =__stack_top
     sub   x1, x1, x21
+    add   x1, x1, x23
     mov   sp, x1                  // stack is live; calls are now legal
 
     // ---- 5. Zero .bss (at its physical addresses) -------------------------
@@ -251,9 +278,11 @@ _start:
     // Since M2 this matters double: the page tables live in .bss, and a
     // descriptor we never write must read as INVALID — that is, zero.
     ldr   x1, =__bss_start
-    sub   x1, x1, x21             // x1 = cursor (PA)
+    sub   x1, x1, x21             // x1 = cursor (link PA)
+    add   x1, x1, x23             // x1 = cursor (actual PA)
     ldr   x2, =__bss_end
-    sub   x2, x2, x21             // x2 = one-past-the-end (PA)
+    sub   x2, x2, x21             // x2 = one-past-the-end (link PA)
+    add   x2, x2, x23             // x2 = one-past-the-end (actual PA)
 
 .L_bss_clear:
     cmp   x1, x2                  // done?
@@ -267,8 +296,11 @@ _start:
     // ---- 6. Build the page tables -----------------------------------------
     // Rust, called at its physical address (LOW WORLD contract: mmu.rs).
     // Returns the root table's PA in x0; stash it in callee-saved x20.
+    // x23 (delta) passed as arg so the builder can map the real image.
     ldr   x9, =opal_build_tables
     sub   x9, x9, x21
+    add   x9, x9, x23
+    mov   x0, x23                 // arg0 = relocation delta
     blr   x9
     mov   x20, x0
 
@@ -282,6 +314,7 @@ _start:
     // structural fix.)
     ldr   x9, =__vectors
     sub   x9, x9, x21
+    add   x9, x9, x23
     msr   VBAR_EL1, x9
     isb
 
@@ -292,6 +325,7 @@ _start:
     mov   x0, x20
     ldr   x9, =opal_mmu_enable
     sub   x9, x9, x21
+    add   x9, x9, x23
     blr   x9
 
     // ---- 9. The canary: prove the high half exists, or say so and stop ----
