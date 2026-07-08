@@ -138,3 +138,139 @@ impl<const BASE: usize> fmt::Write for S5lUart<BASE> {
         Ok(())
     }
 }
+
+// -----------------------------------------------------------------------
+// Runtime-base wrapper — the Apple Silicon console path
+// -----------------------------------------------------------------------
+
+/// A Samsung-style s5l UART whose base address is a *runtime* value.
+///
+/// `S5lUart<const BASE>` carries its MMIO base in the type — perfect for
+/// QEMU's virt board, where the UART base is a compile-time constant. On
+/// Apple Silicon the base is FDT-discovered and differs per SoC, so a
+/// const generic cannot name it. `RuntimeS5lUart` carries the base as a
+/// field instead, making it constructible after the FDT parser hands us
+/// the address.
+///
+/// The same *spirit* as `Pl011`/`S5lUart`: the struct is one word (the
+/// base), and a sentinel `base = 0` is the honest pre-`init` state. The
+/// panic handler can still conjure one — but with base 0 every write
+/// spins (the status check reads from address 0x10, which on Apple is
+/// unmapped and faults). In practice the console is configured before
+/// any code that can panic runs, matching how `board::virt::init()` works.
+///
+/// The register layout and bit semantics are identical to `S5lUart` —
+/// this is the same hardware, just named at runtime. See the module docs
+/// above for the register map and polarity conventions.
+#[derive(Clone, Copy)]
+pub struct RuntimeS5lUart {
+    base: usize,
+}
+
+#[allow(dead_code)] // no Apple board wires this up yet — M7 continues
+impl RuntimeS5lUart {
+    /// Construct an s5l UART at the given virtual base address.
+    ///
+    /// The caller is responsible for ensuring `base` is the kernel's
+    /// higher-half VA of the FDT-discovered physical base (via
+    /// `phys_to_virt`), mapped Device-nGnRnE. Constructing with `base=0`
+    /// yields a sentinel "not yet configured" instance; its methods are
+    /// safe to call but will spin (status reads from address 0x10, which
+    /// faults) — so set the real base before any print path runs.
+    pub const fn new(base: usize) -> Self {
+        Self { base }
+    }
+
+    /// The "not yet configured" sentinel. Methods on this instance are
+    /// safe to call but will not produce output — they spin on a status
+    /// read from an unmapped address. The boot stub's early output (if
+    /// any) goes through m1n1's proxy hypervisor, not this console.
+    pub const fn unconfigured() -> Self {
+        Self { base: 0 }
+    }
+
+    /// Set the base address after FDT discovery. Called by
+    /// `board::apple::init` (or the kmain path that wires the Apple
+    /// console) once the FDT parser finds `compatible = "apple,s5l-uart"`.
+    pub fn set_base(&mut self, base: usize) {
+        self.base = base;
+    }
+
+    /// The current base address (0 if not yet configured).
+    pub fn base(&self) -> usize {
+        self.base
+    }
+
+    // Register offsets — same layout as S5lUart<const BASE>.
+    const UTRSTAT_OFF: usize = 0x10;
+    const UTXH_OFF: usize = 0x20;
+    const URXH_OFF: usize = 0x24;
+
+    const UTRSTAT_TX_EMPTY: u32 = 1 << 1;
+    const UTRSTAT_RX_READY: u32 = 1 << 0;
+
+    #[inline]
+    fn status(&self) -> u32 {
+        // SAFETY: UTRSTAT is a readable 32-bit device register at
+        // base + 0x10. If base is 0 (unconfigured), this reads from
+        // 0x10 — which faults on Apple (unmapped) and is benign on
+        // QEMU (the UART page is at 0x0900_0000, so 0x10 is low RAM,
+        // readable but not a UART). The caller contract is that the
+        // base is set before the first print; the unconfigured
+        // sentinel exists for static initialization, not for use.
+        unsafe {
+            ptr::with_exposed_provenance::<u32>(self.base + Self::UTRSTAT_OFF)
+                .read_volatile()
+        }
+    }
+
+    /// Transmit one byte. Spins while the TX buffer is non-empty.
+    pub fn write_byte(self, b: u8) {
+        while self.status() & Self::UTRSTAT_TX_EMPTY == 0 {
+            core::hint::spin_loop();
+        }
+        // SAFETY: UTXH is a writable device register; TX_EMPTY was set.
+        unsafe {
+            ptr::with_exposed_provenance_mut::<u8>(self.base + Self::UTXH_OFF)
+                .write_volatile(b)
+        }
+    }
+
+    /// Receive one byte if one is waiting, else `None`. Never blocks.
+    pub fn try_read_byte(self) -> Option<u8> {
+        if self.status() & Self::UTRSTAT_RX_READY == 0 {
+            return None;
+        }
+        // SAFETY: URXH is a readable device register; RX_READY was set.
+        let data = unsafe {
+            ptr::with_exposed_provenance::<u8>(self.base + Self::URXH_OFF)
+                .read_volatile()
+        };
+        Some(data)
+    }
+
+    /// Receive one byte, spinning until one arrives.
+    pub fn read_byte(self) -> u8 {
+        loop {
+            if let Some(b) = self.try_read_byte() {
+                return b;
+            }
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// `core::fmt::Write` so `println!` works through the runtime-base console.
+/// The Apple board's `Console` type alias points here once the FDT
+/// parser has discovered the s5l UART base.
+impl fmt::Write for RuntimeS5lUart {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for b in s.bytes() {
+            if b == b'\n' {
+                self.write_byte(b'\r');
+            }
+            self.write_byte(b);
+        }
+        Ok(())
+    }
+}

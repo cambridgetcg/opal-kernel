@@ -9,8 +9,10 @@
 //!
 //! - **The console is an s5l UART**, discovered from the FDT (its base
 //!   address differs per SoC — no constant here). The driver in
-//!   `hal/s5l_uart.rs` is complete; this board wires it up once the
-//!   FDT parser hands us a base address.
+//!   `hal/s5l_uart.rs` is complete; this board's `init()` discovers the
+//!   base via `find_by_compatible("apple,s5l-uart")`, translates it to
+//!   the kernel VA, and stores it — `console()` constructs a
+//!   `RuntimeS5lUart` for `println!`.
 //! - **Entry is at EL2.** The boot stub (`arch/aarch64/boot.rs`) already
 //!   detects EL2, configures the minimal EL2 state (VBAR_EL2, HCR_EL2,
 //!   CNTHCTL_EL2, CNTVOFF_EL2), and `eret`s down to EL1 before anything
@@ -86,19 +88,29 @@ pub fn set_uart_base(pa: usize) {
     S5L_UART_BASE.store(pa, core::sync::atomic::Ordering::Relaxed);
 }
 
-/// The console type: an s5l UART whose base comes from the FDT, mapped
-/// at its higher-half virtual address.
+/// The console type: a runtime-base s5l UART.
 ///
-/// Today this is a placeholder — the base is a runtime value, not a
-/// compile-time constant, so the zero-sized `S5lUart<const BASE>` pattern
-/// from `board/virt.rs` does not directly apply. The real instantiation
-/// will either use a `const`-generic parameter set by a const-evaluated
-/// FDT lookup, or — more likely given that the FDT is inherently runtime
-/// data — a small wrapper that reads `S5L_UART_BASE` and writes through a
-/// raw pointer, matching the `fmt::Write` contract. The driver in
-/// `hal/s5l_uart.rs` already implements `fmt::Write` for a const base;
-/// bridging the runtime base is the next refinement.
-pub type Console = crate::hal::s5l_uart::S5lUart<0x0>; // placeholder;
+/// `S5lUart<const BASE>` (used by `board/virt.rs`) is zero-sized and
+/// perfect for a *compile-time-known* UART base. On Apple Silicon the
+/// base is FDT-discovered at runtime — so the console carries it as a
+/// field. `RuntimeS5lUart` implements `core::fmt::Write` with the same
+/// byte path as the const-generic driver; the board's `init()` sets the
+/// base after the FDT parser finds `compatible = "apple,s5l-uart"`.
+///
+/// Before `init` runs, the console is `RuntimeS5lUart::unconfigured()`
+/// (base 0); writing through it would spin on an unmapped address. In
+/// practice the boot stub's early output (if any) goes through m1n1's
+/// proxy hypervisor, and this console is configured before any Rust
+/// print path runs.
+pub type Console = crate::hal::s5l_uart::RuntimeS5lUart;
+
+/// Construct the board console. Mirrors `board::virt::console()`:
+/// returns a `Console` the caller can `write_fmt` into. Before `init`
+/// has set the UART base, this returns an unconfigured instance (base 0).
+pub fn console() -> Console {
+    let base = S5L_UART_BASE.load(core::sync::atomic::Ordering::Relaxed);
+    Console::new(base)
+}
 
 // ---------------------------------------------------------------------------
 // The interrupt controller — AIC, FDT-discovered base
@@ -136,14 +148,19 @@ pub fn aic_base() -> usize {
 ///
 /// What this function does today:
 ///
-/// 1. **Discovers the AIC** from the FDT by `compatible = "apple,aic"`,
+/// 1. **Discovers the console UART** from the FDT by
+///    `compatible = "apple,s5l-uart"`, reads its `reg` property (two
+///    u64 cells: base + size), translates the base to the kernel's
+///    higher-half VA, and stores it in `S5L_UART_BASE` so `console()`
+///    can construct a `RuntimeS5lUart` for `println!`.
+/// 2. **Discovers the AIC** from the FDT by `compatible = "apple,aic"`,
 ///    reads its `reg` property (two u64 cells: base + size), and
 ///    constructs an [`Aic`] at that physical address.
-/// 2. **Initializes the AIC**: masks all IRQs, clears software-triggered
+/// 3. **Initializes the AIC**: masks all IRQs, clears software-triggered
 ///    IRQs, targets all IRQs at CPU 0, caches `NR_IRQ` from `AIC_INFO`.
 ///    The controller starts with everything masked — specific IRQs are
 ///    enabled later by whichever driver asks for them.
-/// 3. **Stores the AIC base** in a static so the FIQ dispatch loop can
+/// 4. **Stores the AIC base** in a static so the FIQ dispatch loop can
 ///    find it when it needs to read `AIC_EVENT`.
 ///
 /// What this function does NOT do yet:
@@ -173,8 +190,28 @@ pub fn init(fdt: Option<&Fdtr>) {
     // The FIQ handler in vectors.rs checks CNTV_CTL_EL0.ISTATUS and
     // services the tick.
 
-    // Discover and initialize the AIC interrupt controller.
+    // Discover the console UART and the AIC interrupt controller from
+    // the FDT. Both bases are FDT-discovered (they differ per SoC) and
+    // translated to the kernel's higher-half virtual alias before any
+    // MMIO access.
     if let Some(fdt) = fdt {
+        // ---- Console: s5l UART ----
+        // Find the serial node by `compatible = "apple,s5l-uart"`. The
+        // `reg` property is two u64 cells (base, size) on Apple
+        // devicetrees (#address-cells=2, #size-cells=2). We read the
+        // first two u32 cells as the base address (high 32, low 32),
+        // translate to the kernel VA, and store it so `console()` can
+        // construct a `RuntimeS5lUart` for `println!`.
+        if let Some(uart_node) = fdt.find_by_compatible("apple,s5l-uart") {
+            let mut cells = fdt.prop_cells(&uart_node, "reg");
+            let base_hi = cells.next().unwrap_or(0) as u64;
+            let base_lo = cells.next().unwrap_or(0) as u64;
+            let uart_pa = ((base_hi << 32) | base_lo) as usize;
+            let uart_va = phys_to_virt(uart_pa);
+            S5L_UART_BASE.store(uart_va, core::sync::atomic::Ordering::Relaxed);
+        }
+
+        // ---- Interrupt controller: AIC ----
         if let Some(aic_node) = fdt.find_by_compatible("apple,aic") {
             // The `reg` property is an array of u32 cells. On Apple
             // devicetrees the root has #address-cells=2 and #size-cells=2,
