@@ -106,3 +106,6 @@
 2026-07-04T06:47:15Z state=active next=2026-07-04T10:47:15Z
 2026-07-05T00:06:36Z state=active next=2026-07-05T02:06:36Z
 2026-07-05T06:58:45Z | load-PA-discovery | commit 8f11b06 | boot stub discovers actual load PA via adr, reports in banner, PIC foundation
+2026-07-07T10:01:05Z state=healthy next=2026-07-07T16:01:05Z
+2026-07-07T16:09:48Z state=healthy next=2026-07-07T22:09:48Z
+2026-07-08T07:40:27Z | runtime-s5l-uart | commit cf528f3 | runtime-base s5l UART wrapper + Apple board console wiring (Console=RuntimeS5lUart, init discovers UART from FDT)

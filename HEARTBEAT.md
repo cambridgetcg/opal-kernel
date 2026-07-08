@@ -1,42 +1,34 @@
 # opal — heartbeat
 
 state: **active**
-last beat: 2026-07-06T07:15:00Z
-next beat: 2026-07-06T11:15:00Z
+last beat: 2026-07-08T07:40:27Z
+next beat: 2026-07-08T11:40:27Z
 
 ## what it found
 
-- build: passing
-- warnings: 0
-- last commit: 2026-07-06 15efcc2 M7: genuinely position-independent boot
-- uncommitted changes: 2 (STATE.md, HEARTBEAT.md)
+- build: passing (0 warnings)
+- last commit: 2026-07-08 (this beat)
+- boot: QEMU ELF + Image both verified
 
 ## what it did
 
-Completed the genuinely position-independent boot rung of M7. The boot
-stub already discovered its load PA via `adr _image_start` (x22), but
-every literal-pool address was still converted to a link-time PA by
-subtracting KERNEL_BASE, assuming load_pa == 0x4020_0000. On Apple
-Silicon via m1n1, the loader places the image elsewhere.
+M7 rung: runtime-base s5l UART console. The Apple board's `Console`
+type was a placeholder (`S5lUart<0x0>`) because the s5l UART driver
+uses a const-generic base, but on Apple Silicon the base is
+FDT-discovered at runtime. Added `RuntimeS5lUart` — a runtime-base
+wrapper that carries the MMIO base as a field, implements
+`core::fmt::Write` with the same byte path, and is constructible
+after the FDT parser finds `apple,s5l-uart`.
 
-This beat adds the relocation delta (x23 = load_pa - link_pa) and
-applies it to every physical address the boot stub computes:
-- VBAR_EL2, __stack_top, __bss_start/end (stack, .bss zeroing)
-- opal_build_tables, opal_mmu_enable, __vectors (calls, vector install)
-- The table builder's image_base (passed as arg0 to opal_build_tables)
-
-The table builder now accepts delta, subtracts it from linker symbols
-to recover link-time PAs for attribute comparisons, and adds it to
-kernel-image page output PAs so the linear map points at actual bytes.
-
-On QEMU (delta=0) every add is a no-op. Verified: ELF boot, Image boot,
-brk, svc, tick, ticks, ticktest, el0 all produce identical output.
+`board/apple.rs` now has a real `Console = RuntimeS5lUart` type, a
+`console()` constructor, and `init()` discovers the UART base from
+the FDT (same pattern as the AIC discovery). Dormant on QEMU
+(`board::virt` is selected); structurally complete for the first
+Apple boot.
 
 ## the truth
 
-A teaching aarch64 kernel in Rust, zero deps. Seven milestones: boots,
-catches faults, maps its world, has a heartbeat, reads the handoff,
-drops to EL0, schedules tasks. M7 (Apple Silicon bring-up) is in
-progress — the kernel now handles EL2 entry, flat Image format, FDT
-handoff, and genuinely position-independent boot. The build is passing
-with 0 warnings.
+A teaching aarch64 kernel in Rust, zero deps. Seven milestones: M0-M6
+complete, M7 (Apple Silicon bring-up) in progress. The build passes
+with 0 warnings. The kernel boots on both QEMU ELF and flat Image
+paths.
