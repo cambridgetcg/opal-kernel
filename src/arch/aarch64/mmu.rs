@@ -158,13 +158,15 @@ const _: () = assert!(
 ///   posted (early-acked) MMIO writes with an SError — it is why Linux
 ///   grew `ioremap_np()` during the M1 bring-up. QEMU forgives either;
 ///   the real target does not, so we rehearse the strict one.
+/// - **index 2 = 0x44**: Normal non-cacheable, inner and outer. The
+///   framebuffer's attribute: RAM-backed display memory that the display
+///   controller reads directly, so cache would show stale pixels. This
+///   slot waited since M2 for exactly this user.
 ///
-/// The six unused slots stay 0x00, which *decodes as* Device-nGnRnE: a
-/// descriptor with a buggy AttrIndx lands on the strictest memory type
-/// instead of a permissive one. (A third slot — Normal non-cacheable —
-/// has no user until M7's framebuffer; adding an index later rewrites no
-/// existing descriptor, so it waits.)
-pub const MAIR_EL1_VALUE: u64 = 0x0000_0000_0000_00FF;
+/// The five remaining slots stay 0x00, which *decodes as* Device-nGnRnE:
+/// a descriptor with a buggy AttrIndx lands on the strictest memory type
+/// instead of a permissive one.
+pub const MAIR_EL1_VALUE: u64 = 0x0000_0000_0044_00FF;
 
 /// SCTLR_EL1 as one from-scratch value — deliberately *not* read-modify-
 /// write: when m1n1 hands us the machine at EL2, SCTLR_EL1 (a lower EL's
@@ -383,6 +385,12 @@ pub(crate) enum Attr {
     /// userspace program: EL0 can fetch and execute, but neither EL can
     /// write it (W^X is the kernel's invariant, extended downward). M5.
     UserRx,
+    /// Normal non-cacheable, read-write, never executable. The
+    /// framebuffer: RAM-backed display memory that the display
+    /// controller reads directly. Cache would show stale pixels, so
+    /// MAIR slot 2 (0x44 = inner+outer non-cacheable) is the attribute.
+    /// M7's framebuffer console.
+    Framebuffer,
 }
 
 impl Attr {
@@ -412,6 +420,11 @@ impl Attr {
             // EL1 RO), no UXN (EL0 CAN execute), PXN set (EL1 cannot
             // execute — the kernel never branches into user code).
             Attr::UserRx => AF | SH_INNER | AP_RO | (1 << 6) | PXN,
+            // Framebuffer: Normal non-cacheable (AttrIndx = 2, MAIR
+            // slot 2 = 0x44), read-write, never executable. SH_INNER
+            // for consistency with other Normal memory; the non-cacheable
+            // attribute makes shareability largely irrelevant.
+            Attr::Framebuffer => AF | SH_INNER | (0b10 << 2) | PXN | UXN,
         }
     }
 }
@@ -1039,6 +1052,51 @@ pub fn ioremap_device(va: usize, pa: usize) -> Result<(), IoremapError> {
     // vmalle1 invalidation is coarse but correct for single-core boot
     // mapping; the alternative (tlbi by VA) encodes the ASID/VA layout
     // and offers no benefit here.
+    unsafe {
+        core::arch::asm!(
+            "dsb ishst",
+            "tlbi vmalle1",
+            "dsb nsh",
+            "isb",
+            options(nostack, preserves_flags),
+        );
+    }
+    Ok(())
+}
+
+/// Map a single 16 KiB Normal non-cacheable page at `va` -> `pa` in the
+/// kernel's TTBR1 tree, creating any missing intermediate tables from
+/// the runtime pool.
+///
+/// This is the framebuffer counterpart to [`ioremap_device`]: the
+/// framebuffer is RAM-backed display memory, not a device register
+/// block, so it gets Normal non-cacheable attributes (MAIR slot 2)
+/// instead of Device-nGnRnE. The display controller reads the framebuffer
+/// directly; cache would show stale pixels.
+///
+/// # Safety
+/// Must be called with the MMU on and the kernel running in the high
+/// half. Single-core only; no concurrency on the live tables.
+pub fn ioremap_framebuffer(va: usize, pa: usize) -> Result<(), IoremapError> {
+    if va & (GRANULE - 1) != 0 || pa & (GRANULE - 1) != 0 {
+        return Err(IoremapError::Misaligned);
+    }
+    if va >> 48 != 0xFFFF {
+        return Err(IoremapError::NotKernelVa);
+    }
+
+    let l0_pa = ttbr1() as usize;
+    let l0_desc = read_table(l0_pa, va_l0i(va));
+    if l0_desc & 0b11 != 0b11 {
+        return Err(IoremapError::BlockInPath);
+    }
+    let l1_pa = (l0_desc & 0x0000_FFFF_FFFF_C000) as usize;
+
+    let l2_pa = ensure_table(l1_pa, va_l1i(va))?;
+    let l3_pa = ensure_table(l2_pa, va_l2i(va))?;
+
+    write_table(l3_pa, va_l3i(va), page_desc(pa as u64, Attr::Framebuffer));
+
     unsafe {
         core::arch::asm!(
             "dsb ishst",

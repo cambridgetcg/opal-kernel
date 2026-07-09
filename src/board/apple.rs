@@ -247,6 +247,19 @@ pub fn init(fdt: Option<&Fdtr>) {
                 }
             }
         }
+
+        // ---- Framebuffer: simple-framebuffer ----
+        // m1n1 republishes iBoot's framebuffer as a simple-framebuffer
+        // FDT node. Discover it and bring the display online — the only
+        // display path guaranteed on every Apple Silicon Mac. The
+        // framebuffer is mapped Normal non-cacheable (MAIR slot 2) via
+        // ioremap_framebuffer, and hal::fb implements a text console
+        // with a built-in 8x16 font that blits characters directly into
+        // the display memory.
+        //
+        // On QEMU this never fires (no simple-framebuffer node in the
+        // virt DTB). On Apple via m1n1, it brings the screen to life.
+        crate::hal::fb::init_from_fdt(fdt);
     }
 }
 

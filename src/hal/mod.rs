@@ -14,6 +14,7 @@
 //! real UARTs in hand — a minimal `Console` trait may earn its keep.
 
 pub mod aic;
+pub mod fb;
 pub mod gicv2;
 pub mod pl011;
 pub mod s5l_uart;
