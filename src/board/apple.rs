@@ -78,8 +78,7 @@ use crate::hal::aic::Aic;
 /// Zero means "not yet discovered" — before `init` runs, no console
 /// exists. The boot stub's early output (if any) would go through m1n1's
 /// proxy hypervisor, which traps MMIO and tunnels it over USB.
-static S5L_UART_BASE: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
+static S5L_UART_BASE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// Set the s5l UART base, discovered from the FDT by `kmain` (or the
 /// board's own init, once the FDT parser is wired in). Called before
@@ -123,8 +122,7 @@ pub fn console() -> Console {
 /// Under m1n1, each MMIO access is a hypervisor trap tunneled over USB,
 /// so the `Aic` caches `NR_IRQ` (read once during `init`) to avoid
 /// re-reading `AIC_INFO` on every `unmask_irq` / `mask_irq` call.
-static AIC: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
+static AIC: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// Return the AIC base address (virtual), or 0 if not yet initialized.
 /// The FIQ dispatch loop uses this to construct an `Aic` reference and
@@ -208,7 +206,19 @@ pub fn init(fdt: Option<&Fdtr>) {
             let base_lo = cells.next().unwrap_or(0) as u64;
             let uart_pa = ((base_hi << 32) | base_lo) as usize;
             let uart_va = phys_to_virt(uart_pa);
-            S5L_UART_BASE.store(uart_va, core::sync::atomic::Ordering::Relaxed);
+            match mmu::ioremap_device(uart_va, uart_pa) {
+                Ok(()) => {
+                    S5L_UART_BASE.store(uart_va, core::sync::atomic::Ordering::Relaxed);
+                }
+                Err(e) => {
+                    // This is a boot-time fatal condition on Apple
+                    // hardware: the console UART must be mapped before
+                    // any print can reach it. Report it honestly.
+                    println!(
+                        "apple::init: failed to map s5l UART PA {uart_pa:#x} -> VA {uart_va:#x}: {e:?}"
+                    );
+                }
+            }
         }
 
         // ---- Interrupt controller: AIC ----
@@ -223,30 +233,19 @@ pub fn init(fdt: Option<&Fdtr>) {
             let base_lo = cells.next().unwrap_or(0) as u64;
             let aic_pa = ((base_hi << 32) | base_lo) as usize;
 
-            // Translate the physical base to the kernel's higher-half
-            // virtual alias before any MMIO access. By the time init()
-            // runs the MMU is on (kmain calls us after opal_mmu_enable),
-            // so a raw physical address would either fault or hit the
-            // wrong translation. phys_to_virt adds KERNEL_BASE — the same
-            // offset board/virt.rs uses for its UART and GIC constants —
-            // and the linear map covers all of RAM and MMIO space with
-            // Device-nGnRnE attributes for regions the boot tables mark
-            // Device. The AIC's reg window falls in the MMIO L3 table's
-            // 32 MiB slot on virt; on Apple the FDT-reported base lands
-            // wherever iBoot placed it, and the linear map covers it.
             let aic_va = phys_to_virt(aic_pa);
-            let mut aic = Aic::new(aic_va);
-            aic.init();
-
-            // Store the *virtual* base so the FIQ dispatch loop can
-            // reconstruct an &Aic and read AIC_EVENT through the MMU.
-            // The Aic struct is Copy and carries only (base, nr_irq);
-            // we store the base and let the handler reconstruct an &Aic
-            // from it, since static references in no_std are awkward.
-            AIC.store(aic_va, core::sync::atomic::Ordering::Relaxed);
-
-            // Diagnostic: the banner will print NR_IRQ and WHOAMI once
-            // the console is wired. For now, the AIC is online but silent.
+            match mmu::ioremap_device(aic_va, aic_pa) {
+                Ok(()) => {
+                    let mut aic = Aic::new(aic_va);
+                    aic.init();
+                    AIC.store(aic_va, core::sync::atomic::Ordering::Relaxed);
+                }
+                Err(e) => {
+                    println!(
+                        "apple::init: failed to map AIC PA {aic_pa:#x} -> VA {aic_va:#x}: {e:?}"
+                    );
+                }
+            }
         }
     }
 }

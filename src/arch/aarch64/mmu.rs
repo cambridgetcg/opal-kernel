@@ -57,6 +57,7 @@
 //! is docs/04-virtual-memory.md. Read it with this file open.
 
 use crate::board::virt::{RAM_BASE, RAM_SIZE, UART0_BASE};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 // ---------------------------------------------------------------------------
 // The constants the hardware reads
@@ -271,6 +272,7 @@ pub(crate) const fn va_l3i(va: usize) -> usize {
 /// aligned to their size, and a misaligned base would not fault — the
 /// hardware would silently mask the low bits and walk garbage.
 #[repr(C, align(16384))]
+#[derive(Clone, Copy)]
 pub(crate) struct PageTable(pub(crate) [u64; 2048]);
 
 const _: () = assert!(core::mem::size_of::<PageTable>() == GRANULE);
@@ -305,6 +307,12 @@ struct Tables {
     /// the ground floor has silently reopened — the monitor's `low`
     /// command is the standing detector.
     empty_root: PageTable,
+    /// Runtime page tables for post-boot Device mappings (M7). Each is a
+    /// full 16 KiB, 2048-entry L3 (or intermediate L1/L2) table, drawn
+    /// from this pool by [`ioremap_device`]. The pool is sized for a
+    /// handful of Apple MMIO regions — UART, AIC, framebuffer — with
+    /// margin for monitor-driven experiments.
+    runtime: [PageTable; 8],
 }
 
 /// The tables themselves. `static mut` + raw pointers only (edition 2024
@@ -317,7 +325,13 @@ static mut TABLES: Tables = Tables {
     l3_kernel: PageTable([0; 2048]),
     l3_mmio: PageTable([0; 2048]),
     empty_root: PageTable([0; 2048]),
+    runtime: [PageTable([0; 2048]); 8],
 };
+
+/// Allocator cursor for the runtime table pool. Incremented with
+/// `fetch_add`; each index is a distinct 16 KiB page table. The pool is
+/// single-core-only today, which matches the rest of the kernel.
+static mut RUNTIME_IDX: AtomicUsize = AtomicUsize::new(0);
 
 // ---------------------------------------------------------------------------
 // Descriptors: never hand-write a literal
@@ -911,6 +925,130 @@ pub fn set_user_ttbr0(root_pa: u64) {
             options(nostack, preserves_flags),
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Runtime Device mappings (M7): FDT-discovered MMIO that the boot stub
+// never knew about
+// ---------------------------------------------------------------------------
+
+/// Why a runtime Device mapping failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IoremapError {
+    /// Virtual or physical address is not 16 KiB aligned.
+    Misaligned,
+    /// The virtual address is not in the kernel's TTBR1 high half.
+    NotKernelVa,
+    /// A live, non-table descriptor blocks the path (for example, an L2
+    /// block would have to be split into 16 KiB pages).
+    BlockInPath,
+    /// The runtime table pool is exhausted.
+    OutOfTables,
+}
+
+/// Allocate one 16 KiB page table from the runtime pool. Returns its
+/// physical address, or `None` if the pool is empty. Single-core only.
+fn alloc_runtime_table() -> Option<usize> {
+    let idx = unsafe { (&*core::ptr::addr_of!(RUNTIME_IDX)).fetch_add(1, Ordering::Relaxed) };
+    if idx >= 8 {
+        return None;
+    }
+    // SAFETY: `idx` is in bounds; taking the address of a static mut
+    // element is allowed inside an unsafe block. `expose_provenance`
+    // returns the element's virtual address (we are in the high world);
+    // `virt_to_phys` turns that into the physical address the hardware
+    // walker requires in table descriptors.
+    Some(virt_to_phys(unsafe {
+        (&raw const TABLES.runtime[idx]).expose_provenance()
+    }))
+}
+
+/// Read one 8-byte descriptor from a table at physical address `table_pa`,
+/// through its higher-half alias. Volatile: the hardware walker is a
+/// second reader of these tables.
+fn read_table(table_pa: usize, idx: usize) -> u64 {
+    let ptr = phys_to_virt(table_pa) as *const u64;
+    // SAFETY: `table_pa` is a known table PA and `idx` is in [0, 2048);
+    // the table is mapped in the kernel's linear map.
+    unsafe { ptr.add(idx).read_volatile() }
+}
+
+/// Write one 8-byte descriptor into a table at physical address `table_pa`.
+fn write_table(table_pa: usize, idx: usize, desc: u64) {
+    let ptr = phys_to_virt(table_pa) as *mut u64;
+    // SAFETY: same as `read_table`.
+    unsafe { ptr.add(idx).write(desc) }
+}
+
+/// Ensure `table_pa[idx]` points at a next-level table, allocating one
+/// from the runtime pool if it is currently invalid. Returns the next
+/// table's PA. Fails if the slot already holds a block (leaf) descriptor,
+/// which would require break-before-make to replace with a table.
+fn ensure_table(table_pa: usize, idx: usize) -> Result<usize, IoremapError> {
+    let desc = read_table(table_pa, idx);
+    match desc & 0b11 {
+        0b11 => Ok((desc & 0x0000_FFFF_FFFF_C000) as usize),
+        0b00 | 0b10 => {
+            let next_pa = alloc_runtime_table().ok_or(IoremapError::OutOfTables)?;
+            write_table(table_pa, idx, table_desc(next_pa as u64));
+            Ok(next_pa)
+        }
+        0b01 => Err(IoremapError::BlockInPath),
+        _ => unreachable!(),
+    }
+}
+
+/// Map a single 16 KiB Device-nGnRnE page at `va` -> `pa` in the kernel's
+/// TTBR1 tree, creating any missing intermediate tables from the runtime
+/// pool.
+///
+/// This is the honest way to bring up FDT-discovered MMIO regions whose
+/// physical addresses fall outside the fixed MMIO slot the boot stub
+/// mapped for QEMU's UART/GIC — Apple's s5l UART and AIC are the motivating
+/// cases. Before any MMIO access, the region gets a dedicated Device page
+/// with XN and EL1 RW permissions, instead of potentially landing in a
+/// Normal RAM block or an unmapped hole.
+///
+/// # Safety
+/// Must be called with the MMU on and the kernel running in the high
+/// half. Single-core only; no concurrency on the live tables.
+pub fn ioremap_device(va: usize, pa: usize) -> Result<(), IoremapError> {
+    if va & (GRANULE - 1) != 0 || pa & (GRANULE - 1) != 0 {
+        return Err(IoremapError::Misaligned);
+    }
+    if va >> 48 != 0xFFFF {
+        return Err(IoremapError::NotKernelVa);
+    }
+
+    // The kernel's fixed L0 table already has entry 0 -> l1 for all
+    // addresses below 2^48. Its physical address is exactly what
+    // TTBR1_EL1 currently holds (the banner prints it; the walker uses it).
+    let l0_pa = ttbr1() as usize;
+    let l0_desc = read_table(l0_pa, va_l0i(va));
+    if l0_desc & 0b11 != 0b11 {
+        return Err(IoremapError::BlockInPath);
+    }
+    let l1_pa = (l0_desc & 0x0000_FFFF_FFFF_C000) as usize;
+
+    let l2_pa = ensure_table(l1_pa, va_l1i(va))?;
+    let l3_pa = ensure_table(l2_pa, va_l2i(va))?;
+
+    write_table(l3_pa, va_l3i(va), page_desc(pa as u64, Attr::Device));
+
+    // Publish the new leaf and any new intermediate tables. A full
+    // vmalle1 invalidation is coarse but correct for single-core boot
+    // mapping; the alternative (tlbi by VA) encodes the ASID/VA layout
+    // and offers no benefit here.
+    unsafe {
+        core::arch::asm!(
+            "dsb ishst",
+            "tlbi vmalle1",
+            "dsb nsh",
+            "isb",
+            options(nostack, preserves_flags),
+        );
+    }
+    Ok(())
 }
 
 /// Ask the hardware to translate `va` exactly as a kernel read would be:

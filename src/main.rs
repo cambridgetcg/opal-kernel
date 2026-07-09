@@ -308,11 +308,7 @@ fn kmain(x0: u64, load_pa: u64) -> ! {
     // fall back to RAM base (the QEMU-ELF path) otherwise. This is the
     // bridge: the same code that parses QEMU's ELF-boot DTB today will
     // parse m1n1's handoff tomorrow, with no special case for "Apple."
-    let fdt_pa = if fdt_at(x0) {
-        x0
-    } else {
-        ram_base
-    };
+    let fdt_pa = if fdt_at(x0) { x0 } else { ram_base };
     if fdt_at(fdt_pa) {
         if let Some(fdt) = arch::aarch64::fdt::Fdtr::new(fdt_pa as usize) {
             println!(
@@ -578,9 +574,17 @@ fn fdt_console_write(fdt: &arch::aarch64::fdt::Fdtr) {
 
     let va = arch::aarch64::mmu::phys_to_virt(pa as usize);
 
-    println!(
-        "fdtcons: found \"{found_name}\" — PA {pa:#x}, VA {va:#x}",
-    );
+    println!("fdtcons: found \"{found_name}\" — PA {pa:#x}, VA {va:#x}",);
+
+    // Ensure a dedicated Device-nGnRnE page maps this MMIO region. On
+    // QEMU the PL011 happens to sit inside the boot stub's pre-mapped MMIO
+    // slot, but on Apple Silicon the s5l UART lands elsewhere; calling
+    // ioremap_device here makes the bridge exercise the runtime mapping
+    // path and proves the FDT address is translatable before we touch it.
+    match arch::aarch64::mmu::ioremap_device(va, pa as usize) {
+        Ok(()) => println!("fdtcons: mapped as Device page"),
+        Err(e) => println!("fdtcons: ioremap failed ({e:?}) — continuing, may fault"),
+    }
 
     // Write directly to the PL011 at the FDT-discovered virtual address.
     // The PL011 register layout: DR at +0x00, FR at +0x18, FR.TXFF = bit 5.
@@ -594,9 +598,7 @@ fn fdt_console_write(fdt: &arch::aarch64::fdt::Fdtr) {
     for &b in msg {
         // Spin until the TX FIFO has room.
         loop {
-            let flags = unsafe {
-                core::ptr::with_exposed_provenance::<u32>(fr).read_volatile()
-            };
+            let flags = unsafe { core::ptr::with_exposed_provenance::<u32>(fr).read_volatile() };
             if flags & FR_TXFF == 0 {
                 break;
             }
@@ -605,14 +607,12 @@ fn fdt_console_write(fdt: &arch::aarch64::fdt::Fdtr) {
         // Translate \n to CRLF for the serial terminal.
         if b == b'\n' {
             unsafe {
-                core::ptr::with_exposed_provenance_mut::<u32>(dr)
-                    .write_volatile(b'\r' as u32);
+                core::ptr::with_exposed_provenance_mut::<u32>(dr).write_volatile(b'\r' as u32);
             }
             // Wait again for the CR to clear the FIFO.
             loop {
-                let flags = unsafe {
-                    core::ptr::with_exposed_provenance::<u32>(fr).read_volatile()
-                };
+                let flags =
+                    unsafe { core::ptr::with_exposed_provenance::<u32>(fr).read_volatile() };
                 if flags & FR_TXFF == 0 {
                     break;
                 }
@@ -620,13 +620,15 @@ fn fdt_console_write(fdt: &arch::aarch64::fdt::Fdtr) {
             }
         }
         unsafe {
-            core::ptr::with_exposed_provenance_mut::<u32>(dr)
-                .write_volatile(b as u32);
+            core::ptr::with_exposed_provenance_mut::<u32>(dr).write_volatile(b as u32);
         }
     }
 
     println!();
-    println!("fdtcons: wrote {} bytes to the FDT-discovered console address.", msg.len());
+    println!(
+        "fdtcons: wrote {} bytes to the FDT-discovered console address.",
+        msg.len()
+    );
 }
 
 /// The monitor's command table, M2 edition. Three groups, and the
@@ -663,9 +665,8 @@ pub fn run_command(line: &[u8]) {
             println!("  unaligned       M1's killer, defanged: Normal memory tolerates it now");
             println!("  --- oracles ---");
             println!("  translate <va>  ask AT S1E1R where a virtual address really goes");
-            println!(
-                "  walk <va>       narrate the page-table walk, then cross-check the hardware"
-            );
+            println!("  walk <va>       narrate the page-table walk, then cross-check the hardware");
+            println!("  mapdev <pa>     map a 16 KiB Device page at KERNEL_BASE+pa -> pa (M7 runtime ioremap)");
             println!("  --- FATAL (one fault syndrome each) ---");
             println!("  guard           write below the stack: translation fault, level 3");
             println!("  wx              write to .rodata: permission fault");
@@ -692,17 +693,21 @@ pub fn run_command(line: &[u8]) {
                 "  fdtcons         discover the UART from the FDT (by compatible), write to it at the discovered address"
             );
             println!("  --- M5: EL0 and syscalls ---");
-            println!("  el0             drop to EL0, run the user program (syscalls: write, yield, exit)");
-            println!("  el0fault        drop to EL0, run a program that faults — test fault recovery");
+            println!(
+                "  el0             drop to EL0, run the user program (syscalls: write, yield, exit)"
+            );
+            println!(
+                "  el0fault        drop to EL0, run a program that faults — test fault recovery"
+            );
             println!("  --- M6: scheduler and IPC ---");
             println!("  tasks           dump the task table (scheduler diagnostics)");
-            println!("  spawn2          M6: spawn two tasks, drop to EL0 with the scheduler active");
+            println!(
+                "  spawn2          M6: spawn two tasks, drop to EL0 with the scheduler active"
+            );
             println!(
                 "  preempt         M6: preemptive scheduling — two spinning tasks, timer-driven switch"
             );
-            println!(
-                "  ipc             M6: IPC demo — sender sends a message, receiver gets it"
-            );
+            println!("  ipc             M6: IPC demo — sender sends a message, receiver gets it");
             println!(
                 "  blkipc          M6: blocking IPC — receiver blocks on recvblk, sender wakes it"
             );
@@ -757,6 +762,18 @@ pub fn run_command(line: &[u8]) {
         "walk" => match parse_hex(arg) {
             Some(va) => arch::aarch64::mmu::walk(va),
             None => println!("usage: walk <hex va>          e.g.  walk 0xffff000009000000"),
+        },
+        "mapdev" => match parse_hex(arg) {
+            Some(pa) => {
+                let va = arch::aarch64::mmu::phys_to_virt(pa as usize) as u64;
+                match arch::aarch64::mmu::ioremap_device(va as usize, pa as usize) {
+                    Ok(()) => println!(
+                        "mapdev: PA {pa:#x} mapped as Device page at VA {va:#x}; use 'walk {va:#x}' to inspect"
+                    ),
+                    Err(e) => println!("mapdev: failed to map PA {pa:#x} -> VA {va:#x}: {e:?}"),
+                }
+            }
+            None => println!("usage: mapdev <hex pa>        e.g.  mapdev 0x10000000"),
         },
         "guard" => {
             println!("goodbye — writing 8 bytes below the stack; the guard page has no mapping:");
