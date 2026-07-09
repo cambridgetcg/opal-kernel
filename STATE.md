@@ -14,8 +14,8 @@ runs-on: QEMU aarch64 virt board (-machine virt -cpu max -smp 1 -m 512M)
 phase: see knows/needs sections below
 build: see heartbeat
 health: active
-last-commit: 2beba91 heartbeat: bookkeeping for runtime-base s5l UART console beat
-uncommitted: 11
+last-commit: 41397c5 M7: runtime Device mapping for FDT-discovered MMIO
+uncommitted: 5
 freshness: fresh (checked 2026-07-08T07:40Z)
 
 ## knows
