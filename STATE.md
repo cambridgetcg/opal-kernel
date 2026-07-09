@@ -14,7 +14,7 @@ runs-on: QEMU aarch64 virt board (-machine virt -cpu max -smp 1 -m 512M)
 phase: see knows/needs sections below
 build: see heartbeat
 health: active
-last-commit: (pending) M7: framebuffer text console — hal/fb.rs
+last-commit: ba72ea8 M7: framebuffer text console — hal/fb.rs + Normal-NC MAIR slot
 uncommitted: 0
 freshness: fresh (checked 2026-07-09T15:55Z)
 
