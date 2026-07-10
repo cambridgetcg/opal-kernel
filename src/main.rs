@@ -49,7 +49,7 @@ mod sync;
 
 use core::fmt::Write;
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 // ---------------------------------------------------------------------------
 // Printing: one lock, one escape hatch
@@ -87,20 +87,79 @@ fn oops_exit() {
     OOPS.store(false, Ordering::Relaxed)
 }
 
+// ---------------------------------------------------------------------------
+// Board-selected console
+// ---------------------------------------------------------------------------
+
+/// The board kind selected at boot from the FDT root `compatible`.
+/// 0 = Virt (default), 1 = Apple. Stored as an integer because the two
+/// board modules have different console types and we cannot store an enum
+/// of different-sized structs in a plain static without `OnceCell`.
+static BOARD_KIND: AtomicU8 = AtomicU8::new(0);
+
+/// Remember which board we are running on. Called once in `kmain` after
+/// the FDT parser decides.
+fn set_board_kind(kind: board::BoardKind) {
+    let v = match kind {
+        board::BoardKind::Virt => 0,
+        board::BoardKind::Apple => 1,
+    };
+    BOARD_KIND.store(v, Ordering::Relaxed);
+}
+
+/// The console type selected by the current board. Both implement
+/// `core::fmt::Write` and have `read_byte` / `write_byte`.
+#[derive(Clone, Copy)]
+enum Console {
+    Virt(board::virt::Console),
+    Apple(board::apple::Console),
+}
+
+impl core::fmt::Write for Console {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        match self {
+            Console::Virt(c) => c.write_str(s),
+            Console::Apple(c) => c.write_str(s),
+        }
+    }
+}
+
+impl Console {
+    fn write_byte(self, b: u8) {
+        match self {
+            Console::Virt(c) => c.write_byte(b),
+            Console::Apple(c) => c.write_byte(b),
+        }
+    }
+
+    fn read_byte(self) -> u8 {
+        match self {
+            Console::Virt(c) => c.read_byte(),
+            Console::Apple(c) => c.read_byte(),
+        }
+    }
+}
+
+/// Construct the board-selected console. After `set_board_kind` this
+/// returns the right driver; before that it returns the Virt console,
+/// which is the safe fallback on QEMU.
+fn console() -> Console {
+    match BOARD_KIND.load(Ordering::Relaxed) {
+        1 => Console::Apple(board::apple::console()),
+        _ => Console::Virt(board::virt::console()),
+    }
+}
+
 /// The plumbing under `print!`/`println!`: render `format_args!` output
-/// straight into the board console. No allocation, no buffering — but as
-/// of M1, a lock (and its emergency bypass) where M0 honestly had none.
+/// straight into the board-selected console. No allocation, no buffering.
 #[doc(hidden)]
 fn console_print(args: core::fmt::Arguments) {
-    // The console is zero-sized and infallible; ignore the fmt::Result.
     if OOPS.load(Ordering::Relaxed) {
-        // Emergency path: conjure an unlocked console and write. The ZST
-        // design pays off here — there is no shared state to corrupt.
-        let _ = board::virt::console().write_fmt(args);
+        let _ = console().write_fmt(args);
         return;
     }
     CONSOLE_LOCK.with(|| {
-        let _ = board::virt::console().write_fmt(args);
+        let _ = console().write_fmt(args);
     });
 }
 
@@ -158,7 +217,9 @@ fn kmain(x0: u64, load_pa: u64) -> ! {
     // of the same address — the banner reads it back below.)
     arch::aarch64::vectors::install();
 
-    board::virt::init();
+    // Board init is deferred until after the FDT is parsed and
+    // board::which selects the right module (virt vs apple). See the
+    // FDT block below.
 
     // Pull up the ladder: TTBR0 gets the empty root, and the low half —
     // the identity world the boot stub climbed through — stops
@@ -222,19 +283,15 @@ fn kmain(x0: u64, load_pa: u64) -> ! {
         "guard      : 16 KiB unmapped below the stack - overflow now faults instead of eating .bss (M0's debt, paid)"
     );
 
-    // M3's heartbeat: the GIC and the architectural timer.
+    // M3's heartbeat: the architectural timer.
     let freq = arch::aarch64::timer::frequency();
     println!(
-        "timer      : CNTV @ {freq} Hz - the virtual timer (PPI {} via GICv2)",
+        "timer      : CNTV @ {freq} Hz - the virtual timer (PPI {})",
         hal::gicv2::TIMER_IRQ
     );
-    let gic_typer = board::virt::gic().typer();
-    println!(
-        "gic        : GICv2 - GICD at {:#x}, GICC at {:#x} (TYPER={:#x})",
-        board::virt::GICD_VA,
-        board::virt::GICC_VA,
-        gic_typer
-    );
+
+    // Board-specific interrupt controller info is printed after the FDT
+    // parser selects the board (see below).
 
     // What did the bootloader hand us? Under the Linux boot protocol (and
     // m1n1) x0 is a physical FDT pointer. QEMU sets NO registers for
@@ -324,11 +381,48 @@ fn kmain(x0: u64, load_pa: u64) -> ! {
             // bridge: once the Apple board's console wiring is complete,
             // this is where the fork happens.
             let board_kind = board::which(Some(&fdt));
+            set_board_kind(board_kind);
             let root_compat = fdt.root().map(|n| fdt.compatible(&n)).unwrap_or("");
             println!(
                 "board     : {:?} (root compatible: \"{}\")",
                 board_kind, root_compat
             );
+
+            // Initialize the selected board: GIC on virt, AIC + s5l UART
+            // (+ framebuffer) on Apple. From here on console_print routes
+            // through the board-selected console.
+            match board_kind {
+                board::BoardKind::Virt => board::virt::init(),
+                board::BoardKind::Apple => board::apple::init(Some(&fdt)),
+            }
+
+            // Board-specific interrupt controller report.
+            match board_kind {
+                board::BoardKind::Virt => {
+                    let gic_typer = board::virt::gic().typer();
+                    println!(
+                        "gic        : GICv2 - GICD at {:#x}, GICC at {:#x} (TYPER={:#x})",
+                        board::virt::GICD_VA,
+                        board::virt::GICC_VA,
+                        gic_typer
+                    );
+                }
+                board::BoardKind::Apple => {
+                    let aic_base = board::apple::aic_base();
+                    if aic_base != 0 {
+                        let aic = crate::hal::aic::Aic::new(aic_base);
+                        println!(
+                            "aic        : Apple AIC at {:#x} — NR_IRQ {}, WHOAMI {}, CONFIG {:#x}",
+                            aic_base,
+                            aic.cached_nr_irq(),
+                            aic.whoami(),
+                            aic.config()
+                        );
+                    } else {
+                        println!("aic        : Apple AIC not discovered");
+                    }
+                }
+            }
 
             // /memory — the machine's RAM, as QEMU declares it. Cross-
             // check against board::virt's hardcoded RAM_BASE/RAM_SIZE.
@@ -458,7 +552,7 @@ fn kmain(x0: u64, load_pa: u64) -> ! {
     // byte I/O (terminal -> QEMU -> PL011 RX FIFO -> read_byte), but Enter
     // now runs the buffered line as a command. The commands exist to make
     // the kernel fault on purpose — see run_command below.
-    let uart = board::virt::console();
+    let uart = console();
     let mut buf = [0u8; 64];
     let mut len = 0usize;
     print!("> ");

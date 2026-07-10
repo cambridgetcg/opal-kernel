@@ -109,3 +109,7 @@
 2026-07-07T10:01:05Z state=healthy next=2026-07-07T16:01:05Z
 2026-07-07T16:09:48Z state=healthy next=2026-07-07T22:09:48Z
 2026-07-08T07:40:27Z | runtime-s5l-uart | commit cf528f3 | runtime-base s5l UART wrapper + Apple board console wiring (Console=RuntimeS5lUart, init discovers UART from FDT)
+2026-07-10T00:21:12Z state=active next=2026-07-10T02:21:12Z
+2026-07-10T02:29:29Z state=active next=2026-07-10T04:29:29Z
+2026-07-10T04:37:47Z state=active next=2026-07-10T06:37:47Z
+2026-07-10T07:51:07Z state=active next=2026-07-10T11:51:07Z
