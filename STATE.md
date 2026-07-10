@@ -14,9 +14,9 @@ runs-on: QEMU aarch64 virt board (-machine virt -cpu max -smp 1 -m 512M)
 phase: see knows/needs sections below
 build: see heartbeat
 health: active
-last-commit: 41d1df0 heartbeat: STATE.md sync after M7 framebuffer console beat
-uncommitted: 7
-freshness: 2026-07-10T07:51Z
+last-commit: 1446aef M7: runtime board init + board-selected console
+uncommitted: 0
+freshness: 2026-07-10T07:55Z
 
 ## knows
 
