@@ -14,8 +14,8 @@ runs-on: QEMU aarch64 virt board (-machine virt -cpu max -smp 1 -m 512M)
 phase: see knows/needs sections below
 build: see heartbeat
 health: active
-last-commit: f840720 heartbeat: sync HEARTBEAT.md and clean up stale empty files
-uncommitted: 17
+last-commit: 9b9f670 heartbeat: sync STATE.md and tidy stale rescue copies
+uncommitted: 22
 freshness: 2026-07-10T07:55Z
 
 ## knows
