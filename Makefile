@@ -32,7 +32,7 @@ OBJCOPY  := $(shell find "$(TOOLCHAIN_DIR)/lib/rustlib" -name llvm-objcopy -type
 QEMU     := qemu-system-aarch64
 QEMUFLAGS := -machine virt -cpu max -smp 1 -m 512M -nographic
 
-.PHONY: all image build clean run run-img inspect
+.PHONY: all image build clean run run-img inspect smoke
 
 # Default: build the flat Image.
 all: image
@@ -65,6 +65,36 @@ run:
 # accordingly. This is the closest QEMU gets to the m1n1 load path.
 run-img: $(IMG)
 	$(QEMU) $(QEMUFLAGS) -kernel $(IMG)
+
+# Automated smoke test: build Image, boot in QEMU, grep for banner proof.
+# Runs non-interactively with stdin from /dev/null; kills QEMU after timeout.
+# This is the heartbeat's real check that the M7 Image path still works.
+SMOKE_TIMEOUT := 8
+SMOKE_MATCHES := "opal — milestone" "current EL" "mmu        : on" "monitor ready"
+smoke: $(IMG)
+	@echo "=== smoke: booting Image in QEMU (timeout $(SMOKE_TIMEOUT)s) ==="
+	@output=$$(timeout $(SMOKE_TIMEOUT) $(QEMU) $(QEMUFLAGS) -kernel $(IMG) < /dev/null 2>&1); \
+	status=$$?; \
+	if [ $$status -eq 124 ]; then \
+		echo "smoke: QEMU survived $(SMOKE_TIMEOUT)s (expected; no shutdown yet)"; \
+	elif [ $$status -ne 0 ]; then \
+		echo "smoke: QEMU exited unexpectedly (code $$status)"; \
+		printf '%s\n' "$$output" | tail -40; \
+		exit 1; \
+	fi; \
+	failed=; \
+	for m in $(SMOKE_MATCHES); do \
+		if ! printf '%s\n' "$$output" | grep -q "$$m"; then \
+			echo "smoke: missing expected output: $$m"; \
+			failed=1; \
+		fi; \
+	done; \
+	if [ -n "$$failed" ]; then \
+		echo "smoke: output dump (last 40 lines):"; \
+		printf '%s\n' "$$output" | tail -40; \
+		exit 1; \
+	fi; \
+	echo "smoke: all checks passed"
 
 # Inspect the Image header (first 64 bytes) — verifies magic, flags,
 # text_offset, image_size, and the branch target.
