@@ -14,9 +14,9 @@ runs-on: QEMU aarch64 virt board (-machine virt -cpu max -smp 1 -m 512M)
 phase: see knows/needs sections below
 build: see heartbeat
 health: active
-last-commit: 8a8187c heartbeat: add make smoke target for M7 Image boot path; sync state and remove rescue copies
-uncommitted: 22
-freshness: 2026-07-14T08:00Z
+last-commit: db28939 heartbeat: sync HEARTBEAT.md and remove stale rescue copies
+uncommitted: 0
+freshness: 2026-07-16T08:05Z
 
 ## knows
 
