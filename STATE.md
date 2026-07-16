@@ -14,7 +14,7 @@ runs-on: QEMU aarch64 virt board (-machine virt -cpu max -smp 1 -m 512M)
 phase: see knows/needs sections below
 build: see heartbeat
 health: active
-last-commit: db28939 heartbeat: sync HEARTBEAT.md and remove stale rescue copies
+last-commit: 37ffd93 heartbeat: merge remote M7 bridge commits and sync state
 uncommitted: 0
 freshness: 2026-07-16T08:05Z
 
